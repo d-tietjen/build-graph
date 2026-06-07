@@ -1,0 +1,12 @@
+/target
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+
+# local agent/tooling state
+.agents/
+
+# macOS
+.DS_Store

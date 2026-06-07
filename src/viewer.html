@@ -1,0 +1,581 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>build-graph — code knowledge graph</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; font: 13px/1.4 ui-sans-serif, system-ui, -apple-system, sans-serif; background: #0e1116; color: #e6edf3; }
+  #app { display: flex; height: 100%; }
+  #side { width: 250px; flex: 0 0 250px; border-right: 1px solid #232a33; padding: 12px 14px; overflow: auto; }
+  #side h1 { font-size: 14px; margin: 0 0 2px; }
+  #side .muted { color: #8b949e; font-size: 12px; }
+  #engine { font-size: 11px; color: #8b949e; margin-top: 4px; }
+  #engine b { color: #58a6ff; }
+  #search { width: 100%; margin: 10px 0 4px; padding: 6px 8px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: inherit; }
+  .listhdr { color: #8b949e; font-size: 11px; text-transform: uppercase; letter-spacing: .04em; margin: 14px 0 4px; }
+  .row { display: flex; align-items: center; gap: 8px; padding: 3px 5px; border-radius: 5px; cursor: pointer; user-select: none; }
+  .row:hover { background: #161b22; }
+  .row.sel { background: #14213a; outline: 1px solid #2f81f7; }
+  .row .tw { width: 10px; flex: 0 0 10px; color: #8b949e; font-size: 10px; text-align: center; }
+  .row .sw { width: 11px; height: 11px; border-radius: 3px; flex: 0 0 11px; }
+  .tree-row .ico { width: 14px; height: 14px; flex: 0 0 14px; display: inline-flex; align-items: center; justify-content: center; }
+  .tree-row .ico svg { width: 14px; height: 14px; display: block; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+  .row .n { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row .c { color: #8b949e; font-size: 11px; }
+  #stage { flex: 1; position: relative; overflow: hidden; }
+  #gl, #cv { position: absolute; inset: 0; width: 100%; height: 100%; }
+  #tip { position: absolute; pointer-events: none; background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 6px 8px; font-size: 12px; max-width: 380px; opacity: 0; z-index: 6; }
+  #tip b { color: #58a6ff; } #tip .k { color: #8b949e; }
+  #overlay { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #8b949e; font-size: 13px; z-index: 4; pointer-events: none; }
+  #hint { position: absolute; bottom: 10px; left: 12px; color: #8b949e; font-size: 11px; z-index: 5; }
+  .swatch-legend { display: inline-block; width: 18px; height: 2px; background: #e3b341; vertical-align: middle; margin-right: 5px; }
+  #edgekey { display: flex; flex-wrap: wrap; gap: 4px 12px; margin: 6px 0 2px; font-size: 11px; color: #8b949e; }
+  #edgekey span { display: inline-flex; align-items: center; gap: 5px; }
+  #edgekey i { width: 16px; height: 2px; display: inline-block; }
+  #detail { position: absolute; top: 10px; left: 12px; width: 320px; max-height: calc(100% - 24px); overflow: auto;
+    background: rgba(13,17,23,.94); border: 1px solid #30363d; border-radius: 8px; padding: 10px 12px; z-index: 7; display: none; font-size: 12px; }
+  #detail .dh { font-weight: 600; color: #58a6ff; font-size: 13px; }
+  #detail .dk { color: #8b949e; } #detail .dsrc { color: #8b949e; font-size: 11px; margin: 1px 0 6px; word-break: break-all; }
+  #detail .depth { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; color: #8b949e; font-size: 11px; margin: 7px 0 2px; }
+  #detail .depth input { width: 100%; accent-color: #58a6ff; }
+  #detail .depth output { min-width: 64px; text-align: right; color: #c9d1d9; }
+  #detail .grp { margin-top: 7px; } #detail .grp .gt { font-size: 11px; text-transform: uppercase; letter-spacing: .03em; }
+  #detail .ne { padding: 2px 4px; border-radius: 4px; cursor: pointer; display: flex; gap: 6px; align-items: baseline; }
+  #detail .ne:hover { background: #161b22; } #detail .ne .nn { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #detail .ne .nx { color: #8b949e; font-size: 10px; } #detail .more { color: #8b949e; font-size: 11px; padding: 2px 4px; }
+  #detail .close { float: right; cursor: pointer; color: #8b949e; padding: 0 3px; } #detail .close:hover { color: #e6edf3; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="side">
+    <h1>__GRAPH_TITLE__</h1>
+    <div class="muted" id="counts"></div>
+    <div id="engine"></div>
+    <div id="edgekey"></div>
+    <input id="search" placeholder="filter by name…" autocomplete="off" />
+    <div id="cratelist"></div>
+    <div id="kindlist"></div>
+  </div>
+  <div id="stage">
+    <div id="tip"></div>
+    <div id="detail"></div>
+    <div id="overlay">loading…</div>
+    <div id="hint">scroll to zoom · drag to pan · hover a node · <b>click a node</b> to see its callers/uses</div>
+  </div>
+</div>
+
+<script type="application/json" id="graph-data">/*__GRAPH_DATA__*/</script>
+<script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
+<script type="module">
+var KIND_COLORS = {
+  module: "#a371f7", struct: "#58a6ff", enum: "#bc8cff", union: "#58a6ff", trait: "#e3b341",
+  function: "#ff7b72", method: "#6cb6ff", type: "#56d4dd", const: "#d2a8ff", static: "#d2a8ff",
+  macro: "#ffa657", field: "#7d8590", variant: "#7ee787"
+};
+var DEFAULT_COLOR = "#8b949e";
+var PALETTE = ["#f0883e","#58a6ff","#3fb950","#bc8cff","#e3b341","#ff7b72","#56d4dd","#d2a8ff","#79c0ff","#ffa657","#a371f7","#f778ba","#7ee787","#ffa198","#a5d6ff","#6cb6ff"];
+// Edge categories: semantic reference edges pop; structural ones recede.
+var EDGE_COLORS = { call: "#3fb950", use: "#56d4dd", impl: "#e3b341", struct: "#2b3138" };
+function relCat(rel) {
+  return (rel === "calls" || rel === "member_calls") ? "call"
+    : (rel === "uses" || rel === "member_uses") ? "use"
+    : rel === "implements" ? "impl"
+    : "struct";
+}
+// Human label for a (relation, direction) pair, ordered by usefulness for impact analysis.
+var REL_VIEW = [
+  ["calls", "in", "called by", "#3fb950"], ["calls", "out", "calls", "#3fb950"],
+  ["uses", "in", "used by", "#56d4dd"], ["uses", "out", "uses", "#56d4dd"],
+  ["member_calls", "in", "called by members of", "#3fb950"], ["member_calls", "out", "member calls", "#3fb950"],
+  ["member_uses", "in", "used by members of", "#56d4dd"], ["member_uses", "out", "member uses", "#56d4dd"],
+  ["implements", "in", "implemented by", "#e3b341"], ["implements", "out", "implements", "#e3b341"],
+  ["has_method", "out", "methods", "#8b949e"], ["has_field", "out", "fields", "#8b949e"],
+  ["has_variant", "out", "variants", "#8b949e"], ["takes", "in", "passed to", "#8b949e"],
+  ["returns", "in", "returned by", "#8b949e"], ["uses_type", "in", "used in signature of", "#8b949e"],
+  ["contains", "in", "defined in", "#8b949e"], ["aliases", "in", "aliased by", "#8b949e"]
+];
+function kindOf(n) { return (n.attributes && n.attributes.kind) || "other"; }
+function crateOf(n) { return (n.attributes && n.attributes.crate) || ""; }
+function sizeOf(k) { return k === "module" ? 2 : (k === "struct" || k === "enum" || k === "trait" || k === "union") ? 1.7 : (k === "method" || k === "field" || k === "variant") ? 0.8 : 1.3; }
+function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]; }); }
+function webglOK() { try { var c = document.createElement("canvas"); return !!(window.WebGLRenderingContext && (c.getContext("webgl") || c.getContext("experimental-webgl"))); } catch (e) { return false; } }
+function treeIcon(kind) {
+  if (kind === "file")
+    return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z'/><path d='M14 2v4a2 2 0 0 0 2 2h4'/></svg>";
+  return "<svg viewBox='0 0 24 24' aria-hidden='true'><path d='M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.7-.9l-.8-1.2A2 2 0 0 0 7.9 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z'/></svg>";
+}
+function displaySourcePath(n) {
+  var p = n.source_file || "(unknown)";
+  var i = p.lastIndexOf("/src/");
+  if (i >= 0) return p.slice(i + 1);
+  return p;
+}
+function makeTreeNode(key, label, kind, depth, color) {
+  return { key: key, label: label, kind: kind, depth: depth, color: color, count: 0, ids: [], childrenMap: {}, children: [], open: false };
+}
+function buildSourceTree(nodes, crateNames, crateColor) {
+  var rootsByCrate = {}, roots = [];
+  crateNames.forEach(function (crate) {
+    var root = makeTreeNode("crate:" + crate, crate || "(unknown)", "crate", 0, crateColor[crate] || DEFAULT_COLOR);
+    rootsByCrate[crate] = root; roots.push(root);
+  });
+  nodes.forEach(function (n) {
+    var root = rootsByCrate[n.crate]; if (!root) return;
+    root.count++; root.ids.push(n.id);
+    var parts = displaySourcePath(n).split("/").filter(Boolean);
+    if (!parts.length) parts = ["(unknown)"];
+    var cur = root, prefix = [];
+    for (var i = 0; i < parts.length; i++) {
+      prefix.push(parts[i]);
+      var last = i === parts.length - 1, label = parts[i];
+      var key = root.key + ":" + prefix.join("/");
+      var child = cur.childrenMap[label];
+      if (!child) {
+        child = makeTreeNode(key, label, last ? "file" : "folder", cur.depth + 1, root.color);
+        cur.childrenMap[label] = child;
+      }
+      child.count++; child.ids.push(n.id);
+      cur = child;
+    }
+  });
+  function finish(node) {
+    node.children = Object.keys(node.childrenMap).map(function (k) { return node.childrenMap[k]; });
+    node.children.sort(function (a, b) {
+      if (a.kind !== b.kind) return a.kind === "folder" ? -1 : 1;
+      return a.label.localeCompare(b.label);
+    });
+    node.children.forEach(finish);
+  }
+  roots.forEach(finish);
+  if (roots[0]) {
+    roots[0].open = true;
+    var n = roots[0];
+    for (var d = 0; d < 2; d++) {
+      var folders = n.children.filter(function (c) { return c.kind === "folder"; });
+      if (folders.length !== 1) break;
+      folders[0].open = true;
+      n = folders[0];
+    }
+  }
+  return roots;
+}
+
+var G = null; // populated by loadData() before boot()
+var UIAPI = null; // renderer's { select(ids), clear() }, set by mountUI
+function buildG(data) {
+  var nodes = data.nodes.filter(function (n) { var k = kindOf(n); return k !== "crate" && k !== "file"; })
+    .map(function (n) { return { id: n.id, label: n.label, kind: kindOf(n), crate: crateOf(n), source_file: n.source_file, source_location: n.source_location }; });
+  var byId = {}; nodes.forEach(function (n) { byId[n.id] = n; });
+  var links = data.edges.filter(function (e) { return byId[e.source] && byId[e.target]; })
+    .map(function (e) { return { source: e.source, target: e.target, rel: e.relation, cat: relCat(e.relation), cross: byId[e.source].crate !== byId[e.target].crate }; });
+  var crates = {}, kinds = {}, idsByKind = {}, adj = {}, relCount = {};
+  nodes.forEach(function (n) {
+    crates[n.crate] = (crates[n.crate] || 0) + 1; kinds[n.kind] = (kinds[n.kind] || 0) + 1;
+    (idsByKind[n.kind] = idsByKind[n.kind] || []).push(n.id);
+  });
+  // adjacency for the detail panel: id -> [{other, rel, dir}]
+  links.forEach(function (l) {
+    relCount[l.rel] = (relCount[l.rel] || 0) + 1;
+    (adj[l.source] = adj[l.source] || []).push({ other: l.target, rel: l.rel, dir: "out" });
+    (adj[l.target] = adj[l.target] || []).push({ other: l.source, rel: l.rel, dir: "in" });
+  });
+  var crateNames = Object.keys(crates).sort(function (a, b) { return crates[b] - crates[a]; });
+  var crateColor = {}; crateNames.forEach(function (c, i) { crateColor[c] = PALETTE[i % PALETTE.length]; });
+  var sourceTree = buildSourceTree(nodes, crateNames, crateColor);
+  var nc = relCount.calls || 0, nu = relCount.uses || 0, nmc = relCount.member_calls || 0, nmu = relCount.member_uses || 0;
+  document.getElementById("counts").textContent = nodes.length + " items · " + links.length + " edges"
+    + (nc || nu ? " · " + nc + " calls · " + nu + " uses" : "")
+    + (nmc || nmu ? " · " + nmc + " member calls · " + nmu + " member uses" : "");
+  return { nodes: nodes, byId: byId, links: links, adj: adj, relCount: relCount, crates: crates, kinds: kinds, idsByKind: idsByKind, crateNames: crateNames, crateColor: crateColor, sourceTree: sourceTree };
+}
+
+// ---- deterministic initial spread -----------------------------------------
+// Give both renderers a stable, neutral starting cloud. The force simulation
+// still decides the final shape; this just avoids a blank or perfectly stacked
+// first frame, especially in the CPU fallback.
+function seedLayout(G) {
+  var count = Math.max(1, G.nodes.length);
+  var radius = Math.max(60, Math.sqrt(count) * 7);
+  G.nodes.forEach(function (n, i) {
+    var a = i * 2.399963229728653; // golden-angle spiral
+    var r = radius * Math.sqrt((i + 0.5) / count);
+    n.sx = r * Math.cos(a);
+    n.sy = r * Math.sin(a);
+  });
+}
+
+// Map the arbitrary-scale, centered seed into Cosmos' [0, space] box.
+function applyCosmosSeed(G, space) {
+  if (!G.nodes.length) return;
+  var x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+  G.nodes.forEach(function (n) {
+    if (n.sx < x0) x0 = n.sx; if (n.sx > x1) x1 = n.sx;
+    if (n.sy < y0) y0 = n.sy; if (n.sy > y1) y1 = n.sy;
+  });
+  var lo = space * 0.20, span = space - 2 * lo;   // seed into the central 60% so there's margin from the walls
+  var s = Math.min(span / Math.max(1, x1 - x0), span / Math.max(1, y1 - y0));
+  var cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, mid = space / 2;
+  G.nodes.forEach(function (n) { n.x = mid + (n.sx - cx) * s; n.y = mid + (n.sy - cy) * s; });
+}
+
+// shared control-bar widgets (used by both renderers)
+function mkbtn(label, fn) { var b = document.createElement("button"); b.textContent = label; b.style.cssText = "padding:5px 10px;background:#161b22;border:1px solid #30363d;border-radius:6px;color:#c9d1d9;cursor:pointer;font-size:12px;"; if (fn) b.onclick = fn; return b; }
+function controlBar(stage) { var bar = document.createElement("div"); bar.style.cssText = "position:absolute;top:10px;right:12px;z-index:6;display:flex;gap:6px;align-items:center;"; stage.appendChild(bar); return bar; }
+
+// The writer bakes in the filename to fetch when the data isn't inlined —
+// "graph.json.gz" (gzip, default) or "graph.json" (plain).
+var GRAPH_SRC = "__GRAPH_SRC__";
+if (GRAPH_SRC.indexOf("GRAPH_SRC") !== -1) GRAPH_SRC = "graph.json"; // un-replaced template
+
+// Inflate a fetched payload if it's gzip (magic bytes 1f 8b), else decode as
+// text. Browser-native DecompressionStream means no JS gzip library is bundled.
+function decodePayload(buf) {
+  var u8 = new Uint8Array(buf);
+  var gz = u8.length > 1 && u8[0] === 0x1f && u8[1] === 0x8b;
+  if (!gz) return Promise.resolve(new TextDecoder().decode(u8));
+  if (typeof DecompressionStream === "undefined")
+    return Promise.reject(new Error("graph is gzip-compressed but this browser has no DecompressionStream — rebuild with --no-compress"));
+  var stream = new Response(buf).body.pipeThrough(new DecompressionStream("gzip"));
+  return new Response(stream).text();
+}
+
+// Data is either inlined in #graph-data (small graphs) or fetched alongside this
+// HTML (large graphs the writer chose not to inline). The empty / un-replaced
+// placeholder case both fall through to fetch.
+function loadData(cb) {
+  var raw = document.getElementById("graph-data").textContent;
+  var trimmed = raw ? raw.trim() : "";
+  if (trimmed && trimmed.indexOf("__GRAPH_DATA__") === -1) {
+    try { cb(JSON.parse(trimmed)); } catch (e) { document.getElementById("overlay").textContent = "graph data parse error: " + ((e && e.message) || e); }
+    return;
+  }
+  document.getElementById("overlay").textContent = "loading " + GRAPH_SRC + "…";
+  fetch(GRAPH_SRC).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.arrayBuffer(); })
+    .then(decodePayload)
+    .then(function (text) { cb(JSON.parse(text)); })
+    .catch(function (e) {
+      var o = document.getElementById("overlay");
+      if (location.protocol === "file:") {
+        o.innerHTML = "This graph is too large to inline, so the viewer loads <b>" + GRAPH_SRC + "</b> over HTTP — but it was opened from <code>file://</code>.<br><br>Serve the output folder and reopen:<br><br><code>python3 -m http.server</code><br>then open <code>http://localhost:8000/graph.html</code>";
+      } else {
+        o.textContent = "could not load " + GRAPH_SRC + ": " + ((e && e.message) || e);
+      }
+    });
+}
+
+// shared sidebar + tooltip; renderer supplies selectIds(idArray|null) and clearSel()
+function mountUI(api) {
+  var selSource = null, selKind = null;
+  function mark() {
+    document.querySelectorAll("#cratelist .row").forEach(function (r) { r.classList.toggle("sel", r.getAttribute("data-v") === selSource); });
+    document.querySelectorAll("#kindlist .row").forEach(function (r) { r.classList.toggle("sel", r.getAttribute("data-v") === selKind); });
+  }
+  function pickSource(n) { if (selSource === n.key) { selSource = null; api.clear(); } else { selSource = n.key; selKind = null; api.select(n.ids); } mark(); }
+  function pickKind(k) { if (selKind === k) { selKind = null; api.clear(); } else { selKind = k; selSource = null; api.select(G.idsByKind[k]); } mark(); }
+  api.onExternalClear = function () { selSource = null; selKind = null; mark(); };
+  function renderSourceTree() {
+    var box = document.getElementById("cratelist"); box.innerHTML = "";
+    var h = document.createElement("div"); h.className = "listhdr"; h.textContent = "source · click to select"; box.appendChild(h);
+    function addNode(n) {
+      var row = document.createElement("div");
+      row.className = "row tree-row " + n.kind;
+      row.setAttribute("data-v", n.key);
+      row.style.paddingLeft = (5 + n.depth * 12) + "px";
+
+      var tw = document.createElement("span");
+      tw.className = "tw";
+      tw.textContent = n.children.length ? (n.open ? "▾" : "▸") : "";
+      tw.addEventListener("click", function (e) { e.stopPropagation(); if (n.children.length) { n.open = !n.open; renderSourceTree(); } });
+      row.appendChild(tw);
+
+      var icon = document.createElement("span");
+      icon.className = "ico";
+      icon.style.color = n.kind === "file" ? "#8b949e" : n.color;
+      icon.innerHTML = treeIcon(n.kind);
+      row.appendChild(icon);
+
+      var name = document.createElement("span");
+      name.className = "n"; name.textContent = n.label;
+      row.appendChild(name);
+
+      var count = document.createElement("span");
+      count.className = "c"; count.textContent = n.count;
+      row.appendChild(count);
+
+      row.addEventListener("click", function () { pickSource(n); });
+      row.addEventListener("dblclick", function () { if (n.children.length) { n.open = !n.open; renderSourceTree(); } });
+      box.appendChild(row);
+      if (n.open) n.children.forEach(addNode);
+    }
+    G.sourceTree.forEach(addNode);
+    mark();
+  }
+  function buildList(id, header, entries, colorFn, onPick) {
+    var box = document.getElementById(id); box.innerHTML = "";
+    var h = document.createElement("div"); h.className = "listhdr"; h.textContent = header; box.appendChild(h);
+    entries.forEach(function (e) {
+      var row = document.createElement("div"); row.className = "row"; row.setAttribute("data-v", e.key);
+      row.innerHTML = "<span class='sw' style='background:" + colorFn(e.key) + "'></span><span class='n'></span><span class='c'></span>";
+      row.querySelector(".n").textContent = e.key; row.querySelector(".c").textContent = e.count;
+      row.addEventListener("click", function () { onPick(e.key); });
+      box.appendChild(row);
+    });
+  }
+  renderSourceTree();
+  buildList("kindlist", "kinds · click to select", Object.keys(G.kinds).sort(function (a, b) { return G.kinds[b] - G.kinds[a]; }).map(function (k) { return { key: k, count: G.kinds[k] }; }), function (k) { return KIND_COLORS[k] || DEFAULT_COLOR; }, pickKind);
+  document.getElementById("search").addEventListener("input", function (e) {
+    selSource = null; selKind = null; mark();
+    var q = e.target.value.toLowerCase();
+    if (!q) { api.clear(); return; }
+    api.select(G.nodes.filter(function (n) { return n.label.toLowerCase().indexOf(q) !== -1; }).map(function (n) { return n.id; }));
+  });
+  // edge color key
+  var ek = document.getElementById("edgekey"); ek.innerHTML = "";
+  [["call", "calls"], ["use", "uses"], ["impl", "implements"], ["struct", "structural"]].forEach(function (e) {
+    var s = document.createElement("span");
+    s.innerHTML = "<i style='background:" + EDGE_COLORS[e[0]] + "'></i>" + e[1];
+    ek.appendChild(s);
+  });
+  UIAPI = api;
+}
+
+// ---- node detail panel: the visual `refs` (callers / callees / uses) ----
+function renderGroup(title, color, ids) {
+  var max = 18, html = "<div class='grp'><div class='gt' style='color:" + color + "'>" + esc(title) + " · " + ids.length + "</div>";
+  ids.slice(0, max).forEach(function (oid) {
+    var o = G.byId[oid]; if (!o) return;
+    html += "<div class='ne' data-id='" + esc(oid) + "'><span class='nn'>" + esc(o.label)
+      + "</span><span class='nx'>" + esc(o.kind) + (o.crate ? " · " + esc(o.crate) : "") + "</span></div>";
+  });
+  if (ids.length > max) html += "<div class='more'>+ " + (ids.length - max) + " more</div>";
+  return html + "</div>";
+}
+function neighborhoodIds(id, depth) {
+  var seen = {}; seen[id] = 0;
+  var frontier = [id];
+  for (var d = 0; d < depth; d++) {
+    var next = [];
+    frontier.forEach(function (nid) {
+      (G.adj[nid] || []).forEach(function (e) {
+        if (seen[e.other] !== undefined) return;
+        seen[e.other] = d + 1;
+        next.push(e.other);
+      });
+    });
+    frontier = next;
+    if (!frontier.length) break;
+  }
+  return Object.keys(seen);
+}
+function showDetail(id) {
+  var n = G.byId[id]; if (!n) return;
+  var d = document.getElementById("detail"), nb = G.adj[id] || [], groups = {};
+  nb.forEach(function (e) { var k = e.rel + "|" + e.dir; (groups[k] = groups[k] || []).push(e.other); });
+  var html = "<span class='close' title='close'>×</span>";
+  html += "<div class='dh'>" + esc(n.label) + " <span class='dk'>" + esc(n.kind) + "</span></div>";
+  html += "<div class='dk'>" + esc(n.crate) + "</div>";
+  if (n.source_file) html += "<div class='dsrc'>" + esc(n.source_file) + (n.source_location ? ":" + n.source_location : "") + "</div>";
+  html += "<div class='depth'><span>degree</span><input id='depthctl' type='range' min='0' max='4' step='1' value='1'><output id='depthout'></output></div>";
+  var shown = {};
+  REL_VIEW.forEach(function (rv) {
+    var key = rv[0] + "|" + rv[1], arr = groups[key];
+    if (arr && arr.length) { shown[key] = 1; html += renderGroup(rv[2], rv[3], arr); }
+  });
+  Object.keys(groups).forEach(function (key) {
+    if (shown[key]) return; var p = key.split("|");
+    html += renderGroup(p[0] + " (" + p[1] + ")", "#8b949e", groups[key]);
+  });
+  if (!nb.length) html += "<div class='dk' style='margin-top:6px'>no edges (build with --references for calls/uses)</div>";
+  d.innerHTML = html; d.style.display = "block";
+  d.querySelector(".close").addEventListener("click", function () { d.style.display = "none"; if (UIAPI) UIAPI.clear(); });
+  d.querySelectorAll(".ne").forEach(function (el) { el.addEventListener("click", function () { showDetail(el.getAttribute("data-id")); }); });
+  function setDepth(value) {
+    var depth = Number(value) || 0;
+    var ids = neighborhoodIds(id, depth);
+    var out = d.querySelector("#depthout");
+    if (out) out.textContent = "d=" + depth + " · " + ids.length;
+    if (UIAPI) UIAPI.select(ids);
+  }
+  var ctl = d.querySelector("#depthctl");
+  if (ctl) ctl.addEventListener("input", function () { setDepth(ctl.value); });
+  setDepth(ctl ? ctl.value : 1);
+}
+function hideDetail() { var d = document.getElementById("detail"); if (d) d.style.display = "none"; }
+window.__showDetail = showDetail; // programmatic / test handle (like window.__graph)
+function openInitialFocus() {
+  var id = new URLSearchParams(location.search).get("focus");
+  if (id && G.byId[id]) setTimeout(function () { showDetail(id); }, 400);
+}
+function setEngine(name) { var extra = (name.indexOf("CPU") >= 0 && window.__gpuError) ? " — <span style='color:#f0883e'>GPU failed: " + esc(window.__gpuError) + "</span>" : ""; document.getElementById("engine").innerHTML = "renderer: <b>" + name + "</b>" + extra; }
+function tipEl() { return document.getElementById("tip"); }
+function showTip(node, x, y) { var t = tipEl(); t.style.opacity = 1; t.style.left = (x + 14) + "px"; t.style.top = (y + 14) + "px"; t.innerHTML = "<b>" + esc(node.label) + "</b> <span class='k'>" + esc(node.kind) + "</span><br><span class='k'>" + esc(node.crate) + "</span>" + (node.source_file ? "<br>" + esc(node.source_file) + (node.source_location ? ":" + node.source_location : "") : ""); }
+function hideTip() { tipEl().style.opacity = 0; }
+
+// ---- GPU renderer (Cosmos) ----
+function bootCosmos(Graph) {
+  setEngine("GPU (WebGL / Cosmos)");
+  var stage = document.getElementById("stage");
+  var glcv = document.createElement("canvas"); glcv.id = "gl"; stage.insertBefore(glcv, stage.firstChild);
+  var hovered = null;
+  // Cosmos' simulation space is a fixed 8192² box (GPU texture cap). With many
+  // nodes, strong repulsion pushes them until they clamp on the walls — a hard
+  // square edge. So weaken repulsion (and nudge gravity up a touch) as the graph
+  // grows, keeping the cloud an organic island that doesn't reach the walls.
+  var bigN = Math.max(0, Math.min(1, (G.nodes.length - 15000) / 105000));   // 0 at ≤15k … 1 at ≥120k nodes
+  function simCfg() { return { repulsion: 1.3 - 0.6 * bigN, repulsionTheta: 1.0, linkSpring: 1.0, linkDistance: 6, gravity: 0.6, decay: 1000, friction: 0.85 }; }
+  // Edges fade/thin when zoomed out (all nodes visible) and ramp back up as you
+  // zoom in, so the node cloud reads clearly at a distance.
+  var fitZoom = 0, zoomReady = false;   // zoomReady gates the fade until the initial fits settle
+  function applyZoomFade() {
+    if (!zoomReady) return;             // never run during cosmos' programmatic init fits
+    try {
+      var z = graph.getZoomLevel();
+      if (!z || !isFinite(z)) return;
+      if (!fitZoom || z < fitZoom) fitZoom = z;                 // smallest zoom seen = most zoomed-out
+      var t = Math.max(0, Math.min(1, (z / fitZoom - 1) / 5));  // 0 at full-out → 1 by ~6x zoom-in
+      graph.setConfig({ linkWidthScale: 0.08 + 1.2 * t });
+    } catch (e) {}
+  }
+  var config = {
+    backgroundColor: "#0e1116",
+    nodeSize: function (n) { return sizeOf(n.kind); },
+    nodeColor: function (n) { return KIND_COLORS[n.kind] || DEFAULT_COLOR; },
+    nodeGreyoutOpacity: 0.04, renderLinks: true,
+    linkColor: function (l) { return EDGE_COLORS[l.cat] || "#2b3138"; },
+    linkWidth: function (l) { return l.cat === "struct" ? (l.cross ? 0.8 : 0.3) : (l.cross ? 1.8 : 0.9); },
+    linkWidthScale: 0.08,
+    linkArrows: false, linkGreyoutOpacity: 0.03, fitViewOnInit: true, fitViewDelay: 2500, spaceSize: 8192,
+    simulation: simCfg(),
+    events: {
+      onClick: function (node) { if (node) { showDetail(node.id); } else { hideDetail(); graph.unselectNodes(); api.onExternalClear && api.onExternalClear(); } },
+      onZoom: function (e, userDriven) { if (userDriven) applyZoomFade(); },   // never during programmatic fitView
+      onNodeMouseOver: function (node) { hovered = node; },
+      onNodeMouseOut: function () { hovered = null; hideTip(); }
+    }
+  };
+  var graph = new Graph(glcv, config);
+  window.__graph = graph;
+  applyCosmosSeed(G, 8192);
+  graph.setData(G.nodes, G.links);
+  OK = true;
+  [3000, 6000, 10000].forEach(function (t) { setTimeout(function () { try { graph.fitView(500); } catch (e) {} }, t); });
+  setTimeout(function () { zoomReady = true; }, 11000);   // enable zoom-driven edge fade only after init fits
+  var bar = controlBar(stage);
+  bar.appendChild(mkbtn("fit", function () { try { graph.fitView(400); } catch (e) {} }));
+  var paused = false; var pb = mkbtn("pause", function () { paused = !paused; pb.textContent = paused ? "resume" : "pause"; try { paused ? graph.pause() : graph.start(); } catch (e) {} }); bar.appendChild(pb);
+  glcv.addEventListener("mousemove", function (ev) { if (!hovered) { hideTip(); return; } var r = glcv.getBoundingClientRect(); showTip(hovered, ev.clientX - r.left, ev.clientY - r.top); });
+  var o = document.getElementById("overlay"); o.textContent = "running GPU force simulation…"; setTimeout(function () { o.style.display = "none"; }, 2500);
+  var api = { select: function (ids) { graph.selectNodesByIds(ids); }, clear: function () { graph.unselectNodes(); } };
+  mountUI(api);
+  openInitialFocus();
+}
+
+// ---- CPU fallback (canvas + d3-force) ----
+function bootCanvas() {
+  setEngine("CPU (canvas)");
+  var stage = document.getElementById("stage");
+  var cv = document.createElement("canvas"); cv.id = "cv"; stage.insertBefore(cv, stage.firstChild);
+  var ctx = cv.getContext("2d");
+  var nodes = G.nodes, links = G.links.map(function (l) { return { source: G.byId[l.source], target: G.byId[l.target], cat: l.cat, cross: l.cross }; });
+  nodes.forEach(function (n) { n.x = n.sx || 0; n.y = n.sy || 0; });
+  document.getElementById("overlay").textContent = "computing layout… (" + nodes.length + " nodes)";
+  setTimeout(function () {
+    var sim = d3.forceSimulation(nodes)
+      .force("link", d3.forceLink(links).distance(16).strength(0.25))
+      .force("charge", d3.forceManyBody().strength(-30).theta(0.95).distanceMax(600))
+      .force("x", d3.forceX(0).strength(0.01)).force("y", d3.forceY(0).strength(0.01));
+    sim.stop(); var N = nodes.length > 9000 ? 200 : 300; for (var i = 0; i < N; i++) sim.tick();
+    document.getElementById("overlay").style.display = "none"; run();
+  }, 30);
+
+  function run() {
+    var dpr = Math.min(window.devicePixelRatio || 1, 2), W = 0, H = 0;
+    function resize() { W = stage.clientWidth; H = stage.clientHeight; cv.width = W * dpr; cv.height = H * dpr; cv.style.width = W + "px"; cv.style.height = H + "px"; }
+    resize(); window.addEventListener("resize", function () { resize(); draw(); });
+    var tree = d3.quadtree().x(function (d) { return d.x; }).y(function (d) { return d.y; }).addAll(nodes);
+    var byColor = {}; nodes.forEach(function (n) { var c = KIND_COLORS[n.kind] || DEFAULT_COLOR; (byColor[c] = byColor[c] || []).push(n); });
+    var focus = null;
+    function active(n) { return focus ? focus.has(n.id) : true; }
+    var transform = d3.zoomIdentity, fitK = 0;   // fitK = scale at which all nodes fit (most zoomed-out)
+    function fitToNodes() { var xs = nodes.map(function (n) { return n.x; }), ys = nodes.map(function (n) { return n.y; }); var miX = Math.min.apply(null, xs), maX = Math.max.apply(null, xs), miY = Math.min.apply(null, ys), maY = Math.max.apply(null, ys); var s = Math.min((W - 60) / Math.max(1, maX - miX), (H - 60) / Math.max(1, maY - miY)) * 0.95; transform = d3.zoomIdentity.translate((W - s * (miX + maX)) / 2, (H - s * (miY + maY)) / 2).scale(s); fitK = s; }
+    fitToNodes();
+    var zoom = d3.zoom().scaleExtent([0.01, 60]).on("zoom", function (ev) { transform = ev.transform; draw(); });
+    d3.select(cv).call(zoom).call(zoom.transform, transform).on("dblclick.zoom", null);
+    cv.addEventListener("dblclick", function () { focus = null; hideDetail(); api.onExternalClear && api.onExternalClear(); draw(); });
+
+    function draw() {
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, W, H);
+      ctx.translate(transform.x, transform.y); ctx.scale(transform.k, transform.k);
+      var sel = !!focus;
+      // fade + thin edges when zoomed out (zf→0); ramp to full prominence as you zoom in (zf→1)
+      var zf = fitK ? Math.max(0, Math.min(1, (transform.k / fitK - 1) / 5)) : 1;
+      ["struct", "use", "call", "impl"].forEach(function (cat) {
+        var semantic = cat !== "struct";
+        ctx.strokeStyle = EDGE_COLORS[cat]; ctx.lineWidth = (semantic ? 1.0 : 0.5) * (0.18 + 0.82 * zf) / transform.k;
+        var aFull = semantic ? 0.85 : 0.45, aOut = semantic ? 0.045 : 0.015;
+        ctx.globalAlpha = sel ? 0.3 : (aOut + (aFull - aOut) * zf); ctx.beginPath();
+        for (var i = 0; i < links.length; i++) { var l = links[i]; if (l.cat !== cat) continue; ctx.moveTo(l.source.x, l.source.y); ctx.lineTo(l.target.x, l.target.y); }
+        ctx.stroke();
+      });
+      ctx.globalAlpha = 1;
+      if (sel) paint(false, 0.06); paint(true, 1);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    function paint(litOnly, alpha) {
+      ctx.globalAlpha = alpha; var sel = !!focus;
+      Object.keys(byColor).forEach(function (col) {
+        ctx.fillStyle = col; ctx.beginPath(); var arr = byColor[col];
+        for (var i = 0; i < arr.length; i++) { var n = arr[i]; var a = active(n); if (sel && (litOnly ? !a : a)) continue; var r = sizeOf(n.kind) * 0.7; ctx.moveTo(n.x + r, n.y); ctx.arc(n.x, n.y, r, 0, 6.2832); } ctx.fill();
+      });
+      ctx.globalAlpha = 1;
+    }
+    var hovered = null;
+    cv.addEventListener("mousemove", function (ev) {
+      var r = cv.getBoundingClientRect(); var gx = (ev.clientX - r.left - transform.x) / transform.k, gy = (ev.clientY - r.top - transform.y) / transform.k;
+      var n = tree.find(gx, gy, 12 / transform.k); hovered = n || null;
+      if (n) showTip(n, ev.clientX - r.left, ev.clientY - r.top); else hideTip();
+    });
+    cv.addEventListener("mouseleave", hideTip);
+    cv.addEventListener("click", function () { if (hovered) { api.onExternalClear && api.onExternalClear(); showDetail(hovered.id); } });
+
+    var api = { select: function (ids) { focus = new Set(ids); draw(); }, clear: function () { focus = null; draw(); } };
+    var bar = controlBar(stage);
+    bar.appendChild(mkbtn("fit", function () { fitToNodes(); d3.select(cv).call(zoom.transform, transform); draw(); }));
+    mountUI(api);
+    openInitialFocus();
+    draw();
+    OK = true;
+  }
+}
+
+var STARTED = false, OK = false;
+function startCanvasOnce() {
+  if (STARTED || !G) return; STARTED = true;
+  var g = document.getElementById("gl"); if (g) g.remove();
+  try { bootCanvas(); } catch (e) { document.getElementById("overlay").textContent = "viewer error: " + (e && e.message || e); }
+}
+// Any WebGL/regl failure (sync, async, or rejected promise) → CPU fallback.
+window.addEventListener("error", function (e) { if (!OK && /webgl|regl/i.test((e && e.message) || "")) startCanvasOnce(); });
+window.addEventListener("unhandledrejection", function (e) { var m = e && e.reason ? (e.reason.message || e.reason) : ""; if (!OK && /webgl|regl/i.test("" + m)) startCanvasOnce(); });
+
+// Dispatch GPU (Cosmos) vs CPU (canvas). Runs only after G is populated.
+function boot() {
+  if (webglOK()) {
+    document.getElementById("overlay").textContent = "loading GPU engine…";
+    import("https://esm.sh/@cosmograph/cosmos@1")
+      .then(function (m) { if (STARTED) return; try { STARTED = true; bootCosmos(m.Graph); OK = true; } catch (e) { STARTED = false; window.__gpuError = (e && e.message) || ("" + e); console.warn("[build-graph] GPU init failed → CPU:", e); startCanvasOnce(); } })
+      .catch(function (e) { window.__gpuError = "module load failed: " + ((e && e.message) || e); console.warn("[build-graph] Cosmos load failed → CPU:", e); startCanvasOnce(); });
+    setTimeout(function () { if (!OK) startCanvasOnce(); }, 4500); // watchdog: GPU never confirmed → fall back
+  } else {
+    startCanvasOnce();
+  }
+}
+
+loadData(function (data) { G = buildG(data); seedLayout(G); boot(); });
+</script>
+</body>
+</html>

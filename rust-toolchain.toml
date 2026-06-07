@@ -1,0 +1,5 @@
+# The tool itself builds on stable. The rich Layer 2 (rustdoc JSON) is produced
+# by invoking a *nightly* toolchain out-of-band (`cargo +nightly rustdoc`), so we
+# do not pin nightly here. See README for the supported nightly + rustdoc-types pin.
+[toolchain]
+channel = "stable"

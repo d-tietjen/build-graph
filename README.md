@@ -1,0 +1,227 @@
+# build-graph
+
+Build a **code knowledge graph directly from Rust build artifacts**, and refresh it on every rebuild.
+
+Inspired by [graphify](https://github.com/safishamsi/graphify), but where graphify parses *source* with
+tree-sitter, this reads what the **compiler actually produced** under `target/`:
+
+- the resolved **crate dependency graph** (`cargo metadata`),
+- **source-file membership** (cargo dep-info `.d` files), and
+- the full **symbol / type / trait graph** (nightly **rustdoc JSON**).
+
+Because everything comes from the build, every edge is ground truth — there is no LLM and no inference. The output
+is a graphify-compatible `graph.json`, so graphify's viewer/MCP tooling works on it too, plus a bundled offline
+HTML viewer.
+
+## Dashboard preview
+
+![build-graph dashboard for the shard-kv workspace](docs/assets/shard-kv-dashboard.jpg)
+
+## Two ways to use it
+
+### 1. Automatic — refresh on every `cargo build` (build dependency)
+
+Add the build helper and a three-line `build.rs` to any crate you want graphed:
+
+```toml
+# Cargo.toml
+[build-dependencies]
+build-graph = "0.1.0"
+```
+
+```rust
+// build.rs
+fn main() {
+    build_graph::Builder::new().run();
+}
+```
+
+Now every `cargo build` writes `target/build-graph/graph.json` (+ `graph.html`, `GRAPH_REPORT.md`). Cargo only
+re-runs a crate's build script when that crate changes, so the graph updates **incrementally** for free. Add the
+helper to several workspace members and their fragments merge into one graph.
+
+This path is deliberately lightweight (no `cargo`/toolchain invocation from inside the build — it can't deadlock)
+and produces the **Layer 1** graph: crates, source files, and `depends_on` edges. For the rich symbol layer, use
+the CLI below. Set `BUILD_GRAPH=0` to disable; build-script errors never fail your build.
+
+### 2. On demand — the `cargo build-graph` CLI
+
+```bash
+cargo install build-graph     # installs `cargo-build-graph`, invoked as `cargo build-graph`
+
+cargo build-graph build        # run `cargo build`, then refresh the graph from target/
+cargo build-graph update       # refresh from the current target/ without building
+cargo build-graph view         # open the bundled HTML viewer
+cargo build-graph build --rich # also add the nightly rustdoc symbol/type layer (Layer 2)
+cargo build-graph build --rich --references     # + semantic call/use edges via rust-analyzer (Layer 3)
+cargo build-graph context <name> # one-shot: a symbol's location, counts + top callers/uses/impls
+cargo build-graph find <name>  # locate symbols + counts (or `--at FILE:LINE` reverse lookup)
+cargo build-graph refs <name>  # expand one symbol's relationships (bounded, filterable, `--depth N`)
+cargo build-graph serve        # load the graph once + serve queries; find/refs/context auto-use it
+```
+
+Useful flags: `--manifest-path`, `--target-dir`, `--out <dir>`, `-p <crate>` (scope), `--release`,
+`--nightly <toolchain>`, `--no-derives` (drop derive-generated impls), `--references` (Layer 3, below).
+
+## The layers
+
+| Layer | Source | Toolchain | Nodes | Edges |
+|-------|--------|-----------|-------|-------|
+| **1** (always) | `cargo metadata` + dep-info `.d` | **stable** | crates, source files | `depends_on`, `contains` |
+| **2** (`--rich`) | nightly **rustdoc JSON** | **nightly** | modules, structs, enums, traits, fns, methods, fields, type aliases, consts, statics | `implements`, `has_field`, `has_method`, `has_variant`, `takes`, `returns`, `uses_type`, `aliases` |
+| **3** (`--references`) | **rust-analyzer** (SCIP index) | stable | — (connects Layer-2 items) | `calls`, `uses`, plus owner rollups `member_calls`, `member_uses` — **semantic** |
+
+Layer 2 items carry `source_file:line` and link up to their Layer-1 crate node; cross-crate type references
+resolve to other workspace crate nodes, so the layers form one connected graph.
+
+### Layer 3 — function- and object-level references (`--references`)
+
+rustdoc only sees *signatures*, so Layer 2 stops at the type level. Layer 3 reaches into function **bodies** for
+the reference graph that makes "find every use/caller of this symbol" work — and it uses **rust-analyzer** to get
+it right. The tool runs `rust-analyzer scip` over the workspace, parses the resulting index, maps each symbol to
+its Layer-2 node, attributes every reference to its enclosing function, and emits a `calls` edge (target is a
+fn/method) or a `uses` edge (target is a type/const/static/macro/field/variant/etc.).
+
+Those exact function-level references are also rolled up through the Layer-2 ownership graph. If a method on
+`Widget` calls `paint` and uses `Color`, the graph keeps the direct method edges and adds `Widget -> paint`
+(`member_calls`) and `Widget -> Color` (`member_uses`). The same rollup works for structs, enums, traits,
+variants, unions, and modules, so clicking an object-like node in the viewer shows the relationships made by the
+code inside it.
+
+Why rust-analyzer and not the build artifacts? Because for *this* purpose — what the source actually references —
+the semantic resolution is what matters, and it's what object-file or syntactic approaches get wrong: it resolves
+**method calls**, **dyn-dispatch** calls (`a.method()` on a `&dyn Trait`), calls **inside `async fn`s** (which
+object code files under the generated future, not the source fn), and field/const/type uses — completely.
+
+This is the **only** reference source build-graph offers. It needs `rust-analyzer` installed
+(`rustup component add rust-analyzer`); if it's absent, the layer is **skipped with a message** (we'd rather not
+offer the feature than emit inaccurate edges). The index is whole-workspace, so `--references` re-runs it only
+when something changed. `--references` implies `--rich`.
+
+### Nightly + rustdoc-types pin
+
+rustdoc's JSON format is unstable and versioned. This repo pins `rustdoc-types = "0.57"`
+(`FORMAT_VERSION = 57`), which matches **`nightly-2026-02-27`**. The CLI checks the emitted `format_version`
+against the pinned one and fails with a clear message on mismatch — pass `--nightly <toolchain>` to select a
+matching nightly, or bump the `rustdoc-types` dependency. Layer 1 never needs nightly, so the tool is always
+useful even if Layer 2 is off.
+
+## Output
+
+Written to `target/build-graph/` (or `--out`):
+
+- **`graph.json.gz`** — the graph data, gzip-compressed by default (~35× smaller than raw JSON on a large
+  workspace). graphify-compatible (`nodes`/`edges`/`hyperedges`); deterministic, path-derived IDs so it diffs
+  cleanly across builds; every edge is `EXTRACTED`, `confidence_score: 1.0`. Pass **`--no-compress`** to write a
+  plain **`graph.json`** instead (handy for `jq` or graphify's MCP server). Every command reads either form
+  transparently — the format is detected by content (gzip magic bytes), not the extension — so you can switch
+  freely and an incremental rebuild reloads the prior graph regardless.
+- **`graph.html`** — force-directed viewer. Small graphs inline their data, so the file is self-contained and
+  opens straight from `file://`. Large graphs (compact JSON over 32 MiB, e.g. a whole big workspace) are *not*
+  inlined — the viewer fetches the data file beside it (`graph.json.gz`, or `graph.json`) and inflates it
+  in-browser (`DecompressionStream`), so serve the output dir over HTTP (`cd target/build-graph && python3 -m
+  http.server`, then open `http://localhost:8000/graph.html`). The viewer shows this hint if you open such a file
+  from `file://`.
+- **`GRAPH_REPORT.md`** — counts, largest crates, and the most-connected "god nodes".
+
+Because the graph is graphify-compatible, you can also point graphify's MCP server at a plain `graph.json` — build
+with `--no-compress` (or `gunzip -k graph.json.gz`) first: `python3 -m graphify.serve target/build-graph/graph.json`.
+
+## Query the graph — `find` and `refs`
+
+Two commands answer "where is this symbol and what connects to it" — questions text search can't
+(*who implements this trait*, *what takes this type*, *which crates use it*, across crate boundaries). The API is
+**deliberately bounded**: `find` returns counts so you ask for only the context you need; `refs` returns the
+actual edges, capped and filterable.
+
+**`find <name>`** locates symbols and prints metadata + **relationship counts** — never the edges themselves
+(a hot type can have thousands):
+
+```bash
+cargo build-graph find OperationExecutor          # human-readable
+cargo build-graph find Config --kind struct --json # machine-readable, stable shape
+```
+
+```
+Operation — trait · crate endpoint-types
+  src:  endpoints/endpoint-types/src/lib.rs:255
+  refs: 2715 total (out 6 · in 2709)
+        out: has_method 6
+        in:  implements 2708 · contains 1
+```
+
+Many matches? It reports `total_matches` vs `returned`; narrow with `--exact`, `--kind`, `--crate`, `--limit`
+(default 20, max 100).
+
+**`refs <name|id>`** expands *one* symbol's relationships — **bounded** (default 50, hard cap 200) and
+**filterable**, so a huge connection list narrows to the relevant slice:
+
+```bash
+cargo build-graph refs Operation --relation implements --crate ep-azure   # who implements it, in one crate
+cargo build-graph refs Operation --relation implements --match advisor     # text-search the list down
+```
+
+```
+Operation — trait · crate endpoint-types  (endpoints/endpoint-types/src/lib.rs:255)
+  showing 3 of 855 — narrow with --relation / --crate / --kind / --match, or raise --limit
+  implements  <- AdvisorGetRecommendationInput (ep-azure)  endpoints/azure/.../get_recommendation.rs:17
+  …
+```
+
+`refs` flags: `--relation`, `--incoming`/`--outgoing` (default both), `--match <substr>`, `--kind`, `--crate`,
+`--limit`. Pass a node **`id`** from `find` to target a specific symbol when a name is ambiguous. Both commands
+locate the graph via `--graph`/`--out`/`--manifest-path` (default `<target>/build-graph/graph.json.gz`, falling
+back to `graph.json`); build with `--rich` first — the symbol layer is what they search.
+
+### For AI agents
+
+The bounded shape is the point: `find … --json` gives each symbol's `source_file:source_location` and
+relationship **counts**, then `refs … --json` returns a capped, filtered slice of edges — so an agent informs
+what it looks for and opens exactly the right files instead of grepping or drowning in context. The commands are
+plain CLI, so any agent that can run a shell can use them; ready-to-use guidance ships for the common ones:
+
+- **Codex** — copy the body of [`integrations/codex/AGENTS.md`](integrations/codex/AGENTS.md) into your project's
+  `AGENTS.md` (or `~/.codex/AGENTS.md` to enable it everywhere). Codex loads `AGENTS.md` before each task and runs
+  the CLI through its shell — no plugin needed.
+- **Any MCP client** — the graph is graphify-compatible, so graphify's MCP server
+  (`python3 -m graphify.serve target/build-graph/graph.json`) exposes query tools over it; build with
+  `--no-compress` so a plain `graph.json` is on disk, then point your agent's MCP config at it. (A native
+  `cargo build-graph` MCP server exposing `find`/`refs` directly is a candidate.)
+
+## Architecture
+
+One published crate, **`build-graph`**, ships two targets:
+
+- **library `build_graph`** — the `[build-dependencies]` helper (`Builder`) plus the graph model,
+  deterministic IDs, fragment merge, graphify-compatible output, viewer, and report.
+- **binary `cargo-build-graph`** — the `cargo build-graph` CLI (Layer 0 build stream + Layer 1 dep-info +
+  Layer 2 rustdoc JSON + Layer 3 rust-analyzer SCIP `references`), plus the `find`/`refs` graph queries and
+  the `view` server.
+
+## Incremental & caching
+
+Both entry points only re-do the crates whose **source files changed**:
+
+- The **CLI** persists the graph plus a `.build-graph-cache.json` beside it. Each run fingerprints every crate by
+  its sources' mtimes; unchanged crates are reused from the prior graph, and only dirty crates are re-scanned (and,
+  with `--rich`, re-documented). A warm no-op over a 14-crate rich graph (~22k nodes) is ~1s vs ~26s cold; a
+  one-crate edit re-documents just that crate (~2s). Cross-crate edges into a re-extracted crate survive (IDs are
+  deterministic), and any genuinely dangling edge is pruned before writing.
+- The **build-dependency** is incremental by construction: Cargo only re-runs a changed crate's build script, so
+  only that crate's fragment is rewritten before the merge.
+
+## Limitations / future work
+
+- The build-dependency produces Layer 1 only (a build script can't safely run nightly rustdoc or nested cargo).
+- Derive-generated impls (`clone`, `default`, …) add method nodes by default; pass **`--no-derives`** to drop
+  every `#[automatically_derived]` impl (its `implements` edge and its methods) from the rich layer.
+- rustdoc JSON gives only the *structural* graph (signatures, impls, containment). Body references (`calls`,
+  `uses`) and their object-level rollups (`member_calls`, `member_uses`) are added by **Layer 3 `--references`**,
+  which uses rust-analyzer — there is no build-artifact fallback, because object-file and syntactic approaches
+  proved too inaccurate for an async codebase (object code files `async fn` calls under the generated future, not
+  the source fn; syntactic parsing can't resolve methods). So Layer 3 needs `rust-analyzer` installed; without it
+  the references are simply not produced.
+
+## License
+
+MIT
