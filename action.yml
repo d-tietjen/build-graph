@@ -1,0 +1,134 @@
+name: "build-graph architecture"
+description: "Generate a Rust build graph and refresh an AI-readable ARCHITECTURE.md section."
+author: "Devon Tietjen"
+
+inputs:
+  manifest-path:
+    description: "Path to the workspace Cargo.toml."
+    required: false
+    default: "Cargo.toml"
+  graph-dir:
+    description: "Directory for graph.json[.gz], graph.html, and GRAPH_REPORT.md."
+    required: false
+    default: "target/build-graph"
+  architecture-path:
+    description: "Markdown file whose generated build-graph section should be updated."
+    required: false
+    default: "ARCHITECTURE.md"
+  nightly:
+    description: "Nightly toolchain used for rustdoc JSON."
+    required: false
+    default: "nightly-2026-02-27"
+  references:
+    description: "Add rust-analyzer calls/uses edges. Implies the rich rustdoc layer."
+    required: false
+    default: "true"
+  no-compress:
+    description: "Write graph.json instead of graph.json.gz."
+    required: false
+    default: "false"
+  release:
+    description: "Build the target workspace with --release."
+    required: false
+    default: "false"
+  package:
+    description: "Optional Cargo package to graph; may be passed more than once by using separate jobs."
+    required: false
+    default: ""
+  install-source:
+    description: "Where to install cargo-build-graph from: action, crates.io, or skip."
+    required: false
+    default: "action"
+  build-graph-version:
+    description: "Crates.io version used when install-source is crates.io."
+    required: false
+    default: "0.1.0"
+  architecture-limit:
+    description: "Maximum rows per generated architecture table."
+    required: false
+    default: "15"
+
+outputs:
+  graph-dir:
+    description: "Directory containing generated graph artifacts."
+    value: ${{ inputs.graph-dir }}
+  architecture-path:
+    description: "Architecture markdown file updated by the action."
+    value: ${{ inputs.architecture-path }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install Rust tooling
+      shell: bash
+      env:
+        BUILD_GRAPH_NIGHTLY: ${{ inputs.nightly }}
+      run: |
+        set -euo pipefail
+        rustup toolchain install "$BUILD_GRAPH_NIGHTLY" --profile minimal
+        rustup component add rust-analyzer || true
+
+    - name: Install build-graph
+      shell: bash
+      env:
+        BUILD_GRAPH_INSTALL_SOURCE: ${{ inputs.install-source }}
+        BUILD_GRAPH_VERSION: ${{ inputs.build-graph-version }}
+      run: |
+        set -euo pipefail
+        case "$BUILD_GRAPH_INSTALL_SOURCE" in
+          action)
+            cargo install --path "$GITHUB_ACTION_PATH" --locked --force
+            ;;
+          crates.io)
+            cargo install build-graph --version "$BUILD_GRAPH_VERSION" --locked --force
+            ;;
+          skip)
+            command -v cargo-build-graph >/dev/null
+            ;;
+          *)
+            echo "::error::install-source must be one of: action, crates.io, skip"
+            exit 1
+            ;;
+        esac
+
+    - name: Generate build graph
+      shell: bash
+      env:
+        BUILD_GRAPH_MANIFEST_PATH: ${{ inputs.manifest-path }}
+        BUILD_GRAPH_GRAPH_DIR: ${{ inputs.graph-dir }}
+        BUILD_GRAPH_NIGHTLY: ${{ inputs.nightly }}
+        BUILD_GRAPH_REFERENCES: ${{ inputs.references }}
+        BUILD_GRAPH_NO_COMPRESS: ${{ inputs.no-compress }}
+        BUILD_GRAPH_RELEASE: ${{ inputs.release }}
+        BUILD_GRAPH_PACKAGE: ${{ inputs.package }}
+      run: |
+        set -euo pipefail
+        args=(build --manifest-path "$BUILD_GRAPH_MANIFEST_PATH" --out "$BUILD_GRAPH_GRAPH_DIR" --nightly "$BUILD_GRAPH_NIGHTLY")
+        if [[ "$BUILD_GRAPH_REFERENCES" == "true" ]]; then
+          args+=(--references)
+        else
+          args+=(--rich)
+        fi
+        if [[ "$BUILD_GRAPH_NO_COMPRESS" == "true" ]]; then
+          args+=(--no-compress)
+        fi
+        if [[ "$BUILD_GRAPH_RELEASE" == "true" ]]; then
+          args+=(--release)
+        fi
+        if [[ -n "$BUILD_GRAPH_PACKAGE" ]]; then
+          args+=(-p "$BUILD_GRAPH_PACKAGE")
+        fi
+        cargo build-graph "${args[@]}"
+
+    - name: Refresh ARCHITECTURE.md
+      shell: bash
+      env:
+        BUILD_GRAPH_GRAPH_DIR: ${{ inputs.graph-dir }}
+        BUILD_GRAPH_ARCHITECTURE_PATH: ${{ inputs.architecture-path }}
+        BUILD_GRAPH_ARCHITECTURE_LIMIT: ${{ inputs.architecture-limit }}
+      run: |
+        set -euo pipefail
+        python3 "$GITHUB_ACTION_PATH/scripts/render_architecture.py" \
+          --graph-dir "$BUILD_GRAPH_GRAPH_DIR" \
+          --architecture "$BUILD_GRAPH_ARCHITECTURE_PATH" \
+          --limit "$BUILD_GRAPH_ARCHITECTURE_LIMIT"

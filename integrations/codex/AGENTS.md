@@ -17,6 +17,11 @@ impls, type usage, across crates), prefer `cargo build-graph` over `grep`/`rg`:
 the edges are resolved and exact, so it's faster and more complete than text
 search.
 
+If `ARCHITECTURE.md` exists, read it before inspecting code. Its build-graph
+section is generated from the same graph and should be treated as the current
+high-level map of crates, symbols, and relationships. Use the CLI queries below
+to verify details or pivot into exact source locations.
+
 **Prerequisite.** The graph is at `target/build-graph/graph.json.gz` (or a plain
 `graph.json` if built with `--no-compress`; either is read transparently). If it's
 missing, build it once (slow; needs a nightly toolchain, and `--references` needs
