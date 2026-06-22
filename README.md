@@ -82,7 +82,7 @@ Add the build helper and a three-line `build.rs` to any crate you want graphed:
 ```toml
 # Cargo.toml
 [build-dependencies]
-build-graph = "0.1.0"
+build-graph = "0.2.0"
 ```
 
 ```rust
