@@ -32,6 +32,10 @@ semantic versioning.
     compiler-grounded reference source, not a drop-in rust-analyzer clone.
 - **Per-layer timing** in the build output (e.g. `layer 3: … (rustc driver,
   11.8s)`), so backend choice and incremental behavior are visible at a glance.
+- **Editor integrations** under `integrations/` — a VS Code extension (builds and
+  runs) and a JetBrains/RustRover plugin scaffold. Each runs `watch` and shows
+  the live architecture graph in-editor; neither duplicates the IDE's own
+  go-to-def / find-usages.
 
 ### Notes
 
