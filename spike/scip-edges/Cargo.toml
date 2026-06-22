@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "scip-edges"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+scip = "0.5.2"
+protobuf = "3"

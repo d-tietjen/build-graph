@@ -34,27 +34,61 @@ impl Callbacks for BgCallbacks {
     }
 }
 
+/// `file:line` of a def's span, or `None` for dummy/macro spans.
+fn loc_of(tcx: TyCtxt<'_>, def_id: rustc_span::def_id::DefId) -> Option<(String, usize)> {
+    let span = tcx.def_span(def_id);
+    if span.is_dummy() {
+        return None;
+    }
+    let sm = tcx.sess.source_map();
+    let lo = sm.lookup_char_pos(span.lo());
+    let file = sm.filename_for_diagnostics(&lo.file.name).to_string();
+    Some((file, lo.line))
+}
+
 fn extract(tcx: TyCtxt<'_>) {
     let krate = tcx.crate_name(LOCAL_CRATE);
     let mut calls: usize = 0;
     let mut method_calls: usize = 0;
     let mut cross_crate: usize = 0;
     let mut samples: Vec<String> = Vec::new();
+    // Full edge dump (for equivalence checking against rust-analyzer scip):
+    // (caller "file:line", callee "file:line"). Only collected when requested.
+    let want_edges = std::env::var_os("BG_DRIVER_EDGES").is_some();
+    let mut edges: Vec<(String, String)> = Vec::new();
 
     for owner in tcx.hir_body_owners() {
         let body = tcx.hir_body_owned_by(owner);
         let typeck = tcx.typeck(owner);
         let owner_path = tcx.def_path_str(owner.to_def_id());
+        let owner_loc =
+            want_edges
+                .then(|| loc_of(tcx, owner.to_def_id()))
+                .flatten()
+                .map(|(f, l)| format!("{f}:{l}"));
         let mut v = CallVisitor {
             tcx,
             typeck,
             owner: owner_path,
+            owner_loc,
             calls: &mut calls,
             method_calls: &mut method_calls,
             cross_crate: &mut cross_crate,
             samples: &mut samples,
+            edges: &mut edges,
         };
         v.visit_expr(body.value);
+    }
+
+    if want_edges {
+        if let Ok(path) = std::env::var("BG_DRIVER_EDGES") {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                for (c, callee) in &edges {
+                    let _ = writeln!(f, "call\t{c}\t{callee}");
+                }
+            }
+        }
     }
 
     eprintln!(
@@ -80,10 +114,12 @@ struct CallVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     typeck: &'tcx TypeckResults<'tcx>,
     owner: String,
+    owner_loc: Option<String>,
     calls: &'a mut usize,
     method_calls: &'a mut usize,
     cross_crate: &'a mut usize,
     samples: &'a mut Vec<String>,
+    edges: &'a mut Vec<(String, String)>,
 }
 
 impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
@@ -103,6 +139,11 @@ impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
                 self.owner,
                 self.tcx.def_path_str(callee)
             ));
+        }
+        if let Some(caller) = self.owner_loc.clone() {
+            if let Some((f, l)) = loc_of(self.tcx, callee) {
+                self.edges.push((caller, format!("{f}:{l}")));
+            }
         }
     }
 }
