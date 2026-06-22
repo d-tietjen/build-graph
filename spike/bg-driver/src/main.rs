@@ -20,7 +20,7 @@ extern crate rustc_span;
 use rustc_driver::{Callbacks, Compilation};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{AmbigArg, Expr, ExprKind, Pat, PatKind, QPath, Ty, TyKind};
+use rustc_hir::{AmbigArg, Expr, ExprKind, HirId, Pat, PatKind, QPath, Ty, TyKind};
 use rustc_interface::interface::Compiler;
 use rustc_middle::ty::{self, TyCtxt, TypeckResults};
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
@@ -74,6 +74,7 @@ fn extract(tcx: TyCtxt<'_>) {
         let mut v = CallVisitor {
             tcx,
             typeck,
+            owner_did: owner.to_def_id(),
             owner: owner_path,
             owner_loc,
             calls: &mut calls,
@@ -84,6 +85,15 @@ fn extract(tcx: TyCtxt<'_>) {
             edges: &mut edges,
         };
         v.visit_expr(body.value);
+        // Also walk the fn signature (param/return/where types) — rust-analyzer
+        // records those type references too, attributed to the fn.
+        let node = tcx.hir_node_by_def_id(owner);
+        if let Some(decl) = node.fn_decl() {
+            intravisit::walk_fn_decl(&mut v, decl);
+        }
+        if let Some(generics) = node.generics() {
+            intravisit::walk_generics(&mut v, generics);
+        }
     }
 
     if want_edges {
@@ -126,6 +136,7 @@ fn extract(tcx: TyCtxt<'_>) {
 struct CallVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     typeck: &'tcx TypeckResults<'tcx>,
+    owner_did: DefId,
     owner: String,
     owner_loc: Option<String>,
     calls: &'a mut usize,
@@ -173,6 +184,18 @@ impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
     fn use_def(&mut self, callee: DefId) {
         *self.uses_count += 1;
         self.record("use", callee);
+    }
+
+    /// For a method call, resolve to the *concrete impl* method when the receiver
+    /// is monomorphizable (matching rust-analyzer, which records the impl). For a
+    /// generic/dyn receiver this can't be done, so fall back to the trait method.
+    fn method_target(&self, trait_method: DefId, hir_id: HirId) -> DefId {
+        let args = self.typeck.node_args(hir_id);
+        let env = ty::TypingEnv::post_analysis(self.tcx, self.owner_did);
+        match ty::Instance::try_resolve(self.tcx, env, trait_method, args) {
+            Ok(Some(inst)) => inst.def_id(),
+            _ => trait_method,
+        }
     }
 
     /// A `uses` target from a path resolution: types, consts, statics, fields,
@@ -225,7 +248,8 @@ impl<'a, 'tcx> Visitor<'tcx> for CallVisitor<'a, 'tcx> {
                 }
                 ExprKind::MethodCall(..) => {
                     if let Some(def_id) = self.typeck.type_dependent_def_id(ex.hir_id) {
-                        self.call(def_id, true);
+                        let target = self.method_target(def_id, ex.hir_id);
+                        self.call(target, true);
                     }
                 }
                 // value paths to consts/statics/variants used as values → use
