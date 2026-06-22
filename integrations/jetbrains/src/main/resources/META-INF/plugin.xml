@@ -1,0 +1,27 @@
+<idea-plugin>
+  <id>dev.eden.build-graph</id>
+  <name>build-graph</name>
+  <vendor email="devon@eden.dev" url="https://github.com/d-tietjen/build-graph">Eden</vendor>
+  <description><![CDATA[
+    Live Rust architecture graph from <a href="https://github.com/d-tietjen/build-graph">build-graph</a>,
+    refreshed on save. Shows the cross-crate architecture graph (crates, files, symbols,
+    relationships) in a tool window — it does not duplicate the IDE's own go-to-def /
+    find-usages.
+  ]]></description>
+
+  <depends>com.intellij.modules.platform</depends>
+
+  <extensions defaultExtensionNs="com.intellij">
+    <toolWindow id="build-graph" anchor="right" icon="AllIcons.Toolwindows.ToolWindowHierarchy"
+                factoryClass="dev.eden.buildgraph.BuildGraphToolWindowFactory"/>
+  </extensions>
+
+  <actions>
+    <action id="BuildGraph.StartWatch"
+            class="dev.eden.buildgraph.StartWatchAction"
+            text="build-graph: Start Watch"
+            description="Run cargo build-graph watch and keep the graph fresh on save">
+      <add-to-group group-id="ToolsMenu" anchor="last"/>
+    </action>
+  </actions>
+</idea-plugin>

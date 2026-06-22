@@ -28,6 +28,18 @@ HTML viewer.
 
 ![build-graph dashboard for the shard-kv workspace](docs/assets/shard-kv-dashboard.jpg)
 
+## Editor integrations
+
+Thin shells that run `cargo build-graph watch` and show the live architecture
+graph in-editor (they don't duplicate the IDE's own go-to-def / find-usages):
+
+- **VS Code** — [`integrations/vscode`](integrations/vscode) (builds + runs today).
+- **JetBrains / RustRover** — [`integrations/jetbrains`](integrations/jetbrains)
+  (scaffold; needs a JDK to build).
+
+The live graph also works with no editor plugin at all: `cargo build-graph watch
+--driver` plus the bundled HTML viewer / `serve`.
+
 ## GitHub Action — keep `ARCHITECTURE.md` fresh
 
 Add this workflow to any Rust repo. It builds the graph, updates the generated section of `ARCHITECTURE.md`, and
