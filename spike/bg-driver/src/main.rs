@@ -108,7 +108,11 @@ fn extract(tcx: TyCtxt<'_>) {
             for did in tcx.hir_crate_items(()).definitions() {
                 if let Some((file, line)) = loc_of(tcx, did.to_def_id()) {
                     if !file.starts_with('/') {
-                        buf.push_str(&format!("{file}:{line}\t{:?}\n", tcx.def_kind(did)));
+                        buf.push_str(&format!(
+                            "{file}:{line}\t{:?}\t{}\n",
+                            tcx.def_kind(did),
+                            tcx.def_path_str(did.to_def_id())
+                        ));
                     }
                 }
             }
