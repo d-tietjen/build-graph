@@ -96,6 +96,26 @@ fn extract(tcx: TyCtxt<'_>) {
         }
     }
 
+    // Optional def catalog: `file:line -> DefKind` for every local def, so a
+    // node-space analysis can classify each reference target (field/variant/
+    // type-alias = Layer 2's structural domain, vs a genuine reference gap).
+    if let Ok(dir) = std::env::var("BG_DRIVER_DEFS") {
+        use std::io::Write;
+        let _ = std::fs::create_dir_all(&dir);
+        let path = format!("{dir}/{krate}-{}.tsv", std::process::id());
+        if let Ok(mut f) = std::fs::File::create(&path) {
+            let mut buf = String::new();
+            for did in tcx.hir_crate_items(()).definitions() {
+                if let Some((file, line)) = loc_of(tcx, did.to_def_id()) {
+                    if !file.starts_with('/') {
+                        buf.push_str(&format!("{file}:{line}\t{:?}\n", tcx.def_kind(did)));
+                    }
+                }
+            }
+            let _ = f.write_all(buf.as_bytes());
+        }
+    }
+
     if want_edges {
         // BG_DRIVER_EDGES is a *directory*: each (parallel) rustc process writes
         // its own file, so concurrent compiles can't tear each other's lines.
