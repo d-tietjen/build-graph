@@ -150,10 +150,28 @@ the semantic resolution is what matters, and it's what object-file or syntactic 
 **method calls**, **dyn-dispatch** calls (`a.method()` on a `&dyn Trait`), calls **inside `async fn`s** (which
 object code files under the generated future, not the source fn), and field/const/type uses — completely.
 
-This is the **only** reference source build-graph offers. It needs `rust-analyzer` installed
-(`rustup component add rust-analyzer`); if it's absent, the layer is **skipped with a message** (we'd rather not
-offer the feature than emit inaccurate edges). The index is whole-workspace, so `--references` re-runs it only
-when something changed. `--references` implies `--rich`.
+rust-analyzer needs to be installed (`rustup component add rust-analyzer`); if it's absent, the layer is
+**skipped with a message** (we'd rather not offer the feature than emit inaccurate edges). The index is
+whole-workspace, so `--references` re-runs it only when something changed. `--references` implies `--rich`.
+
+#### Alternative backend — the rustc driver (`--driver-bin`, experimental)
+
+`rust-analyzer scip` is a **cold, whole-workspace** index: any change re-runs the whole thing (minutes to tens of
+minutes on a large workspace). The alternative is a clippy-style **rustc driver** that reads the compiler's HIR
+during a normal `cargo check`, so it is **incremental for free** — cargo only re-runs it for the crates it
+recompiles. Build the driver (see [`spike/bg-driver`](spike/bg-driver), pinned to the same nightly) and pass it:
+
+```bash
+cargo build-graph build --driver-bin /path/to/bg-driver --nightly nightly-2026-02-27
+```
+
+This replaces the scip pass: it runs `cargo check --all-targets` with the driver as `RUSTC_WORKSPACE_WRAPPER`,
+persists per-crate edge files (keyed by cargo's stable metadata hash) under `<out>/driver-refs`, and maps them
+onto the Layer-2 nodes. On a benchmark workspace (108 crates) it was ~7× faster cold and orders of magnitude
+faster per edit. Its resolution is validated against ground truth, but it is **not** byte-identical to
+rust-analyzer (it indexes the semantic def-reference graph, not rust-analyzer's syntactic occurrence graph — e.g.
+it sees through `use` imports and omits item-level type decls that Layer 2 already covers). Treat it as a faster,
+compiler-grounded reference source rather than a drop-in rust-analyzer clone.
 
 ### Nightly + rustdoc-types pin
 
