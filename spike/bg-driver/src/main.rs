@@ -205,57 +205,72 @@ impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
 
 impl<'a, 'tcx> Visitor<'tcx> for CallVisitor<'a, 'tcx> {
     fn visit_expr(&mut self, ex: &'tcx Expr<'tcx>) {
-        match ex.kind {
-            ExprKind::Call(callee, _args) => {
-                if let ExprKind::Path(ref qpath) = callee.kind {
-                    if let Res::Def(_dk, def_id) = self.typeck.qpath_res(qpath, callee.hir_id) {
-                        self.call(def_id, false);
-                    }
-                }
-            }
-            ExprKind::MethodCall(..) => {
-                if let Some(def_id) = self.typeck.type_dependent_def_id(ex.hir_id) {
-                    self.call(def_id, true);
-                }
-            }
-            // value paths to consts/statics/variants used as values → use
-            ExprKind::Path(ref qpath) => {
-                self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id));
-            }
-            // struct/enum-variant literal → use of the type/variant
-            ExprKind::Struct(qpath, ..) => {
-                self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id));
-            }
-            // field access → use of the field def
-            ExprKind::Field(recv, _) => {
-                let ty = self.typeck.expr_ty_adjusted(recv);
-                if let ty::Adt(adt, _) = ty.kind() {
-                    if adt.is_struct() || adt.is_union() {
-                        let idx = self.typeck.field_index(ex.hir_id);
-                        if let Some(field) = adt.non_enum_variant().fields.get(idx) {
-                            self.use_def(field.did);
+        // Skip references in macro-expanded code: rust-analyzer's SCIP works on
+        // source tokens, so it doesn't emit occurrences for derive/`?`-desugar
+        // generated calls. User code spliced into a macro arg keeps its own span.
+        if !ex.span.from_expansion() {
+            match ex.kind {
+                ExprKind::Call(callee, _args) => {
+                    if let ExprKind::Path(ref qpath) = callee.kind {
+                        if let Res::Def(dk, def_id) = self.typeck.qpath_res(qpath, callee.hir_id) {
+                            // tuple-struct/variant construction: rustc says "call",
+                            // SCIP says "use" — match SCIP.
+                            if matches!(dk, DefKind::Ctor(..)) {
+                                self.use_def(def_id);
+                            } else {
+                                self.call(def_id, false);
+                            }
                         }
                     }
                 }
+                ExprKind::MethodCall(..) => {
+                    if let Some(def_id) = self.typeck.type_dependent_def_id(ex.hir_id) {
+                        self.call(def_id, true);
+                    }
+                }
+                // value paths to consts/statics/variants used as values → use
+                ExprKind::Path(ref qpath) => {
+                    self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id));
+                }
+                // struct/enum-variant literal → use of the type/variant
+                ExprKind::Struct(qpath, ..) => {
+                    self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id));
+                }
+                // field access → use of the field def
+                ExprKind::Field(recv, _) => {
+                    let ty = self.typeck.expr_ty_adjusted(recv);
+                    if let ty::Adt(adt, _) = ty.kind() {
+                        if adt.is_struct() || adt.is_union() {
+                            let idx = self.typeck.field_index(ex.hir_id);
+                            if let Some(field) = adt.non_enum_variant().fields.get(idx) {
+                                self.use_def(field.did);
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
         intravisit::walk_expr(self, ex);
     }
 
     fn visit_ty(&mut self, t: &'tcx Ty<'tcx, AmbigArg>) {
-        if let TyKind::Path(QPath::Resolved(_, path)) = t.kind {
-            self.use_from_res(path.res);
+        if !t.span.from_expansion() {
+            if let TyKind::Path(QPath::Resolved(_, path)) = t.kind {
+                self.use_from_res(path.res);
+            }
         }
         intravisit::walk_ty(self, t);
     }
 
     fn visit_pat(&mut self, p: &'tcx Pat<'tcx>) {
-        match p.kind {
-            PatKind::TupleStruct(ref qpath, ..) | PatKind::Struct(ref qpath, ..) => {
-                self.use_from_res(self.typeck.qpath_res(qpath, p.hir_id));
+        if !p.span.from_expansion() {
+            match p.kind {
+                PatKind::TupleStruct(ref qpath, ..) | PatKind::Struct(ref qpath, ..) => {
+                    self.use_from_res(self.typeck.qpath_res(qpath, p.hir_id));
+                }
+                _ => {}
             }
-            _ => {}
         }
         intravisit::walk_pat(self, p);
     }
