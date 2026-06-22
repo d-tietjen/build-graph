@@ -38,6 +38,8 @@ struct Cli {
 enum Cmd {
     /// Run `cargo build` (JSON stream), then refresh the graph from target/.
     Build(BuildArgs),
+    /// Watch the workspace and refresh the graph on every save (incrementally).
+    Watch(WatchArgs),
     /// Re-extract the graph from the current target/ without building.
     Update(CommonArgs),
     /// Open the bundled HTML viewer for the generated graph.
@@ -97,6 +99,25 @@ struct CommonArgs {
 struct BuildArgs {
     #[command(flatten)]
     common: CommonArgs,
+    /// Extra arguments forwarded to `cargo build` (after `--`).
+    #[arg(last = true)]
+    cargo_args: Vec<String>,
+}
+
+#[derive(Args)]
+struct WatchArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// Poll/debounce interval in milliseconds between change checks (min 50).
+    /// A change must hold steady for one interval before a refresh runs, so a
+    /// burst of saves coalesces into a single rebuild.
+    #[arg(long, default_value_t = 500)]
+    debounce: u64,
+    /// Don't run `cargo build` each cycle — just re-extract from the current
+    /// target/. Use when your editor/rust-analyzer already drives the build and
+    /// you only want the graph to track what's already compiled.
+    #[arg(long)]
+    no_build: bool,
     /// Extra arguments forwarded to `cargo build` (after `--`).
     #[arg(last = true)]
     cargo_args: Vec<String>,
@@ -229,6 +250,7 @@ fn main() -> Result<()> {
     }
     match Cli::parse_from(args).cmd {
         Cmd::Build(a) => run_build(a),
+        Cmd::Watch(w) => run_watch(w),
         Cmd::Update(c) => run_extract(&c, &[]),
         Cmd::View(v) => run_view(v),
         Cmd::Find(f) => run_find(f),
@@ -239,20 +261,136 @@ fn main() -> Result<()> {
 }
 
 fn run_build(a: BuildArgs) -> Result<()> {
+    build_and_extract(&a.common, &a.cargo_args, true)
+}
+
+/// One refresh pass: optionally run `cargo build`, then (re)extract the graph
+/// from target/. Shared by `build` and the `watch` loop. Both the build and the
+/// extract are already incremental — only changed crates recompile/re-document.
+fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool) -> Result<()> {
+    let compiled = if do_build {
+        let manifest = common.manifest_path.as_ref().map(Utf8PathBuf::from);
+        let compiled = cargo_build::run_build(
+            manifest.as_deref(),
+            common.release,
+            &common.packages,
+            cargo_args,
+        )?;
+        let changed = compiled.iter().filter(|t| t.changed()).count();
+        eprintln!(
+            "[build-graph] build ok: {} artifact(s), {} recompiled",
+            compiled.len(),
+            changed
+        );
+        compiled
+    } else {
+        Vec::new()
+    };
+    run_extract(common, &compiled)
+}
+
+/// Watch the workspace and re-run the incremental refresh whenever a `.rs` or
+/// `Cargo.toml` file changes. Layers 1–2 already reuse the prior graph for
+/// unchanged crates, so a save only re-does the crate(s) you touched. The graph
+/// (and anything serving it) updates in place.
+fn run_watch(a: WatchArgs) -> Result<()> {
     let manifest = a.common.manifest_path.as_ref().map(Utf8PathBuf::from);
-    let compiled = cargo_build::run_build(
-        manifest.as_deref(),
-        a.common.release,
-        &a.common.packages,
-        &a.cargo_args,
-    )?;
-    let changed = compiled.iter().filter(|t| t.changed()).count();
-    eprintln!(
-        "[build-graph] build ok: {} artifact(s), {} recompiled",
-        compiled.len(),
-        changed
-    );
-    run_extract(&a.common, &compiled)
+    let meta = metadata::load(manifest.as_deref())?;
+    let root = meta.workspace_root.clone();
+    let target_dir = a
+        .common
+        .target_dir
+        .as_ref()
+        .map(Utf8PathBuf::from)
+        .unwrap_or_else(|| meta.target_directory.clone());
+    let out = a
+        .common
+        .out
+        .as_ref()
+        .map(Utf8PathBuf::from)
+        .unwrap_or_else(|| target_dir.join("build-graph"));
+    // Don't let our own outputs (or cargo's) trigger another rebuild.
+    let excludes: Vec<std::path::PathBuf> = vec![
+        target_dir.as_std_path().to_path_buf(),
+        out.as_std_path().to_path_buf(),
+    ];
+    let do_build = !a.no_build;
+    let interval = std::time::Duration::from_millis(a.debounce.max(50));
+
+    eprintln!("[build-graph] watch: workspace {root}");
+    if let Err(e) = build_and_extract(&a.common, &a.cargo_args, do_build) {
+        eprintln!("[build-graph] watch: initial refresh failed — {e:#}");
+    }
+    eprintln!("[build-graph] watch: watching .rs/Cargo.toml under {root} (Ctrl-C to stop)…");
+
+    let mut last = workspace_fingerprint(&root, &excludes);
+    loop {
+        std::thread::sleep(interval);
+        let mut fp = workspace_fingerprint(&root, &excludes);
+        if fp == last {
+            continue;
+        }
+        // Let a burst of saves settle before rebuilding: wait until the
+        // fingerprint stops moving for one whole interval.
+        loop {
+            std::thread::sleep(interval);
+            let next = workspace_fingerprint(&root, &excludes);
+            if next == fp {
+                break;
+            }
+            fp = next;
+        }
+        eprintln!("[build-graph] watch: change detected — refreshing…");
+        if let Err(e) = build_and_extract(&a.common, &a.cargo_args, do_build) {
+            eprintln!("[build-graph] watch: refresh failed — {e:#}");
+        }
+        // Rescan after the refresh so sources the build itself touched (e.g.
+        // generated files under a watched dir) don't immediately re-trigger.
+        last = workspace_fingerprint(&root, &excludes);
+    }
+}
+
+fn is_excluded(path: &std::path::Path, excludes: &[std::path::PathBuf]) -> bool {
+    excludes.iter().any(|e| path.starts_with(e))
+        || path.components().any(|c| c.as_os_str() == ".git")
+}
+
+/// A cheap change signal: hash of every workspace `.rs`/`Cargo.toml` path + mtime,
+/// skipping target/, the output dir, and `.git`. Reuses the same mtime basis as
+/// the per-crate cache, so it flags exactly the edits a refresh would act on.
+fn workspace_fingerprint(root: &Utf8Path, excludes: &[std::path::PathBuf]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut items: Vec<(String, u128)> = Vec::new();
+    for entry in walkdir::WalkDir::new(root.as_std_path())
+        .into_iter()
+        .filter_entry(|e| !is_excluded(e.path(), excludes))
+        .flatten()
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let p = entry.path();
+        let is_rs = p.extension().and_then(|e| e.to_str()) == Some("rs");
+        let is_manifest = p.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml");
+        if !is_rs && !is_manifest {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        items.push((p.to_string_lossy().into_owned(), mtime));
+    }
+    items.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (path, mtime) in items {
+        path.hash(&mut hasher);
+        mtime.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Result<()> {
@@ -617,4 +755,40 @@ fn open_in_browser(path: &str) -> Result<()> {
         .status()
         .with_context(|| format!("failed to launch `{opener}`"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::is_excluded;
+
+    #[test]
+    fn watch_skips_target_out_and_git() {
+        let excludes = vec![
+            PathBuf::from("/ws/target"),
+            PathBuf::from("/ws/target/build-graph"),
+        ];
+        // Watched source is included.
+        assert!(!is_excluded(&PathBuf::from("/ws/src/lib.rs"), &excludes));
+        assert!(!is_excluded(
+            &PathBuf::from("/ws/crates/a/src/main.rs"),
+            &excludes
+        ));
+        // target/ (compiler output) and the graph output dir never count as edits —
+        // this is what stops our own `graph.json.gz` writes from looping the watcher.
+        assert!(is_excluded(
+            &PathBuf::from("/ws/target/debug/deps/foo.d"),
+            &excludes
+        ));
+        assert!(is_excluded(
+            &PathBuf::from("/ws/target/build-graph/graph.json.gz"),
+            &excludes
+        ));
+        // .git churns constantly during commits/checkouts; ignore it.
+        assert!(is_excluded(
+            &PathBuf::from("/ws/.git/index.lock"),
+            &excludes
+        ));
+    }
 }

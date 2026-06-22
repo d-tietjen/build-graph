@@ -106,6 +106,7 @@ the CLI below. Set `BUILD_GRAPH=0` to disable; build-script errors never fail yo
 cargo install build-graph     # installs `cargo-build-graph`, invoked as `cargo build-graph`
 
 cargo build-graph build        # run `cargo build`, then refresh the graph from target/
+cargo build-graph watch        # rebuild + refresh on every save (incremental; Ctrl-C to stop)
 cargo build-graph update       # refresh from the current target/ without building
 cargo build-graph view         # open the bundled HTML viewer
 cargo build-graph build --rich # also add the nightly rustdoc symbol/type layer (Layer 2)
@@ -272,6 +273,17 @@ Both entry points only re-do the crates whose **source files changed**:
   deterministic), and any genuinely dangling edge is pruned before writing.
 - The **build-dependency** is incremental by construction: Cargo only re-runs a changed crate's build script, so
   only that crate's fragment is rewritten before the merge.
+
+`cargo build-graph watch` turns this into a hands-free loop: it does one refresh up front, then watches the
+workspace's `.rs`/`Cargo.toml` files (skipping `target/`, the output dir, and `.git`) and re-runs the same
+incremental refresh whenever they change — a burst of saves coalesces into one rebuild. Pass `--no-build` to only
+re-extract from the current `target/` (when your editor already drives the build), `--debounce <ms>` to tune the
+settle window, and any `build` flags (`--rich`, `-p`, `--release`, …) to control what each cycle produces.
+
+> **Note on `--rich --references` under `watch`:** Layers 1–2 update per changed crate, but Layer 3
+> (`--references`) currently re-runs rust-analyzer over the whole workspace each cycle (a cold index), so a
+> reference-heavy watch is only as fast as that re-index. Keeping rust-analyzer warm for incremental per-file
+> reference updates is the planned next step.
 
 ## Limitations / future work
 
