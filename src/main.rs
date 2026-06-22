@@ -530,6 +530,7 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
         if rich_dirty.is_empty() {
             eprintln!("[build-graph] layer 2: no changed crates to re-document");
         } else {
+            let t2 = std::time::Instant::now();
             let items = rustdoc::add_item_layer(
                 &mut graph,
                 &meta,
@@ -539,13 +540,18 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
                 c.release,
                 c.no_derives,
             )?;
-            eprintln!("[build-graph] layer 2: +{items} item node(s)");
+            eprintln!(
+                "[build-graph] layer 2: +{items} item node(s) ({} crate(s), {:.1}s)",
+                rich_dirty.len(),
+                t2.elapsed().as_secs_f64()
+            );
         }
 
         // Layer 3 (semantic) — body-level calls/uses. Two backends: the rustc
         // driver (incremental; only changed crates re-run) or rust-analyzer SCIP
         // (cold whole-workspace index). Only (re)run when something changed.
         if references && !dirty.is_empty() {
+            let t3 = std::time::Instant::now();
             let result;
             let backend;
             #[cfg(feature = "rustc-driver")]
@@ -572,8 +578,9 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
             }
             match result {
                 Ok(counts) => eprintln!(
-                    "[build-graph] layer 3: +{} calls, +{} uses, +{} member_calls, +{} member_uses edge(s) ({backend})",
-                    counts.calls, counts.uses, counts.member_calls, counts.member_uses
+                    "[build-graph] layer 3: +{} calls, +{} uses, +{} member_calls, +{} member_uses edge(s) ({backend}, {:.1}s)",
+                    counts.calls, counts.uses, counts.member_calls, counts.member_uses,
+                    t3.elapsed().as_secs_f64()
                 ),
                 Err(e) => eprintln!("[build-graph] layer 3: references skipped — {e:#}"),
             }
