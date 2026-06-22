@@ -1,0 +1,6 @@
+# The spike driver links rustc internals, so it must build with the exact
+# nightly whose rustc-dev component is installed — the same one build-graph
+# already pins for Layer 2 (rustdoc JSON, FORMAT_VERSION 57).
+[toolchain]
+channel = "nightly-2026-02-27"
+components = ["rustc-dev", "llvm-tools-preview"]
