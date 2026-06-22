@@ -159,19 +159,26 @@ whole-workspace, so `--references` re-runs it only when something changed. `--re
 `rust-analyzer scip` is a **cold, whole-workspace** index: any change re-runs the whole thing (minutes to tens of
 minutes on a large workspace). The alternative is a clippy-style **rustc driver** that reads the compiler's HIR
 during a normal `cargo check`, so it is **incremental for free** — cargo only re-runs it for the crates it
-recompiles. Build the driver (see [`spike/bg-driver`](spike/bg-driver), pinned to the same nightly) and pass it:
+recompiles. It's a build-time **Cargo feature** (the driver is a separate nightly `rustc_private` crate); enable it
+and turn it on per run with `--driver`:
 
 ```bash
-cargo build-graph build --driver-bin /path/to/bg-driver --nightly nightly-2026-02-27
+cargo install build-graph --features rustc-driver   # or: cargo build --features rustc-driver
+cargo build-graph build  --driver        # build the graph with driver references
+cargo build-graph watch  --driver        # …and on every save, incrementally
 ```
 
-This replaces the scip pass: it runs `cargo check --all-targets` with the driver as `RUSTC_WORKSPACE_WRAPPER`,
-persists per-crate edge files (keyed by cargo's stable metadata hash) under `<out>/driver-refs`, and maps them
-onto the Layer-2 nodes. On a benchmark workspace (108 crates) it was ~7× faster cold and orders of magnitude
-faster per edit. Its resolution is validated against ground truth, but it is **not** byte-identical to
-rust-analyzer (it indexes the semantic def-reference graph, not rust-analyzer's syntactic occurrence graph — e.g.
-it sees through `use` imports and omits item-level type decls that Layer 2 already covers). Treat it as a faster,
-compiler-grounded reference source rather than a drop-in rust-analyzer clone.
+`--driver` builds the driver crate ([`crates/bg-driver`](crates/bg-driver), pinned to the right nightly) on demand
+the first time (cargo caches it after); pass `--driver-bin <path>` to use a prebuilt binary, or set
+`BUILD_GRAPH_DRIVER`. It replaces the scip pass: runs `cargo check --all-targets` with the driver as
+`RUSTC_WORKSPACE_WRAPPER`, persists per-crate edge files (keyed by cargo's stable metadata hash) under
+`<out>/driver-refs`, and maps them onto the Layer-2 nodes.
+
+On a benchmark workspace (108 crates) it was ~7× faster cold and orders of magnitude faster per edit. Its
+resolution is validated against ground truth, but it is **not** byte-identical to rust-analyzer (it indexes the
+semantic def-reference graph, not rust-analyzer's syntactic occurrence graph — e.g. it sees through `use` imports
+and omits item-level type decls that Layer 2 already covers). Treat it as a faster, compiler-grounded reference
+source rather than a drop-in rust-analyzer clone.
 
 ### Nightly + rustdoc-types pin
 

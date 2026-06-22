@@ -17,11 +17,72 @@ use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
 use anyhow::{Context, Result, bail};
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 
 use build_graph::Graph;
 
 use crate::scip::{ReferenceCounts, add_member_reference_edges};
+
+/// Locate the `bg-driver` binary, building it on demand if needed. In order:
+/// `explicit` (`--driver-bin`), then `$BUILD_GRAPH_DRIVER`, then building the
+/// `crates/bg-driver` crate (its own nightly pin applies) and using the result.
+pub fn resolve_driver(explicit: Option<&str>) -> Result<Utf8PathBuf> {
+    if let Some(p) = explicit {
+        let p = Utf8PathBuf::from(p);
+        if !p.as_std_path().exists() {
+            bail!("--driver-bin {p} not found");
+        }
+        return Ok(p);
+    }
+    if let Some(env) = std::env::var_os("BUILD_GRAPH_DRIVER") {
+        let p = Utf8PathBuf::from(env.to_string_lossy().into_owned());
+        if !p.as_std_path().exists() {
+            bail!("BUILD_GRAPH_DRIVER points at a missing file: {p}");
+        }
+        return Ok(p);
+    }
+    let src = driver_src().context(
+        "rustc driver source not found — set BUILD_GRAPH_DRIVER to a prebuilt bg-driver binary, \
+         or BUILD_GRAPH_DRIVER_SRC to the crates/bg-driver directory, or pass --driver-bin",
+    )?;
+    build_driver(&src)
+}
+
+/// The `crates/bg-driver` source dir: `$BUILD_GRAPH_DRIVER_SRC`, else the copy
+/// baked in next to this crate (works when running a locally-built binary).
+fn driver_src() -> Option<Utf8PathBuf> {
+    if let Some(s) = std::env::var_os("BUILD_GRAPH_DRIVER_SRC") {
+        let p = Utf8PathBuf::from(s.to_string_lossy().into_owned());
+        if p.join("Cargo.toml").as_std_path().exists() {
+            return Some(p);
+        }
+    }
+    let baked = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/bg-driver");
+    baked
+        .join("Cargo.toml")
+        .as_std_path()
+        .exists()
+        .then_some(baked)
+}
+
+/// Build the driver crate (its `rust-toolchain.toml` selects the nightly). Cargo
+/// caches, so this is a fast no-op after the first run.
+fn build_driver(src: &Utf8Path) -> Result<Utf8PathBuf> {
+    let bin = src.join("target/release/bg-driver");
+    eprintln!("[build-graph] driver: ensuring {src} is built (cargo caches)…");
+    let status = std::process::Command::new("cargo")
+        .args(["build", "--release"])
+        .current_dir(src.as_std_path()) // so bg-driver's nightly toolchain pin applies
+        .status()
+        .context("building the bg-driver crate")?;
+    if !status.success() {
+        bail!("building bg-driver failed (needs the pinned nightly + rustc-dev component)");
+    }
+    if !bin.as_std_path().exists() {
+        bail!("bg-driver built but binary missing at {bin}");
+    }
+    Ok(bin)
+}
 
 /// `file:line -> node id`, split fn vs other so a trait and a method defined on
 /// the same line don't collide; lookups allow ±1 line — same convention scip.rs
@@ -109,7 +170,7 @@ pub fn add_references_layer(
 ) -> Result<ReferenceCounts> {
     if !driver_bin.as_std_path().exists() {
         bail!(
-            "rustc driver not found at {driver_bin} — build it (see spike/bg-driver) \
+            "rustc driver not found at {driver_bin} — build it (see crates/bg-driver) \
              and pass --driver-bin"
         );
     }

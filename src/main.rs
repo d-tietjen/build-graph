@@ -5,6 +5,7 @@
 mod cache;
 mod cargo_build;
 mod depinfo;
+#[cfg(feature = "rustc-driver")]
 mod driver_refs;
 mod metadata;
 mod qserve;
@@ -23,9 +24,10 @@ use build_graph::{Graph, GraphJson, norm};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
 
-/// The nightly `spike/bg-driver` is pinned to (it links that toolchain's
+/// The nightly `crates/bg-driver` is pinned to (it links that toolchain's
 /// `rustc_driver`) — the same nightly Layer 2's `rustdoc-types` pin matches.
 /// Override with `--nightly` if you built the driver against another.
+#[cfg(feature = "rustc-driver")]
 const DEFAULT_DRIVER_NIGHTLY: &str = "nightly-2026-02-27";
 
 #[derive(Parser)]
@@ -88,10 +90,15 @@ struct CommonArgs {
     #[arg(long)]
     nightly: Option<String>,
     /// Use the build-graph **rustc driver** for the references layer instead of
-    /// rust-analyzer: pass the path to the `bg-driver` binary (built against the
-    /// `--nightly` toolchain). Implies `--references`. Far cheaper than a cold
-    /// scip index and incremental for free — cargo only re-runs it for changed
-    /// crates.
+    /// rust-analyzer. The driver (`crates/bg-driver`) is built on demand; it
+    /// reads the compiler's HIR during `cargo check`, so it's incremental for
+    /// free (only changed crates re-run). Implies `--references`.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long)]
+    driver: bool,
+    /// Path to a prebuilt `bg-driver` binary (skips the on-demand build). Also
+    /// enables the driver backend. Built against the `--nightly` toolchain.
+    #[cfg(feature = "rustc-driver")]
     #[arg(long, value_name = "PATH")]
     driver_bin: Option<String>,
     /// Restrict extraction to these packages.
@@ -106,6 +113,21 @@ struct CommonArgs {
     /// `jq` or the graphify MCP server).
     #[arg(long = "no-compress", action = clap::ArgAction::SetFalse)]
     compress: bool,
+}
+
+impl CommonArgs {
+    /// Whether the rustc-driver references backend was requested. Always false
+    /// when the `rustc-driver` feature is disabled (the flags don't exist).
+    fn driver_requested(&self) -> bool {
+        #[cfg(feature = "rustc-driver")]
+        {
+            self.driver || self.driver_bin.is_some()
+        }
+        #[cfg(not(feature = "rustc-driver"))]
+        {
+            false
+        }
+    }
 }
 
 #[derive(Args)]
@@ -421,10 +443,10 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
         .map(Utf8PathBuf::from)
         .unwrap_or_else(|| target_dir.join("build-graph"));
     let profiles: &[&str] = if c.release { &["release"] } else { &["debug"] };
-    // The rustc-driver backend (`--driver-bin`) produces the references layer,
-    // so it implies `--references`; `--references` in turn needs the rich item
-    // nodes to connect to, so it implies `--rich`.
-    let references = c.references || c.driver_bin.is_some();
+    // The rustc-driver backend (`--driver`/`--driver-bin`) produces the
+    // references layer, so it implies `--references`; `--references` in turn
+    // needs the rich item nodes to connect to, so it implies `--rich`.
+    let references = c.references || c.driver_requested();
     let rich = c.rich || references;
 
     // Reuse the prior graph when the cache is compatible (same layer settings).
@@ -524,24 +546,30 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
         // driver (incremental; only changed crates re-run) or rust-analyzer SCIP
         // (cold whole-workspace index). Only (re)run when something changed.
         if references && !dirty.is_empty() {
-            let (result, backend) = if let Some(db) = &c.driver_bin {
+            let result;
+            let backend;
+            #[cfg(feature = "rustc-driver")]
+            if c.driver_requested() {
                 let nightly = c.nightly.as_deref().unwrap_or(DEFAULT_DRIVER_NIGHTLY);
-                (
+                result = driver_refs::resolve_driver(c.driver_bin.as_deref()).and_then(|bin| {
                     driver_refs::add_references_layer(
                         &mut graph,
                         &meta.workspace_root,
                         &out,
-                        Utf8Path::new(db),
+                        &bin,
                         nightly,
-                    ),
-                    "rustc driver",
-                )
+                    )
+                });
+                backend = "rustc driver";
             } else {
-                (
-                    scip::add_references_layer(&mut graph, &meta.workspace_root, &out),
-                    "rust-analyzer",
-                )
-            };
+                result = scip::add_references_layer(&mut graph, &meta.workspace_root, &out);
+                backend = "rust-analyzer";
+            }
+            #[cfg(not(feature = "rustc-driver"))]
+            {
+                result = scip::add_references_layer(&mut graph, &meta.workspace_root, &out);
+                backend = "rust-analyzer";
+            }
             match result {
                 Ok(counts) => eprintln!(
                     "[build-graph] layer 3: +{} calls, +{} uses, +{} member_calls, +{} member_uses edge(s) ({backend})",

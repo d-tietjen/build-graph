@@ -12,6 +12,13 @@ readme = "README.md"
 name = "cargo-build-graph"
 path = "src/main.rs"
 
+[features]
+# Opt-in rustc-driver references backend (Layer 3 via RUSTC_WORKSPACE_WRAPPER).
+# The glue compiled here is pure-stable; the driver itself is the separate
+# `crates/bg-driver` nightly crate, auto-built on demand. Enable the CLI flags
+# and code path with `--features rustc-driver`.
+rustc-driver = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
