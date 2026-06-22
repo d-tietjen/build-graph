@@ -34,6 +34,19 @@ impl Callbacks for BgCallbacks {
     }
 }
 
+/// A filename key that is **stable per compilation unit across edits** (cargo's
+/// `-C metadata` hash) so persisted edge/def files overwrite cleanly on an
+/// incremental rebuild instead of accumulating stale duplicates. Falls back to
+/// the pid if metadata is absent.
+fn unit_key(tcx: TyCtxt<'_>, krate: &str) -> String {
+    let meta = tcx.sess.opts.cg.metadata.join("");
+    if meta.is_empty() {
+        format!("{krate}-{}", std::process::id())
+    } else {
+        format!("{krate}-{meta}")
+    }
+}
+
 /// `file:line` of a def's *identifier* span (matching rust-analyzer's
 /// name-occurrence convention), falling back to the full def span. Using the
 /// identifier line is what makes coordinates line up with SCIP.
@@ -102,7 +115,7 @@ fn extract(tcx: TyCtxt<'_>) {
     if let Ok(dir) = std::env::var("BG_DRIVER_DEFS") {
         use std::io::Write;
         let _ = std::fs::create_dir_all(&dir);
-        let path = format!("{dir}/{krate}-{}.tsv", std::process::id());
+        let path = format!("{dir}/{}.tsv", unit_key(tcx, &krate.to_string()));
         if let Ok(mut f) = std::fs::File::create(&path) {
             let mut buf = String::new();
             for did in tcx.hir_crate_items(()).definitions() {
@@ -126,7 +139,7 @@ fn extract(tcx: TyCtxt<'_>) {
         if let Ok(dir) = std::env::var("BG_DRIVER_EDGES") {
             use std::io::Write;
             let _ = std::fs::create_dir_all(&dir);
-            let path = format!("{dir}/{krate}-{}.tsv", std::process::id());
+            let path = format!("{dir}/{}.tsv", unit_key(tcx, &krate.to_string()));
             if let Ok(mut f) = std::fs::File::create(&path) {
                 let mut buf = String::new();
                 for (kind, caller, callee) in &edges {

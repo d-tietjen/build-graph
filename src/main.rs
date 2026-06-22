@@ -5,6 +5,7 @@
 mod cache;
 mod cargo_build;
 mod depinfo;
+mod driver_refs;
 mod metadata;
 mod qserve;
 mod query;
@@ -21,6 +22,11 @@ use anyhow::{Context, Result, bail};
 use build_graph::{Graph, GraphJson, norm};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
+
+/// The nightly `spike/bg-driver` is pinned to (it links that toolchain's
+/// `rustc_driver`) — the same nightly Layer 2's `rustdoc-types` pin matches.
+/// Override with `--nightly` if you built the driver against another.
+const DEFAULT_DRIVER_NIGHTLY: &str = "nightly-2026-02-27";
 
 #[derive(Parser)]
 #[command(
@@ -81,6 +87,13 @@ struct CommonArgs {
     /// Nightly toolchain for Layer 2 (default: auto-detect newest installed).
     #[arg(long)]
     nightly: Option<String>,
+    /// Use the build-graph **rustc driver** for the references layer instead of
+    /// rust-analyzer: pass the path to the `bg-driver` binary (built against the
+    /// `--nightly` toolchain). Implies `--references`. Far cheaper than a cold
+    /// scip index and incremental for free — cargo only re-runs it for changed
+    /// crates.
+    #[arg(long, value_name = "PATH")]
+    driver_bin: Option<String>,
     /// Restrict extraction to these packages.
     #[arg(short = 'p', long = "package")]
     packages: Vec<String>,
@@ -408,8 +421,11 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
         .map(Utf8PathBuf::from)
         .unwrap_or_else(|| target_dir.join("build-graph"));
     let profiles: &[&str] = if c.release { &["release"] } else { &["debug"] };
-    // `--references` needs the rich item nodes to connect to, so it implies `--rich`.
-    let rich = c.rich || c.references;
+    // The rustc-driver backend (`--driver-bin`) produces the references layer,
+    // so it implies `--references`; `--references` in turn needs the rich item
+    // nodes to connect to, so it implies `--rich`.
+    let references = c.references || c.driver_bin.is_some();
+    let rich = c.rich || references;
 
     // Reuse the prior graph when the cache is compatible (same layer settings).
     // The prior graph may be in either form (gzip or plain) — `find_graph`
@@ -420,7 +436,7 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
     let prior = cache::Cache::load(cache_path.as_std_path());
     let compatible = prior
         .as_ref()
-        .map(|p| p.rich == rich && p.no_derives == c.no_derives && p.references == c.references)
+        .map(|p| p.rich == rich && p.no_derives == c.no_derives && p.references == references)
         .unwrap_or(false)
         && existing.is_some();
     let mut graph = match (compatible, &existing) {
@@ -504,12 +520,31 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
             eprintln!("[build-graph] layer 2: +{items} item node(s)");
         }
 
-        // Layer 3 (semantic): rust-analyzer SCIP references — accurate calls/uses.
-        // The index is whole-workspace, so only (re)run when something changed.
-        if c.references && !dirty.is_empty() {
-            match scip::add_references_layer(&mut graph, &meta.workspace_root, &out) {
+        // Layer 3 (semantic) — body-level calls/uses. Two backends: the rustc
+        // driver (incremental; only changed crates re-run) or rust-analyzer SCIP
+        // (cold whole-workspace index). Only (re)run when something changed.
+        if references && !dirty.is_empty() {
+            let (result, backend) = if let Some(db) = &c.driver_bin {
+                let nightly = c.nightly.as_deref().unwrap_or(DEFAULT_DRIVER_NIGHTLY);
+                (
+                    driver_refs::add_references_layer(
+                        &mut graph,
+                        &meta.workspace_root,
+                        &out,
+                        Utf8Path::new(db),
+                        nightly,
+                    ),
+                    "rustc driver",
+                )
+            } else {
+                (
+                    scip::add_references_layer(&mut graph, &meta.workspace_root, &out),
+                    "rust-analyzer",
+                )
+            };
+            match result {
                 Ok(counts) => eprintln!(
-                    "[build-graph] layer 3: +{} calls, +{} uses, +{} member_calls, +{} member_uses edge(s) (rust-analyzer)",
+                    "[build-graph] layer 3: +{} calls, +{} uses, +{} member_calls, +{} member_uses edge(s) ({backend})",
                     counts.calls, counts.uses, counts.member_calls, counts.member_uses
                 ),
                 Err(e) => eprintln!("[build-graph] layer 3: references skipped — {e:#}"),
@@ -527,7 +562,7 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
         title,
     )
     .with_context(|| format!("writing graph to {out}"))?;
-    cache::Cache::new(rich, c.no_derives, c.references, current)
+    cache::Cache::new(rich, c.no_derives, references, current)
         .save(cache_path.as_std_path())
         .with_context(|| format!("writing cache to {cache_path}"))?;
     let wrote = if c.compress {
