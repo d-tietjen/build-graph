@@ -18,12 +18,12 @@ extern crate rustc_session;
 extern crate rustc_span;
 
 use rustc_driver::{Callbacks, Compilation};
-use rustc_hir::def::Res;
+use rustc_hir::def::{DefKind, Res};
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{Expr, ExprKind};
+use rustc_hir::{AmbigArg, Expr, ExprKind, Pat, PatKind, QPath, Ty, TyKind};
 use rustc_interface::interface::Compiler;
-use rustc_middle::ty::{TyCtxt, TypeckResults};
-use rustc_span::def_id::LOCAL_CRATE;
+use rustc_middle::ty::{self, TyCtxt, TypeckResults};
+use rustc_span::def_id::{DefId, LOCAL_CRATE};
 
 struct BgCallbacks;
 
@@ -34,9 +34,13 @@ impl Callbacks for BgCallbacks {
     }
 }
 
-/// `file:line` of a def's span, or `None` for dummy/macro spans.
+/// `file:line` of a def's *identifier* span (matching rust-analyzer's
+/// name-occurrence convention), falling back to the full def span. Using the
+/// identifier line is what makes coordinates line up with SCIP.
 fn loc_of(tcx: TyCtxt<'_>, def_id: rustc_span::def_id::DefId) -> Option<(String, usize)> {
-    let span = tcx.def_span(def_id);
+    let span = tcx
+        .def_ident_span(def_id)
+        .unwrap_or_else(|| tcx.def_span(def_id));
     if span.is_dummy() {
         return None;
     }
@@ -51,11 +55,12 @@ fn extract(tcx: TyCtxt<'_>) {
     let mut calls: usize = 0;
     let mut method_calls: usize = 0;
     let mut cross_crate: usize = 0;
+    let mut uses_count: usize = 0;
     let mut samples: Vec<String> = Vec::new();
     // Full edge dump (for equivalence checking against rust-analyzer scip):
-    // (caller "file:line", callee "file:line"). Only collected when requested.
+    // (kind, caller "file:line", callee "file:line"). Only collected when requested.
     let want_edges = std::env::var_os("BG_DRIVER_EDGES").is_some();
-    let mut edges: Vec<(String, String)> = Vec::new();
+    let mut edges: Vec<(&'static str, String, String)> = Vec::new();
 
     for owner in tcx.hir_body_owners() {
         let body = tcx.hir_body_owned_by(owner);
@@ -74,6 +79,7 @@ fn extract(tcx: TyCtxt<'_>) {
             calls: &mut calls,
             method_calls: &mut method_calls,
             cross_crate: &mut cross_crate,
+            uses_count: &mut uses_count,
             samples: &mut samples,
             edges: &mut edges,
         };
@@ -81,21 +87,28 @@ fn extract(tcx: TyCtxt<'_>) {
     }
 
     if want_edges {
-        if let Ok(path) = std::env::var("BG_DRIVER_EDGES") {
+        // BG_DRIVER_EDGES is a *directory*: each (parallel) rustc process writes
+        // its own file, so concurrent compiles can't tear each other's lines.
+        if let Ok(dir) = std::env::var("BG_DRIVER_EDGES") {
             use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                for (c, callee) in &edges {
-                    let _ = writeln!(f, "call\t{c}\t{callee}");
+            let _ = std::fs::create_dir_all(&dir);
+            let path = format!("{dir}/{krate}-{}.tsv", std::process::id());
+            if let Ok(mut f) = std::fs::File::create(&path) {
+                let mut buf = String::new();
+                for (kind, caller, callee) in &edges {
+                    buf.push_str(&format!("{kind}\t{caller}\t{callee}\n"));
                 }
+                let _ = f.write_all(buf.as_bytes());
             }
         }
     }
 
     eprintln!(
-        "[bg-driver] crate `{krate}`: {} call edges ({} method, {} cross-crate)",
+        "[bg-driver] crate `{krate}`: {} call edges ({} method, {} cross-crate), {} use edges",
         calls + method_calls,
         method_calls,
-        cross_crate
+        cross_crate,
+        uses_count
     );
     // A real run appends one line here; cargo's replayed-stderr cache can't fake a
     // file write, so this is the honest "the driver actually executed" signal.
@@ -118,19 +131,33 @@ struct CallVisitor<'a, 'tcx> {
     calls: &'a mut usize,
     method_calls: &'a mut usize,
     cross_crate: &'a mut usize,
+    uses_count: &'a mut usize,
     samples: &'a mut Vec<String>,
-    edges: &'a mut Vec<(String, String)>,
+    edges: &'a mut Vec<(&'static str, String, String)>,
 }
 
 impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
-    fn emit(&mut self, callee: rustc_span::def_id::DefId, method: bool) {
+    fn record(&mut self, kind: &'static str, callee: DefId) {
+        if callee.krate != LOCAL_CRATE {
+            *self.cross_crate += 1;
+        }
+        if let Some(caller) = self.owner_loc.clone() {
+            if let Some((f, l)) = loc_of(self.tcx, callee) {
+                // Keep only workspace↔workspace edges (drop std `/rustc/…` and
+                // dep absolute paths) — matches build-graph's reference layer and
+                // keeps the dump comparable to scip's.
+                if !f.starts_with('/') {
+                    self.edges.push((kind, caller, format!("{f}:{l}")));
+                }
+            }
+        }
+    }
+
+    fn call(&mut self, callee: DefId, method: bool) {
         if method {
             *self.method_calls += 1;
         } else {
             *self.calls += 1;
-        }
-        if callee.krate != LOCAL_CRATE {
-            *self.cross_crate += 1;
         }
         if self.samples.len() < 12 {
             let kind = if method { "m" } else { "f" };
@@ -140,9 +167,37 @@ impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
                 self.tcx.def_path_str(callee)
             ));
         }
-        if let Some(caller) = self.owner_loc.clone() {
-            if let Some((f, l)) = loc_of(self.tcx, callee) {
-                self.edges.push((caller, format!("{f}:{l}")));
+        self.record("call", callee);
+    }
+
+    fn use_def(&mut self, callee: DefId) {
+        *self.uses_count += 1;
+        self.record("use", callee);
+    }
+
+    /// A `uses` target from a path resolution: types, consts, statics, fields,
+    /// variants, etc. — but NOT fns/ctors (those are `calls`, handled separately,
+    /// and re-counting their path expr would double-count).
+    fn use_from_res(&mut self, res: Res) {
+        if let Res::Def(kind, def_id) = res {
+            let is_use = matches!(
+                kind,
+                DefKind::Struct
+                    | DefKind::Enum
+                    | DefKind::Union
+                    | DefKind::Trait
+                    | DefKind::TyAlias
+                    | DefKind::AssocTy
+                    | DefKind::TraitAlias
+                    | DefKind::ForeignTy
+                    | DefKind::Const
+                    | DefKind::AssocConst
+                    | DefKind::Static { .. }
+                    | DefKind::Field
+                    | DefKind::Variant
+            );
+            if is_use {
+                self.use_def(def_id);
             }
         }
     }
@@ -154,18 +209,55 @@ impl<'a, 'tcx> Visitor<'tcx> for CallVisitor<'a, 'tcx> {
             ExprKind::Call(callee, _args) => {
                 if let ExprKind::Path(ref qpath) = callee.kind {
                     if let Res::Def(_dk, def_id) = self.typeck.qpath_res(qpath, callee.hir_id) {
-                        self.emit(def_id, false);
+                        self.call(def_id, false);
                     }
                 }
             }
             ExprKind::MethodCall(..) => {
                 if let Some(def_id) = self.typeck.type_dependent_def_id(ex.hir_id) {
-                    self.emit(def_id, true);
+                    self.call(def_id, true);
+                }
+            }
+            // value paths to consts/statics/variants used as values → use
+            ExprKind::Path(ref qpath) => {
+                self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id));
+            }
+            // struct/enum-variant literal → use of the type/variant
+            ExprKind::Struct(qpath, ..) => {
+                self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id));
+            }
+            // field access → use of the field def
+            ExprKind::Field(recv, _) => {
+                let ty = self.typeck.expr_ty_adjusted(recv);
+                if let ty::Adt(adt, _) = ty.kind() {
+                    if adt.is_struct() || adt.is_union() {
+                        let idx = self.typeck.field_index(ex.hir_id);
+                        if let Some(field) = adt.non_enum_variant().fields.get(idx) {
+                            self.use_def(field.did);
+                        }
+                    }
                 }
             }
             _ => {}
         }
         intravisit::walk_expr(self, ex);
+    }
+
+    fn visit_ty(&mut self, t: &'tcx Ty<'tcx, AmbigArg>) {
+        if let TyKind::Path(QPath::Resolved(_, path)) = t.kind {
+            self.use_from_res(path.res);
+        }
+        intravisit::walk_ty(self, t);
+    }
+
+    fn visit_pat(&mut self, p: &'tcx Pat<'tcx>) {
+        match p.kind {
+            PatKind::TupleStruct(ref qpath, ..) | PatKind::Struct(ref qpath, ..) => {
+                self.use_from_res(self.typeck.qpath_res(qpath, p.hir_id));
+            }
+            _ => {}
+        }
+        intravisit::walk_pat(self, p);
     }
 }
 
