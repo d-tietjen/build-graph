@@ -176,10 +176,13 @@ recompiles. It's a build-time **Cargo feature** (the driver is a separate nightl
 and turn it on per run with `--driver`:
 
 ```bash
-cargo install build-graph --features rustc-driver   # or: cargo build --features rustc-driver
-cargo build-graph build  --driver        # build the graph with driver references
-cargo build-graph watch  --driver        # …and on every save, incrementally
+cargo install build-graph --features rustc-driver
+cargo build-graph build --driver
+cargo build-graph watch --driver
 ```
+
+(`cargo build --features rustc-driver` instead of `install` for a local build;
+`build` produces the graph once, `watch` refreshes it incrementally on every save.)
 
 `--driver` builds the driver crate ([`crates/bg-driver`](crates/bg-driver), pinned to the right nightly) on demand
 the first time (cargo caches it after); pass `--driver-bin <path>` to use a prebuilt binary, or set

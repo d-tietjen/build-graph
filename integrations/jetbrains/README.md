@@ -15,16 +15,20 @@ find-usages; it surfaces the cross-crate architecture graph the IDE doesn't.
 
 ## Build & run
 
+A JDK 21 ships with RustRover; reuse it. Run each line on its own (no trailing
+`#` comments — zsh passes them to Gradle as task names):
+
 ```bash
-# A JDK 21 is bundled with RustRover; reuse it:
 export JAVA_HOME=/Applications/RustRover.app/Contents/jbr/Contents/Home
-./gradlew runIde         # launches a sandbox RustRover with the plugin
-./gradlew buildPlugin    # produces build/distributions/*.zip to install manually
+./gradlew runIde
 ```
 
-`./gradlew buildPlugin` succeeds and the plugin loads into a headless RustRover
-2024.2 during the build. The action + live browser page haven't been clicked
-through in a real GUI session yet — do that with `./gradlew runIde`.
+`./gradlew runIde` launches a sandbox RustRover with the plugin; `./gradlew
+buildPlugin` produces `build/distributions/*.zip` to install manually.
+
+`buildPlugin` succeeds and the plugin loads into a headless RustRover 2024.2
+during the build. The action + live browser page haven't been clicked through in
+a real GUI session yet — do that with `./gradlew runIde`.
 
 Notes:
 - Pinned to the IntelliJ Platform Gradle Plugin 2.1.0 (a newer 2.16.0 exists;

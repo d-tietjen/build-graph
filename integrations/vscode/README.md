@@ -29,11 +29,12 @@ the cross-crate **architecture graph** (crates, files, symbols, and relationship
 
 ```bash
 npm install
-npm run compile      # or: npm run watch
-# Press F5 in VS Code to launch an Extension Development Host.
+npm run compile
 ```
 
-Package with [`vsce`](https://github.com/microsoft/vscode-vsce): `npx vsce package`.
+Then press **F5** in VS Code to launch an Extension Development Host (or
+`npm run watch` to recompile on change). Package with
+[`vsce`](https://github.com/microsoft/vscode-vsce): `npx vsce package`.
 
 Requires `build-graph` on PATH (or set `buildGraph.command`). For the fast
 incremental `driver` backend, build/install build-graph with
