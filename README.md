@@ -288,6 +288,9 @@ plain CLI, so any agent that can run a shell can use them; ready-to-use guidance
 - **Codex** — copy the body of [`integrations/codex/AGENTS.md`](integrations/codex/AGENTS.md) into your project's
   `AGENTS.md` (or `~/.codex/AGENTS.md` to enable it everywhere). Codex loads `AGENTS.md` before each task and runs
   the CLI through its shell — no plugin needed.
+- **Claude Code** — copy the body of [`integrations/claude-code/CLAUDE.md`](integrations/claude-code/CLAUDE.md)
+  into your project's `CLAUDE.md`. Claude Code loads it as project memory and runs the same bounded
+  `find`/`refs` shell queries — no MCP server or editor extension needed.
 - **Any MCP client** — the graph is graphify-compatible, so graphify's MCP server
   (`python3 -m graphify.serve target/build-graph/graph.json`) exposes query tools over it; build with
   `--no-compress` so a plain `graph.json` is on disk, then point your agent's MCP config at it. (A native
@@ -300,8 +303,8 @@ One published crate, **`build-graph`**, ships two targets:
 - **library `build_graph`** — the `[build-dependencies]` helper (`Builder`) plus the graph model,
   deterministic IDs, fragment merge, graphify-compatible output, viewer, and report.
 - **binary `cargo-build-graph`** — the `cargo build-graph` CLI (Layer 0 build stream + Layer 1 dep-info +
-  Layer 2 rustdoc JSON + Layer 3 rust-analyzer SCIP `references`), plus the `find`/`refs` graph queries and
-  the `view` server.
+  Layer 2 rustdoc JSON + Layer 3 references from rust-analyzer SCIP or the opt-in rustc driver), plus the
+  `find`/`refs` graph queries and the `view` server.
 
 ## Incremental & caching
 
@@ -321,10 +324,10 @@ incremental refresh whenever they change — a burst of saves coalesces into one
 re-extract from the current `target/` (when your editor already drives the build), `--debounce <ms>` to tune the
 settle window, and any `build` flags (`--rich`, `-p`, `--release`, …) to control what each cycle produces.
 
-> **Note on `--rich --references` under `watch`:** Layers 1–2 update per changed crate, but Layer 3
-> (`--references`) currently re-runs rust-analyzer over the whole workspace each cycle (a cold index), so a
-> reference-heavy watch is only as fast as that re-index. Keeping rust-analyzer warm for incremental per-file
-> reference updates is the planned next step.
+> **Note on Layer 3 under `watch`:** `--rich --references` still uses rust-analyzer's cold, whole-workspace SCIP
+> index, so a reference-heavy watch is only as fast as that re-index. For incremental Layer 3 refreshes, build
+> `build-graph` with `--features rustc-driver` and run `cargo build-graph watch --driver`; the driver reads HIR
+> during `cargo check`, so cargo re-runs it only for changed crates.
 
 ## Limitations / future work
 
@@ -332,11 +335,11 @@ settle window, and any `build` flags (`--rich`, `-p`, `--release`, …) to contr
 - Derive-generated impls (`clone`, `default`, …) add method nodes by default; pass **`--no-derives`** to drop
   every `#[automatically_derived]` impl (its `implements` edge and its methods) from the rich layer.
 - rustdoc JSON gives only the *structural* graph (signatures, impls, containment). Body references (`calls`,
-  `uses`) and their object-level rollups (`member_calls`, `member_uses`) are added by **Layer 3 `--references`**,
-  which uses rust-analyzer — there is no build-artifact fallback, because object-file and syntactic approaches
-  proved too inaccurate for an async codebase (object code files `async fn` calls under the generated future, not
-  the source fn; syntactic parsing can't resolve methods). So Layer 3 needs `rust-analyzer` installed; without it
-  the references are simply not produced.
+  `uses`) and their object-level rollups (`member_calls`, `member_uses`) are added by **Layer 3** via either
+  rust-analyzer SCIP (`--references`) or the opt-in compiler HIR driver (`--driver`). Object-file and purely
+  syntactic approaches proved too inaccurate for an async codebase (object code files `async fn` calls under the
+  generated future, not the source fn; syntactic parsing can't resolve methods). Without one of the Layer 3
+  backends, body-level references are simply not produced.
 
 ## License
 

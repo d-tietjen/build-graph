@@ -9,9 +9,10 @@ task and runs shell commands, so this is all it needs — no plugin.
 ## Code navigation with build-graph
 
 This workspace has a **build-graph** knowledge graph of its Rust code, built from
-the compiler's output (crate/dep graph, rustdoc symbols) plus — with
-`--references` — semantic `calls`/`uses` edges from rust-analyzer and owner-level
-`member_calls`/`member_uses` rollups for structs/enums/traits/modules. To find
+the compiler's output (crate/dep graph, rustdoc symbols) plus — with Layer 3
+enabled — semantic `calls`/`uses` edges from rust-analyzer or the rustc driver
+and owner-level `member_calls`/`member_uses` rollups for
+structs/enums/traits/modules. To find
 where a symbol lives and how it connects (definition, callers/callees, trait
 impls, type usage, across crates), prefer `cargo build-graph` over `grep`/`rg`:
 the edges are resolved and exact, so it's faster and more complete than text
@@ -24,10 +25,13 @@ to verify details or pivot into exact source locations.
 
 **Prerequisite.** The graph is at `target/build-graph/graph.json.gz` (or a plain
 `graph.json` if built with `--no-compress`; either is read transparently). If it's
-missing, build it once (slow; needs a nightly toolchain, and `--references` needs
-rust-analyzer installed):
+missing, build it once (slow; needs a nightly toolchain). Prefer the rustc driver
+when `build-graph` was installed or built with `--features rustc-driver`; otherwise
+fall back to rust-analyzer SCIP:
 
 ```bash
+cargo build-graph build --rich --driver
+# or:
 cargo build-graph build --rich --references
 ```
 
@@ -69,7 +73,7 @@ under a restrictive sandbox.
 
 Follow the `source_file:source_location` values from the results instead of
 searching, then pivot by querying a neighbor you found. The `calls`/`uses` and
-`member_calls`/`member_uses` edges (semantic, from rust-analyzer) exist only if
-the graph was built with `--references`; without it you still have definitions
-and structural edges (`implements`, `has_method`, `takes`/`returns`, …) but not
-the body-level call/use graph.
+`member_calls`/`member_uses` edges exist only if the graph was built with
+`--driver` or `--references`; without one of those Layer 3 backends you still
+have definitions and structural edges (`implements`, `has_method`,
+`takes`/`returns`, …) but not the body-level call/use graph.
