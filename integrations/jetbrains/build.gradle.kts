@@ -24,6 +24,7 @@ dependencies {
         // Ultimate with the Rust plugin.
         rustRover("2024.2")
         instrumentationTools()
+        pluginVerifier()
     }
 }
 
@@ -32,6 +33,12 @@ intellijPlatform {
         ideaVersion {
             sinceBuild = "242"
             untilBuild = provider { null }
+        }
+    }
+    // Static runtime-API compatibility check (`./gradlew verifyPlugin`).
+    pluginVerification {
+        ides {
+            recommended()
         }
     }
 }
