@@ -102,26 +102,50 @@ fn build_driver(src: &Utf8Path) -> Result<Utf8PathBuf> {
 struct Locator {
     loc_fn: HashMap<String, String>,
     loc_other: HashMap<String, String>,
+    /// fn/method node lines per file, sorted — for enclosing-fn rollup.
+    fns_by_file: HashMap<String, Vec<(i64, String)>>,
 }
 
 impl Locator {
     fn build(graph: &Graph) -> Self {
         let mut loc_fn = HashMap::new();
         let mut loc_other = HashMap::new();
+        let mut fns_by_file: HashMap<String, Vec<(i64, String)>> = HashMap::new();
         for n in graph.node_values() {
             if let (Some(f), Some(l)) = (n.source_file.as_deref(), n.source_location) {
                 let kind = n.attributes.get("kind").map(String::as_str).unwrap_or("");
-                let bucket = if kind == "function" || kind == "method" {
-                    &mut loc_fn
-                } else {
-                    &mut loc_other
-                };
+                let is_fn = kind == "function" || kind == "method";
+                let bucket = if is_fn { &mut loc_fn } else { &mut loc_other };
                 bucket
                     .entry(format!("{f}:{l}"))
                     .or_insert_with(|| n.id.clone());
+                if is_fn {
+                    fns_by_file
+                        .entry(f.to_string())
+                        .or_default()
+                        .push((l as i64, n.id.clone()));
+                }
             }
         }
-        Locator { loc_fn, loc_other }
+        for v in fns_by_file.values_mut() {
+            v.sort();
+        }
+        Locator {
+            loc_fn,
+            loc_other,
+            fns_by_file,
+        }
+    }
+
+    /// The nearest fn/method defined at or before `file:line` — used to roll a
+    /// caller that lands inside a closure or const initializer (which has no
+    /// graph node) up to its enclosing function, so the edge isn't lost.
+    fn enclosing_fn(&self, fileline: &str) -> Option<&String> {
+        let (f, l) = fileline.rsplit_once(':')?;
+        let l: i64 = l.parse().ok()?;
+        let list = self.fns_by_file.get(f)?;
+        let pos = list.partition_point(|(ln, _)| *ln <= l);
+        (pos > 0).then(|| &list[pos - 1].1)
     }
 
     /// Resolve a `file:line` to a node id, preferring the fn or other bucket per
@@ -236,8 +260,10 @@ pub fn add_references_layer(
                 continue;
             };
             let is_call = kind == "call";
-            // The caller is always a fn/method/closure/const-initializer body owner.
-            let Some(src) = loc.get(true, caller) else {
+            // The caller is a fn/method/closure/const-initializer body owner. If
+            // it maps to no node (a closure or const init — no Layer-2 item), roll
+            // it up to the enclosing function so the edge survives.
+            let Some(src) = loc.get(true, caller).or_else(|| loc.enclosing_fn(caller)) else {
                 continue;
             };
             let Some(dst) = loc.get(is_call, callee) else {
