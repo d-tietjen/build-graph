@@ -11,8 +11,9 @@ IDE doesn't.
 - `AutoStartActivity` — on opening a project with a `Cargo.toml`, starts
   `cargo build-graph watch --driver` automatically and shows a notification with
   **Open graph** / **Disable auto-start**. No menu click needed.
-- **Tools → Build Graph** submenu — *Open Live Graph*, *Reopen Graph in Browser*,
-  *Stop Watching*, and an *Auto-Start on Project Open* toggle.
+- **Tools → Build Graph** submenu — *Trigger Rebuild* (one-shot), *Resume/Stop
+  Auto Build* (toggles the watcher; text follows state), and *Open Graph in
+  Browser*.
 - `WatchService` — per-project owner of the watcher (idempotent start; killed
   when the project closes). Resolves `cargo` via `~/.cargo/bin` so it works even
   when the IDE was launched without the login-shell PATH.

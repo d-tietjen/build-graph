@@ -4,43 +4,62 @@ import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
-import com.intellij.openapi.actionSystem.ToggleAction
 import com.intellij.openapi.components.service
+import com.intellij.openapi.ui.Messages
 
-/** Open the graph in the browser without (re)starting the watcher, if it's up. */
-class OpenInBrowserAction : AnAction() {
+private fun fail(e: AnActionEvent, ex: Exception) = Messages.showErrorDialog(
+    e.project,
+    "build-graph: ${ex.message}\nIs `build-graph` on PATH (built with --features rustc-driver)?",
+    "build-graph",
+)
+
+/** Force a one-shot rebuild of the graph now. */
+class TriggerRebuildAction : AnAction() {
     override fun actionPerformed(e: AnActionEvent) {
         val svc = e.project?.service<WatchService>() ?: return
-        if (svc.isRunning() && svc.port != 0) {
-            BrowserUtil.browse(svc.liveUrl())
+        try {
+            svc.triggerRebuild()
+        } catch (ex: Exception) {
+            fail(e, ex)
+        }
+    }
+}
+
+/** Single toggle: stop the watcher if running, otherwise (re)start it. Dynamic
+ *  text + the persisted auto-start-on-open flag follow the watcher state. */
+class ToggleAutoBuildAction : AnAction() {
+    override fun actionPerformed(e: AnActionEvent) {
+        val svc = e.project?.service<WatchService>() ?: return
+        try {
+            if (svc.isRunning()) {
+                svc.stop()
+                BuildGraphSettings.setAutoStart(false)
+            } else {
+                BuildGraphSettings.setAutoStart(true)
+                svc.ensureWatching()
+            }
+        } catch (ex: Exception) {
+            fail(e, ex)
         }
     }
 
     override fun update(e: AnActionEvent) {
-        e.presentation.isEnabled = e.project?.service<WatchService>()?.isRunning() == true
+        val running = e.project?.service<WatchService>()?.isRunning() == true
+        e.presentation.text = if (running) "Stop Auto Build" else "Resume Auto Build"
     }
 
     override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
 }
 
-/** Stop this project's build-graph watcher. */
-class StopWatcherAction : AnAction() {
+/** Open (or reopen) the graph in the system browser. */
+class OpenInBrowserAction : AnAction() {
     override fun actionPerformed(e: AnActionEvent) {
-        e.project?.service<WatchService>()?.stop()
+        val svc = e.project?.service<WatchService>() ?: return
+        try {
+            svc.ensureServer()
+            BrowserUtil.browse(svc.liveUrl())
+        } catch (ex: Exception) {
+            fail(e, ex)
+        }
     }
-
-    override fun update(e: AnActionEvent) {
-        e.presentation.isEnabled = e.project?.service<WatchService>()?.isRunning() == true
-    }
-
-    override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
-}
-
-/** Toggle "auto-start the watcher when a Cargo project opens". */
-class AutoStartToggleAction : ToggleAction() {
-    override fun isSelected(e: AnActionEvent): Boolean = BuildGraphSettings.autoStartEnabled()
-
-    override fun setSelected(e: AnActionEvent, state: Boolean) = BuildGraphSettings.setAutoStart(state)
-
-    override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
 }

@@ -19,23 +19,18 @@
   <actions>
     <group id="BuildGraph.Menu" text="Build Graph" popup="true">
       <add-to-group group-id="ToolsMenu" anchor="last"/>
-      <action id="BuildGraph.OpenLiveGraph"
-              class="dev.eden.buildgraph.OpenLiveGraphAction"
-              text="Open Live Graph"
-              description="Start the watcher (if needed) and open the live graph in your browser"/>
+      <action id="BuildGraph.TriggerRebuild"
+              class="dev.eden.buildgraph.TriggerRebuildAction"
+              text="Trigger Rebuild"
+              description="Force a one-shot rebuild of the graph now"/>
+      <action id="BuildGraph.ToggleAutoBuild"
+              class="dev.eden.buildgraph.ToggleAutoBuildAction"
+              text="Resume Auto Build"
+              description="Start or stop watching the workspace (rebuild the graph on save)"/>
       <action id="BuildGraph.OpenInBrowser"
               class="dev.eden.buildgraph.OpenInBrowserAction"
-              text="Reopen Graph in Browser"
-              description="Open the graph tab again without restarting the watcher"/>
-      <action id="BuildGraph.StopWatcher"
-              class="dev.eden.buildgraph.StopWatcherAction"
-              text="Stop Watching"
-              description="Stop the build-graph watcher for this project"/>
-      <separator/>
-      <action id="BuildGraph.AutoStartToggle"
-              class="dev.eden.buildgraph.AutoStartToggleAction"
-              text="Auto-Start on Project Open"
-              description="Automatically start watching when a Cargo project opens"/>
+              text="Open Graph in Browser"
+              description="Open the graph in your default browser"/>
     </group>
   </actions>
 </idea-plugin>
