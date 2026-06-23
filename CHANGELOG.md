@@ -43,6 +43,9 @@ semantic versioning.
   installs the opt-in driver feature and runs the compiler-backed Layer 3 path;
   `references-backend: rust-analyzer` remains the default for existing
   workflows.
+- **Live viewer refreshes** now keep the page mounted and patch in fresh graph
+  data from VS Code / JetBrains live views, preserving layout and avoiding a
+  full GPU/WebGL rebuild when the topology did not change.
 
 ### Notes
 

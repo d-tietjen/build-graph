@@ -166,12 +166,16 @@ function buildSourceTree(nodes, crateNames, crateColor) {
 
 var G = null; // populated by loadData() before boot()
 var UIAPI = null; // renderer's { select(ids), clear() }, set by mountUI
+var DETAIL_ID = null;
+function linkSourceId(l) { return l.sid || (typeof l.source === "object" ? l.source.id : l.source); }
+function linkTargetId(l) { return l.tid || (typeof l.target === "object" ? l.target.id : l.target); }
+function edgeKey(l) { return linkSourceId(l) + "\t" + linkTargetId(l) + "\t" + l.rel; }
 function buildG(data) {
   var nodes = data.nodes.filter(function (n) { var k = kindOf(n); return k !== "crate" && k !== "file"; })
     .map(function (n) { return { id: n.id, label: n.label, kind: kindOf(n), crate: crateOf(n), source_file: n.source_file, source_location: n.source_location }; });
   var byId = {}; nodes.forEach(function (n) { byId[n.id] = n; });
   var links = data.edges.filter(function (e) { return byId[e.source] && byId[e.target]; })
-    .map(function (e) { return { source: e.source, target: e.target, rel: e.relation, cat: relCat(e.relation), cross: byId[e.source].crate !== byId[e.target].crate }; });
+    .map(function (e) { return { source: e.source, target: e.target, sid: e.source, tid: e.target, rel: e.relation, cat: relCat(e.relation), cross: byId[e.source].crate !== byId[e.target].crate }; });
   var crates = {}, kinds = {}, idsByKind = {}, adj = {}, relCount = {};
   nodes.forEach(function (n) {
     crates[n.crate] = (crates[n.crate] || 0) + 1; kinds[n.kind] = (kinds[n.kind] || 0) + 1;
@@ -179,9 +183,10 @@ function buildG(data) {
   });
   // adjacency for the detail panel: id -> [{other, rel, dir}]
   links.forEach(function (l) {
+    var sid = linkSourceId(l), tid = linkTargetId(l);
     relCount[l.rel] = (relCount[l.rel] || 0) + 1;
-    (adj[l.source] = adj[l.source] || []).push({ other: l.target, rel: l.rel, dir: "out" });
-    (adj[l.target] = adj[l.target] || []).push({ other: l.source, rel: l.rel, dir: "in" });
+    (adj[sid] = adj[sid] || []).push({ other: tid, rel: l.rel, dir: "out" });
+    (adj[tid] = adj[tid] || []).push({ other: sid, rel: l.rel, dir: "in" });
   });
   var crateNames = Object.keys(crates).sort(function (a, b) { return crates[b] - crates[a]; });
   var crateColor = {}; crateNames.forEach(function (c, i) { crateColor[c] = PALETTE[i % PALETTE.length]; });
@@ -191,6 +196,70 @@ function buildG(data) {
     + (nc || nu ? " · " + nc + " calls · " + nu + " uses" : "")
     + (nmc || nmu ? " · " + nmc + " member calls · " + nmu + " member uses" : "");
   return { nodes: nodes, byId: byId, links: links, adj: adj, relCount: relCount, crates: crates, kinds: kinds, idsByKind: idsByKind, crateNames: crateNames, crateColor: crateColor, sourceTree: sourceTree };
+}
+
+function mergeGraph(prev, next) {
+  var diff = { nodesAdded: 0, nodesRemoved: 0, nodesUpdated: 0, linksAdded: 0, linksRemoved: 0, visualChanged: false };
+  if (!prev) { return { graph: next, diff: diff }; }
+
+  var oldNodes = prev.byId || {}, seenNodes = {};
+  var mergedNodes = [];
+  next.nodes.forEach(function (fresh) {
+    var old = oldNodes[fresh.id];
+    seenNodes[fresh.id] = true;
+    if (old) {
+      var visual = old.kind !== fresh.kind || old.crate !== fresh.crate;
+      var changed = visual || old.label !== fresh.label || old.source_file !== fresh.source_file || old.source_location !== fresh.source_location;
+      if (changed) diff.nodesUpdated++;
+      if (visual) diff.visualChanged = true;
+      old.label = fresh.label; old.kind = fresh.kind; old.crate = fresh.crate;
+      old.source_file = fresh.source_file; old.source_location = fresh.source_location;
+      old.sx = fresh.sx; old.sy = fresh.sy; old.cax = fresh.cax; old.cay = fresh.cay;
+      if (old.x == null && fresh.x != null) old.x = fresh.x;
+      if (old.y == null && fresh.y != null) old.y = fresh.y;
+      mergedNodes.push(old);
+    } else {
+      diff.nodesAdded++;
+      mergedNodes.push(fresh);
+    }
+  });
+  prev.nodes.forEach(function (n) { if (!seenNodes[n.id]) diff.nodesRemoved++; });
+
+  var oldLinks = {};
+  prev.links.forEach(function (l) { oldLinks[edgeKey(l)] = l; });
+  var seenLinks = {}, mergedLinks = [];
+  next.links.forEach(function (fresh) {
+    var key = edgeKey(fresh), old = oldLinks[key];
+    seenLinks[key] = true;
+    if (old) {
+      old.source = fresh.sid; old.target = fresh.tid; old.sid = fresh.sid; old.tid = fresh.tid;
+      old.rel = fresh.rel; old.cat = fresh.cat; old.cross = fresh.cross;
+      mergedLinks.push(old);
+    } else {
+      diff.linksAdded++;
+      mergedLinks.push(fresh);
+    }
+  });
+  prev.links.forEach(function (l) { if (!seenLinks[edgeKey(l)]) diff.linksRemoved++; });
+
+  next.nodes = mergedNodes;
+  next.byId = {};
+  next.nodes.forEach(function (n) { next.byId[n.id] = n; });
+  next.links = mergedLinks;
+  return { graph: next, diff: diff };
+}
+
+function diffNeedsRenderer(diff) {
+  return diff.nodesAdded || diff.nodesRemoved || diff.linksAdded || diff.linksRemoved || diff.visualChanged;
+}
+function diffText(diff) {
+  var parts = [];
+  if (diff.nodesAdded) parts.push("+" + diff.nodesAdded + " nodes");
+  if (diff.nodesRemoved) parts.push("-" + diff.nodesRemoved + " nodes");
+  if (diff.nodesUpdated) parts.push(diff.nodesUpdated + " node updates");
+  if (diff.linksAdded) parts.push("+" + diff.linksAdded + " edges");
+  if (diff.linksRemoved) parts.push("-" + diff.linksRemoved + " edges");
+  return parts.length ? parts.join(" · ") : "no graph changes";
 }
 
 // ---- deterministic initial spread -----------------------------------------
@@ -263,29 +332,74 @@ function decodePayload(buf) {
   return new Response(stream).text();
 }
 
+function cacheBusted(url) {
+  return url + (url.indexOf("?") >= 0 ? "&" : "?") + "t=" + Date.now();
+}
+
+function handleLoadError(e) {
+  var o = document.getElementById("overlay");
+  if (location.protocol === "file:") {
+    o.innerHTML = "This graph is too large to inline, so the viewer loads <b>" + GRAPH_SRC + "</b> over HTTP — but it was opened from <code>file://</code>.<br><br>Serve the output folder and reopen:<br><br><code>python3 -m http.server</code><br>then open <code>http://localhost:8000/graph.html</code>";
+  } else {
+    o.textContent = "could not load " + GRAPH_SRC + ": " + ((e && e.message) || e);
+  }
+}
+
 // Data is either inlined in #graph-data (small graphs) or fetched alongside this
 // HTML (large graphs the writer chose not to inline). The empty / un-replaced
-// placeholder case both fall through to fetch.
-function loadData(cb) {
+// placeholder case both fall through to fetch. Live refreshes force a fetch so
+// the viewer can stay mounted while the graph data changes underneath it.
+function loadData(cb, opts) {
+  opts = opts || {};
   var raw = document.getElementById("graph-data").textContent;
   var trimmed = raw ? raw.trim() : "";
-  if (trimmed && trimmed.indexOf("__GRAPH_DATA__") === -1) {
-    try { cb(JSON.parse(trimmed)); } catch (e) { document.getElementById("overlay").textContent = "graph data parse error: " + ((e && e.message) || e); }
+  if (!opts.forceFetch && trimmed && trimmed.indexOf("__GRAPH_DATA__") === -1) {
+    try { cb(JSON.parse(trimmed)); } catch (e) { document.getElementById("overlay").textContent = "graph data parse error: " + ((e && e.message) || e); if (opts.onError) opts.onError(e); }
     return;
   }
   document.getElementById("overlay").textContent = "loading " + GRAPH_SRC + "…";
-  fetch(GRAPH_SRC).then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.arrayBuffer(); })
+  fetch(opts.noStore ? cacheBusted(GRAPH_SRC) : GRAPH_SRC, { cache: opts.noStore ? "no-store" : "default" })
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.arrayBuffer(); })
     .then(decodePayload)
     .then(function (text) { cb(JSON.parse(text)); })
     .catch(function (e) {
-      var o = document.getElementById("overlay");
-      if (location.protocol === "file:") {
-        o.innerHTML = "This graph is too large to inline, so the viewer loads <b>" + GRAPH_SRC + "</b> over HTTP — but it was opened from <code>file://</code>.<br><br>Serve the output folder and reopen:<br><br><code>python3 -m http.server</code><br>then open <code>http://localhost:8000/graph.html</code>";
-      } else {
-        o.textContent = "could not load " + GRAPH_SRC + ": " + ((e && e.message) || e);
-      }
+      handleLoadError(e);
+      if (opts.onError) opts.onError(e);
     });
 }
+
+var RELOAD_BUSY = false, RELOAD_AGAIN = false;
+function reloadGraphData() {
+  if (!G || !UIAPI || !UIAPI.updateGraph) { location.reload(); return; }
+  if (RELOAD_BUSY) { RELOAD_AGAIN = true; return; }
+  RELOAD_BUSY = true;
+  var overlay = document.getElementById("overlay");
+  overlay.style.display = "flex";
+  overlay.textContent = "refreshing graph…";
+  loadData(function (data) {
+    var next = buildG(data);
+    seedLayout(next);
+    var diff = UIAPI.updateGraph(next);
+    overlay.textContent = "graph updated · " + diffText(diff);
+    setTimeout(function () { overlay.style.display = "none"; }, 1400);
+    RELOAD_BUSY = false;
+    if (RELOAD_AGAIN) { RELOAD_AGAIN = false; reloadGraphData(); }
+  }, {
+    forceFetch: true,
+    noStore: true,
+    onError: function () {
+      RELOAD_BUSY = false;
+      // If graph.html changed format/source (for example graph.json ↔ graph.json.gz),
+      // a full reload lets the new template tell us which data file to fetch.
+      setTimeout(function () { location.reload(); }, 500);
+    }
+  });
+}
+window.__reloadGraph = reloadGraphData;
+window.addEventListener("message", function (e) {
+  var t = e && e.data && e.data.type;
+  if (t === "build-graph:reload-data" || t === "reload-data" || t === "reload") reloadGraphData();
+});
 
 // shared sidebar + tooltip; renderer supplies selectIds(idArray|null) and clearSel()
 function mountUI(api) {
@@ -297,6 +411,13 @@ function mountUI(api) {
   function pickSource(n) { if (selSource === n.key) { selSource = null; api.clear(); } else { selSource = n.key; selKind = null; api.select(n.ids); } mark(); }
   function pickKind(k) { if (selKind === k) { selKind = null; api.clear(); } else { selKind = k; selSource = null; api.select(G.idsByKind[k]); } mark(); }
   api.onExternalClear = function () { selSource = null; selKind = null; mark(); };
+  function applySearch() {
+    var q = document.getElementById("search").value.toLowerCase();
+    if (!q) return false;
+    selSource = null; selKind = null; mark();
+    api.select(G.nodes.filter(function (n) { return n.label.toLowerCase().indexOf(q) !== -1; }).map(function (n) { return n.id; }));
+    return true;
+  }
   function renderSourceTree() {
     var box = document.getElementById("cratelist"); box.innerHTML = "";
     var h = document.createElement("div"); h.className = "listhdr"; h.textContent = "source · click to select"; box.appendChild(h);
@@ -345,13 +466,23 @@ function mountUI(api) {
       box.appendChild(row);
     });
   }
-  renderSourceTree();
-  buildList("kindlist", "kinds · click to select", Object.keys(G.kinds).sort(function (a, b) { return G.kinds[b] - G.kinds[a]; }).map(function (k) { return { key: k, count: G.kinds[k] }; }), function (k) { return KIND_COLORS[k] || DEFAULT_COLOR; }, pickKind);
+  function refreshSidebar() {
+    renderSourceTree();
+    buildList("kindlist", "kinds · click to select", Object.keys(G.kinds).sort(function (a, b) { return G.kinds[b] - G.kinds[a]; }).map(function (k) { return { key: k, count: G.kinds[k] }; }), function (k) { return KIND_COLORS[k] || DEFAULT_COLOR; }, pickKind);
+    if (selKind && !G.idsByKind[selKind]) selKind = null;
+    if (selSource) {
+      var foundSource = false;
+      document.querySelectorAll("#cratelist .row").forEach(function (r) { if (r.getAttribute("data-v") === selSource) foundSource = true; });
+      if (!foundSource) selSource = null;
+    }
+    if (applySearch()) return;
+    mark();
+  }
+  api.refreshSidebar = refreshSidebar;
+  refreshSidebar();
   document.getElementById("search").addEventListener("input", function (e) {
-    selSource = null; selKind = null; mark();
-    var q = e.target.value.toLowerCase();
-    if (!q) { api.clear(); return; }
-    api.select(G.nodes.filter(function (n) { return n.label.toLowerCase().indexOf(q) !== -1; }).map(function (n) { return n.id; }));
+    if (!e.target.value) { selSource = null; selKind = null; mark(); api.clear(); return; }
+    applySearch();
   });
   // edge color key
   var ek = document.getElementById("edgekey"); ek.innerHTML = "";
@@ -393,6 +524,7 @@ function neighborhoodIds(id, depth) {
 }
 function showDetail(id) {
   var n = G.byId[id]; if (!n) return;
+  DETAIL_ID = id;
   var d = document.getElementById("detail"), nb = G.adj[id] || [], groups = {};
   nb.forEach(function (e) { var k = e.rel + "|" + e.dir; (groups[k] = groups[k] || []).push(e.other); });
   var html = "<span class='close' title='close'>×</span>";
@@ -424,7 +556,7 @@ function showDetail(id) {
   if (ctl) ctl.addEventListener("input", function () { setDepth(ctl.value); });
   setDepth(ctl ? ctl.value : 1);
 }
-function hideDetail() { var d = document.getElementById("detail"); if (d) d.style.display = "none"; }
+function hideDetail() { DETAIL_ID = null; var d = document.getElementById("detail"); if (d) d.style.display = "none"; }
 window.__showDetail = showDetail; // programmatic / test handle (like window.__graph)
 function openInitialFocus() {
   var id = new URLSearchParams(location.search).get("focus");
@@ -498,7 +630,27 @@ function bootCosmos(Graph) {
   var paused = false; var pb = mkbtn("pause", function () { paused = !paused; pb.textContent = paused ? "resume" : "pause"; try { paused ? graph.pause() : graph.start(); } catch (e) {} }); bar.appendChild(pb);
   glcv.addEventListener("mousemove", function (ev) { if (!hovered) { hideTip(); return; } var r = glcv.getBoundingClientRect(); showTip(hovered, ev.clientX - r.left, ev.clientY - r.top); });
   var o = document.getElementById("overlay"); o.textContent = "running GPU force simulation…"; setTimeout(function () { o.style.display = "none"; }, 2500);
-  var api = { select: function (ids) { lastSel = ids; graph.selectNodesByIds(ids); }, clear: function () { lastSel = null; graph.unselectNodes(); } };
+  var api = {
+    select: function (ids) { lastSel = ids || []; graph.selectNodesByIds(lastSel); },
+    clear: function () { lastSel = null; graph.unselectNodes(); },
+    updateGraph: function (next) {
+      applyCosmosSeed(next, 8192);
+      var merged = mergeGraph(G, next), diff = merged.diff;
+      G = merged.graph;
+      if (lastSel) lastSel = lastSel.filter(function (id) { return !!G.byId[id]; });
+      if (diffNeedsRenderer(diff)) {
+        // Existing node objects keep their x/y positions; new nodes arrive with
+        // seeded coordinates. This avoids the full page/import rebuild and gives
+        // Cosmos a stable layout to continue from.
+        graph.setData(G.nodes, G.links);
+        try { graph.start(); } catch (e) {}
+      }
+      if (lastSel && lastSel.length) graph.selectNodesByIds(lastSel); else graph.unselectNodes();
+      if (api.refreshSidebar) api.refreshSidebar();
+      if (DETAIL_ID && G.byId[DETAIL_ID]) showDetail(DETAIL_ID); else if (DETAIL_ID) hideDetail();
+      return diff;
+    }
+  };
   mountUI(api);
   openInitialFocus();
 }
@@ -509,7 +661,12 @@ function bootCanvas() {
   var stage = document.getElementById("stage");
   var cv = document.createElement("canvas"); cv.id = "cv"; stage.insertBefore(cv, stage.firstChild);
   var ctx = cv.getContext("2d");
-  var nodes = G.nodes, links = G.links.map(function (l) { return { source: G.byId[l.source], target: G.byId[l.target], cat: l.cat, cross: l.cross }; });
+  function makeCanvasLinks() {
+    return G.links.map(function (l) {
+      return { source: G.byId[linkSourceId(l)], target: G.byId[linkTargetId(l)], cat: l.cat, cross: l.cross };
+    }).filter(function (l) { return l.source && l.target; });
+  }
+  var nodes = G.nodes, links = makeCanvasLinks();
   nodes.forEach(function (n) { n.x = n.sx || 0; n.y = n.sy || 0; });
   document.getElementById("overlay").textContent = "computing layout… (" + nodes.length + " nodes)";
   setTimeout(function () {
@@ -531,8 +688,12 @@ function bootCanvas() {
     var dpr = Math.min(window.devicePixelRatio || 1, 2), W = 0, H = 0;
     function resize() { W = stage.clientWidth; H = stage.clientHeight; cv.width = W * dpr; cv.height = H * dpr; cv.style.width = W + "px"; cv.style.height = H + "px"; }
     resize(); window.addEventListener("resize", function () { resize(); draw(); });
-    var tree = d3.quadtree().x(function (d) { return d.x; }).y(function (d) { return d.y; }).addAll(nodes);
-    var byColor = {}; nodes.forEach(function (n) { var c = KIND_COLORS[n.kind] || DEFAULT_COLOR; (byColor[c] = byColor[c] || []).push(n); });
+    var tree = null, byColor = {};
+    function rebuildDrawIndexes() {
+      tree = d3.quadtree().x(function (d) { return d.x; }).y(function (d) { return d.y; }).addAll(nodes);
+      byColor = {}; nodes.forEach(function (n) { var c = KIND_COLORS[n.kind] || DEFAULT_COLOR; (byColor[c] = byColor[c] || []).push(n); });
+    }
+    rebuildDrawIndexes();
     var focus = null, hideOthers = false;
     function active(n) { return focus ? focus.has(n.id) : true; }
     var transform = d3.zoomIdentity, fitK = 0;   // fitK = scale at which all nodes fit (most zoomed-out)
@@ -577,7 +738,40 @@ function bootCanvas() {
     cv.addEventListener("mouseleave", hideTip);
     cv.addEventListener("click", function () { if (hovered) { api.onExternalClear && api.onExternalClear(); showDetail(hovered.id); } });
 
-    var api = { select: function (ids) { focus = new Set(ids); draw(); }, clear: function () { focus = null; draw(); } };
+    function settleChanged(diff) {
+      if (!diffNeedsRenderer(diff)) return;
+      var changed = diff.nodesAdded + diff.nodesRemoved + diff.linksAdded + diff.linksRemoved;
+      var ticks = changed > 5000 ? 45 : changed > 500 ? 30 : 16;
+      var sim = d3.forceSimulation(nodes)
+        .force("link", d3.forceLink(links)
+          .distance(function (l) { return l.cross ? 26 : 11; })
+          .strength(function (l) { return l.cross ? 0.03 : 0.25; }))
+        .force("charge", d3.forceManyBody().strength(-18).theta(0.95).distanceMax(450))
+        .force("cx", d3.forceX(function (n) { return n.cax || 0; }).strength(0.035))
+        .force("cy", d3.forceY(function (n) { return n.cay || 0; }).strength(0.035))
+        .stop();
+      for (var i = 0; i < ticks; i++) sim.tick();
+    }
+    var api = {
+      select: function (ids) { focus = new Set(ids || []); draw(); },
+      clear: function () { focus = null; draw(); },
+      updateGraph: function (next) {
+        var merged = mergeGraph(G, next), diff = merged.diff;
+        G = merged.graph; nodes = G.nodes; links = makeCanvasLinks();
+        nodes.forEach(function (n) { if (n.x == null) n.x = n.sx || 0; if (n.y == null) n.y = n.sy || 0; });
+        settleChanged(diff);
+        rebuildDrawIndexes();
+        if (focus) {
+          var keep = new Set();
+          focus.forEach(function (id) { if (G.byId[id]) keep.add(id); });
+          focus = keep.size ? keep : null;
+        }
+        if (api.refreshSidebar) api.refreshSidebar();
+        if (DETAIL_ID && G.byId[DETAIL_ID]) showDetail(DETAIL_ID); else if (DETAIL_ID) hideDetail();
+        draw();
+        return diff;
+      }
+    };
     var bar = controlBar(stage);
     function applyFit(list) { fitToNodes(list); d3.select(cv).call(zoom.transform, transform); draw(); }
     bar.appendChild(mkbtn("fit", function () { applyFit(); }));
