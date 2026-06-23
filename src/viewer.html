@@ -197,14 +197,34 @@ function buildG(data) {
 // Give both renderers a stable, neutral starting cloud. The force simulation
 // still decides the final shape; this just avoids a blank or perfectly stacked
 // first frame, especially in the CPU fallback.
+// Cluster the seed by crate: every crate gets an anchor on a golden-angle disc,
+// and its nodes spiral tightly around that anchor. The force sim still decides
+// the final shape, but it starts crate-grouped (and the CPU layout keeps each
+// node gently pulled toward its crate anchor via n.cax/n.cay), so related
+// objects stay together instead of dissolving into one even cloud.
 function seedLayout(G) {
   var count = Math.max(1, G.nodes.length);
-  var radius = Math.max(60, Math.sqrt(count) * 7);
-  G.nodes.forEach(function (n, i) {
-    var a = i * 2.399963229728653; // golden-angle spiral
-    var r = radius * Math.sqrt((i + 0.5) / count);
-    n.sx = r * Math.cos(a);
-    n.sy = r * Math.sin(a);
+  var crateNames = (G.crateNames && G.crateNames.length) ? G.crateNames : [""];
+  var nc = crateNames.length;
+  var spread = Math.max(80, Math.sqrt(count) * 11);
+  var anchor = {};
+  crateNames.forEach(function (c, i) {
+    var a = i * 2.399963229728653; // golden-angle spiral of crate anchors
+    var r = nc > 1 ? spread * Math.sqrt((i + 0.5) / nc) : 0;
+    anchor[c] = { x: r * Math.cos(a), y: r * Math.sin(a) };
+  });
+  var fallback = anchor[crateNames[0]];
+  var idx = {};
+  G.nodes.forEach(function (n) {
+    var an = anchor[n.crate] || fallback;
+    var size = (G.crates && G.crates[n.crate]) || 1;
+    var k = (idx[n.crate] = (idx[n.crate] || 0) + 1);
+    var localR = Math.max(14, Math.sqrt(size) * 5);
+    var ga = k * 2.399963229728653;
+    var rr = localR * Math.sqrt(k / Math.max(1, size));
+    n.sx = an.x + rr * Math.cos(ga);
+    n.sy = an.y + rr * Math.sin(ga);
+    n.cax = an.x; n.cay = an.y; // crate anchor, used by the CPU clustering force
   });
 }
 
@@ -426,7 +446,7 @@ function bootCosmos(Graph) {
   // square edge. So weaken repulsion (and nudge gravity up a touch) as the graph
   // grows, keeping the cloud an organic island that doesn't reach the walls.
   var bigN = Math.max(0, Math.min(1, (G.nodes.length - 15000) / 105000));   // 0 at ≤15k … 1 at ≥120k nodes
-  function simCfg() { return { repulsion: 1.3 - 0.6 * bigN, repulsionTheta: 1.0, linkSpring: 1.0, linkDistance: 6, gravity: 0.6, decay: 1000, friction: 0.85 }; }
+  function simCfg() { return { repulsion: 1.3 - 0.6 * bigN, repulsionTheta: 1.0, linkSpring: 1.7, linkDistance: 5, gravity: 0.6, decay: 1000, friction: 0.9 }; }
   // Edges fade/thin when zoomed out (all nodes visible) and ramp back up as you
   // zoom in, so the node cloud reads clearly at a distance.
   var fitZoom = 0, zoomReady = false;   // zoomReady gates the fade until the initial fits settle
@@ -485,9 +505,15 @@ function bootCanvas() {
   document.getElementById("overlay").textContent = "computing layout… (" + nodes.length + " nodes)";
   setTimeout(function () {
     var sim = d3.forceSimulation(nodes)
-      .force("link", d3.forceLink(links).distance(16).strength(0.25))
+      // Intra-crate edges pull short + hard; cross-crate edges long + soft, so
+      // crates cohere without merging.
+      .force("link", d3.forceLink(links)
+        .distance(function (l) { return l.cross ? 26 : 11; })
+        .strength(function (l) { return l.cross ? 0.05 : 0.45; }))
       .force("charge", d3.forceManyBody().strength(-30).theta(0.95).distanceMax(600))
-      .force("x", d3.forceX(0).strength(0.01)).force("y", d3.forceY(0).strength(0.01));
+      // Hold each node near its crate anchor so clusters stay grouped.
+      .force("cx", d3.forceX(function (n) { return n.cax || 0; }).strength(0.07))
+      .force("cy", d3.forceY(function (n) { return n.cay || 0; }).strength(0.07));
     sim.stop(); var N = nodes.length > 9000 ? 200 : 300; for (var i = 0; i < N; i++) sim.tick();
     document.getElementById("overlay").style.display = "none"; run();
   }, 30);
