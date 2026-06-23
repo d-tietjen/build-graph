@@ -65,16 +65,28 @@ fn driver_src() -> Option<Utf8PathBuf> {
         .then_some(baked)
 }
 
+/// Strip the rustup/cargo toolchain selectors that a parent `cargo build-graph`
+/// invocation leaks into child processes (`RUSTUP_TOOLCHAIN`, `RUSTC`,
+/// `RUSTDOC`). Without this, running build-graph under a project pinned to
+/// stable (or any non-driver toolchain) forces the nested driver build/check
+/// onto that toolchain instead of the driver crate's pinned nightly, and
+/// `#![feature(rustc_private)]` fails to compile.
+fn free_toolchain(cmd: &mut std::process::Command) {
+    cmd.env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTC")
+        .env_remove("RUSTDOC");
+}
+
 /// Build the driver crate (its `rust-toolchain.toml` selects the nightly). Cargo
 /// caches, so this is a fast no-op after the first run.
 fn build_driver(src: &Utf8Path) -> Result<Utf8PathBuf> {
     let bin = src.join("target/release/bg-driver");
     eprintln!("[build-graph] driver: ensuring {src} is built (cargo caches)…");
-    let status = std::process::Command::new("cargo")
-        .args(["build", "--release"])
-        .current_dir(src.as_std_path()) // so bg-driver's nightly toolchain pin applies
-        .status()
-        .context("building the bg-driver crate")?;
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.args(["build", "--release"])
+        .current_dir(src.as_std_path()); // so bg-driver's nightly toolchain pin applies
+    free_toolchain(&mut cmd);
+    let status = cmd.status().context("building the bg-driver crate")?;
     if !status.success() {
         bail!("building bg-driver failed (needs the pinned nightly + rustc-dev component)");
     }
@@ -182,14 +194,16 @@ pub fn add_references_layer(
     eprintln!(
         "[build-graph] references(driver): cargo +{nightly} check --all-targets via the rustc driver…"
     );
-    let status = Command::new("cargo")
-        .arg(format!("+{nightly}"))
+    let mut cmd = Command::new("cargo");
+    cmd.arg(format!("+{nightly}"))
         .args(["check", "--all-targets", "--target-dir"])
         .arg(target_dir.as_str())
         .current_dir(ws_root.as_std_path())
         .env("RUSTC_WORKSPACE_WRAPPER", driver_bin.as_str())
         .env("BG_DRIVER_EDGES", edges_dir.as_str())
-        .env(dylib_env(), format!("{sysroot}/lib"))
+        .env(dylib_env(), format!("{sysroot}/lib"));
+    free_toolchain(&mut cmd);
+    let status = cmd
         .status()
         .context("running `cargo check` with the rustc driver")?;
     if !status.success() {
