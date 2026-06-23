@@ -36,6 +36,9 @@ semantic versioning.
   runs) and a JetBrains/RustRover plugin scaffold. Each runs `watch` and shows
   the live architecture graph in-editor; neither duplicates the IDE's own
   go-to-def / find-usages.
+- **Agent integration templates** for Codex and Claude Code, with drop-in
+  `AGENTS.md`/`CLAUDE.md` guidance for using bounded `find`/`refs` queries
+  instead of text-searching blindly.
 
 ### Notes
 
