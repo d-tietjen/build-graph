@@ -1,0 +1,13 @@
+# Standalone (its own [workspace]) so it doesn't get pulled into the parent
+# build-graph package while sitting inside its directory tree.
+[workspace]
+
+[package]
+name = "bg-driver"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "bg-driver"
+path = "src/main.rs"

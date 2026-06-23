@@ -1,7 +1,7 @@
 [package]
 name = "build-graph"
 description = "Build a Rust code knowledge graph from build artifacts; includes a build-script helper and the `cargo build-graph` CLI."
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -11,6 +11,13 @@ readme = "README.md"
 [[bin]]
 name = "cargo-build-graph"
 path = "src/main.rs"
+
+[features]
+# Opt-in rustc-driver references backend (Layer 3 via RUSTC_WORKSPACE_WRAPPER).
+# The glue compiled here is pure-stable; the driver itself is the separate
+# `crates/bg-driver` nightly crate, auto-built on demand. Enable the CLI flags
+# and code path with `--features rustc-driver`.
+rustc-driver = []
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }

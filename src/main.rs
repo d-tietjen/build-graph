@@ -5,6 +5,8 @@
 mod cache;
 mod cargo_build;
 mod depinfo;
+#[cfg(feature = "rustc-driver")]
+mod driver_refs;
 mod metadata;
 mod qserve;
 mod query;
@@ -22,6 +24,12 @@ use build_graph::{Graph, GraphJson, norm};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
 
+/// The nightly `crates/bg-driver` is pinned to (it links that toolchain's
+/// `rustc_driver`) — the same nightly Layer 2's `rustdoc-types` pin matches.
+/// Override with `--nightly` if you built the driver against another.
+#[cfg(feature = "rustc-driver")]
+const DEFAULT_DRIVER_NIGHTLY: &str = "nightly-2026-02-27";
+
 #[derive(Parser)]
 #[command(
     name = "cargo-build-graph",
@@ -38,6 +46,8 @@ struct Cli {
 enum Cmd {
     /// Run `cargo build` (JSON stream), then refresh the graph from target/.
     Build(BuildArgs),
+    /// Watch the workspace and refresh the graph on every save (incrementally).
+    Watch(WatchArgs),
     /// Re-extract the graph from the current target/ without building.
     Update(CommonArgs),
     /// Open the bundled HTML viewer for the generated graph.
@@ -79,6 +89,18 @@ struct CommonArgs {
     /// Nightly toolchain for Layer 2 (default: auto-detect newest installed).
     #[arg(long)]
     nightly: Option<String>,
+    /// Use the build-graph **rustc driver** for the references layer instead of
+    /// rust-analyzer. The driver (`crates/bg-driver`) is built on demand; it
+    /// reads the compiler's HIR during `cargo check`, so it's incremental for
+    /// free (only changed crates re-run). Implies `--references`.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long)]
+    driver: bool,
+    /// Path to a prebuilt `bg-driver` binary (skips the on-demand build). Also
+    /// enables the driver backend. Built against the `--nightly` toolchain.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, value_name = "PATH")]
+    driver_bin: Option<String>,
     /// Restrict extraction to these packages.
     #[arg(short = 'p', long = "package")]
     packages: Vec<String>,
@@ -93,10 +115,44 @@ struct CommonArgs {
     compress: bool,
 }
 
+impl CommonArgs {
+    /// Whether the rustc-driver references backend was requested. Always false
+    /// when the `rustc-driver` feature is disabled (the flags don't exist).
+    fn driver_requested(&self) -> bool {
+        #[cfg(feature = "rustc-driver")]
+        {
+            self.driver || self.driver_bin.is_some()
+        }
+        #[cfg(not(feature = "rustc-driver"))]
+        {
+            false
+        }
+    }
+}
+
 #[derive(Args)]
 struct BuildArgs {
     #[command(flatten)]
     common: CommonArgs,
+    /// Extra arguments forwarded to `cargo build` (after `--`).
+    #[arg(last = true)]
+    cargo_args: Vec<String>,
+}
+
+#[derive(Args)]
+struct WatchArgs {
+    #[command(flatten)]
+    common: CommonArgs,
+    /// Poll/debounce interval in milliseconds between change checks (min 50).
+    /// A change must hold steady for one interval before a refresh runs, so a
+    /// burst of saves coalesces into a single rebuild.
+    #[arg(long, default_value_t = 500)]
+    debounce: u64,
+    /// Don't run `cargo build` each cycle — just re-extract from the current
+    /// target/. Use when your editor/rust-analyzer already drives the build and
+    /// you only want the graph to track what's already compiled.
+    #[arg(long)]
+    no_build: bool,
     /// Extra arguments forwarded to `cargo build` (after `--`).
     #[arg(last = true)]
     cargo_args: Vec<String>,
@@ -229,6 +285,7 @@ fn main() -> Result<()> {
     }
     match Cli::parse_from(args).cmd {
         Cmd::Build(a) => run_build(a),
+        Cmd::Watch(w) => run_watch(w),
         Cmd::Update(c) => run_extract(&c, &[]),
         Cmd::View(v) => run_view(v),
         Cmd::Find(f) => run_find(f),
@@ -239,20 +296,136 @@ fn main() -> Result<()> {
 }
 
 fn run_build(a: BuildArgs) -> Result<()> {
+    build_and_extract(&a.common, &a.cargo_args, true)
+}
+
+/// One refresh pass: optionally run `cargo build`, then (re)extract the graph
+/// from target/. Shared by `build` and the `watch` loop. Both the build and the
+/// extract are already incremental — only changed crates recompile/re-document.
+fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool) -> Result<()> {
+    let compiled = if do_build {
+        let manifest = common.manifest_path.as_ref().map(Utf8PathBuf::from);
+        let compiled = cargo_build::run_build(
+            manifest.as_deref(),
+            common.release,
+            &common.packages,
+            cargo_args,
+        )?;
+        let changed = compiled.iter().filter(|t| t.changed()).count();
+        eprintln!(
+            "[build-graph] build ok: {} artifact(s), {} recompiled",
+            compiled.len(),
+            changed
+        );
+        compiled
+    } else {
+        Vec::new()
+    };
+    run_extract(common, &compiled)
+}
+
+/// Watch the workspace and re-run the incremental refresh whenever a `.rs` or
+/// `Cargo.toml` file changes. Layers 1–2 already reuse the prior graph for
+/// unchanged crates, so a save only re-does the crate(s) you touched. The graph
+/// (and anything serving it) updates in place.
+fn run_watch(a: WatchArgs) -> Result<()> {
     let manifest = a.common.manifest_path.as_ref().map(Utf8PathBuf::from);
-    let compiled = cargo_build::run_build(
-        manifest.as_deref(),
-        a.common.release,
-        &a.common.packages,
-        &a.cargo_args,
-    )?;
-    let changed = compiled.iter().filter(|t| t.changed()).count();
-    eprintln!(
-        "[build-graph] build ok: {} artifact(s), {} recompiled",
-        compiled.len(),
-        changed
-    );
-    run_extract(&a.common, &compiled)
+    let meta = metadata::load(manifest.as_deref())?;
+    let root = meta.workspace_root.clone();
+    let target_dir = a
+        .common
+        .target_dir
+        .as_ref()
+        .map(Utf8PathBuf::from)
+        .unwrap_or_else(|| meta.target_directory.clone());
+    let out = a
+        .common
+        .out
+        .as_ref()
+        .map(Utf8PathBuf::from)
+        .unwrap_or_else(|| target_dir.join("build-graph"));
+    // Don't let our own outputs (or cargo's) trigger another rebuild.
+    let excludes: Vec<std::path::PathBuf> = vec![
+        target_dir.as_std_path().to_path_buf(),
+        out.as_std_path().to_path_buf(),
+    ];
+    let do_build = !a.no_build;
+    let interval = std::time::Duration::from_millis(a.debounce.max(50));
+
+    eprintln!("[build-graph] watch: workspace {root}");
+    if let Err(e) = build_and_extract(&a.common, &a.cargo_args, do_build) {
+        eprintln!("[build-graph] watch: initial refresh failed — {e:#}");
+    }
+    eprintln!("[build-graph] watch: watching .rs/Cargo.toml under {root} (Ctrl-C to stop)…");
+
+    let mut last = workspace_fingerprint(&root, &excludes);
+    loop {
+        std::thread::sleep(interval);
+        let mut fp = workspace_fingerprint(&root, &excludes);
+        if fp == last {
+            continue;
+        }
+        // Let a burst of saves settle before rebuilding: wait until the
+        // fingerprint stops moving for one whole interval.
+        loop {
+            std::thread::sleep(interval);
+            let next = workspace_fingerprint(&root, &excludes);
+            if next == fp {
+                break;
+            }
+            fp = next;
+        }
+        eprintln!("[build-graph] watch: change detected — refreshing…");
+        if let Err(e) = build_and_extract(&a.common, &a.cargo_args, do_build) {
+            eprintln!("[build-graph] watch: refresh failed — {e:#}");
+        }
+        // Rescan after the refresh so sources the build itself touched (e.g.
+        // generated files under a watched dir) don't immediately re-trigger.
+        last = workspace_fingerprint(&root, &excludes);
+    }
+}
+
+fn is_excluded(path: &std::path::Path, excludes: &[std::path::PathBuf]) -> bool {
+    excludes.iter().any(|e| path.starts_with(e))
+        || path.components().any(|c| c.as_os_str() == ".git")
+}
+
+/// A cheap change signal: hash of every workspace `.rs`/`Cargo.toml` path + mtime,
+/// skipping target/, the output dir, and `.git`. Reuses the same mtime basis as
+/// the per-crate cache, so it flags exactly the edits a refresh would act on.
+fn workspace_fingerprint(root: &Utf8Path, excludes: &[std::path::PathBuf]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut items: Vec<(String, u128)> = Vec::new();
+    for entry in walkdir::WalkDir::new(root.as_std_path())
+        .into_iter()
+        .filter_entry(|e| !is_excluded(e.path(), excludes))
+        .flatten()
+    {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let p = entry.path();
+        let is_rs = p.extension().and_then(|e| e.to_str()) == Some("rs");
+        let is_manifest = p.file_name().and_then(|n| n.to_str()) == Some("Cargo.toml");
+        if !is_rs && !is_manifest {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        items.push((p.to_string_lossy().into_owned(), mtime));
+    }
+    items.sort();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for (path, mtime) in items {
+        path.hash(&mut hasher);
+        mtime.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Result<()> {
@@ -270,8 +443,11 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
         .map(Utf8PathBuf::from)
         .unwrap_or_else(|| target_dir.join("build-graph"));
     let profiles: &[&str] = if c.release { &["release"] } else { &["debug"] };
-    // `--references` needs the rich item nodes to connect to, so it implies `--rich`.
-    let rich = c.rich || c.references;
+    // The rustc-driver backend (`--driver`/`--driver-bin`) produces the
+    // references layer, so it implies `--references`; `--references` in turn
+    // needs the rich item nodes to connect to, so it implies `--rich`.
+    let references = c.references || c.driver_requested();
+    let rich = c.rich || references;
 
     // Reuse the prior graph when the cache is compatible (same layer settings).
     // The prior graph may be in either form (gzip or plain) — `find_graph`
@@ -282,7 +458,7 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
     let prior = cache::Cache::load(cache_path.as_std_path());
     let compatible = prior
         .as_ref()
-        .map(|p| p.rich == rich && p.no_derives == c.no_derives && p.references == c.references)
+        .map(|p| p.rich == rich && p.no_derives == c.no_derives && p.references == references)
         .unwrap_or(false)
         && existing.is_some();
     let mut graph = match (compatible, &existing) {
@@ -354,6 +530,7 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
         if rich_dirty.is_empty() {
             eprintln!("[build-graph] layer 2: no changed crates to re-document");
         } else {
+            let t2 = std::time::Instant::now();
             let items = rustdoc::add_item_layer(
                 &mut graph,
                 &meta,
@@ -363,16 +540,47 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
                 c.release,
                 c.no_derives,
             )?;
-            eprintln!("[build-graph] layer 2: +{items} item node(s)");
+            eprintln!(
+                "[build-graph] layer 2: +{items} item node(s) ({} crate(s), {:.1}s)",
+                rich_dirty.len(),
+                t2.elapsed().as_secs_f64()
+            );
         }
 
-        // Layer 3 (semantic): rust-analyzer SCIP references — accurate calls/uses.
-        // The index is whole-workspace, so only (re)run when something changed.
-        if c.references && !dirty.is_empty() {
-            match scip::add_references_layer(&mut graph, &meta.workspace_root, &out) {
+        // Layer 3 (semantic) — body-level calls/uses. Two backends: the rustc
+        // driver (incremental; only changed crates re-run) or rust-analyzer SCIP
+        // (cold whole-workspace index). Only (re)run when something changed.
+        if references && !dirty.is_empty() {
+            let t3 = std::time::Instant::now();
+            let result;
+            let backend;
+            #[cfg(feature = "rustc-driver")]
+            if c.driver_requested() {
+                let nightly = c.nightly.as_deref().unwrap_or(DEFAULT_DRIVER_NIGHTLY);
+                result = driver_refs::resolve_driver(c.driver_bin.as_deref()).and_then(|bin| {
+                    driver_refs::add_references_layer(
+                        &mut graph,
+                        &meta.workspace_root,
+                        &out,
+                        &bin,
+                        nightly,
+                    )
+                });
+                backend = "rustc driver";
+            } else {
+                result = scip::add_references_layer(&mut graph, &meta.workspace_root, &out);
+                backend = "rust-analyzer";
+            }
+            #[cfg(not(feature = "rustc-driver"))]
+            {
+                result = scip::add_references_layer(&mut graph, &meta.workspace_root, &out);
+                backend = "rust-analyzer";
+            }
+            match result {
                 Ok(counts) => eprintln!(
-                    "[build-graph] layer 3: +{} calls, +{} uses, +{} member_calls, +{} member_uses edge(s) (rust-analyzer)",
-                    counts.calls, counts.uses, counts.member_calls, counts.member_uses
+                    "[build-graph] layer 3: +{} calls, +{} uses, +{} member_calls, +{} member_uses edge(s) ({backend}, {:.1}s)",
+                    counts.calls, counts.uses, counts.member_calls, counts.member_uses,
+                    t3.elapsed().as_secs_f64()
                 ),
                 Err(e) => eprintln!("[build-graph] layer 3: references skipped — {e:#}"),
             }
@@ -389,7 +597,7 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
         title,
     )
     .with_context(|| format!("writing graph to {out}"))?;
-    cache::Cache::new(rich, c.no_derives, c.references, current)
+    cache::Cache::new(rich, c.no_derives, references, current)
         .save(cache_path.as_std_path())
         .with_context(|| format!("writing cache to {cache_path}"))?;
     let wrote = if c.compress {
@@ -617,4 +825,40 @@ fn open_in_browser(path: &str) -> Result<()> {
         .status()
         .with_context(|| format!("failed to launch `{opener}`"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::is_excluded;
+
+    #[test]
+    fn watch_skips_target_out_and_git() {
+        let excludes = vec![
+            PathBuf::from("/ws/target"),
+            PathBuf::from("/ws/target/build-graph"),
+        ];
+        // Watched source is included.
+        assert!(!is_excluded(&PathBuf::from("/ws/src/lib.rs"), &excludes));
+        assert!(!is_excluded(
+            &PathBuf::from("/ws/crates/a/src/main.rs"),
+            &excludes
+        ));
+        // target/ (compiler output) and the graph output dir never count as edits —
+        // this is what stops our own `graph.json.gz` writes from looping the watcher.
+        assert!(is_excluded(
+            &PathBuf::from("/ws/target/debug/deps/foo.d"),
+            &excludes
+        ));
+        assert!(is_excluded(
+            &PathBuf::from("/ws/target/build-graph/graph.json.gz"),
+            &excludes
+        ));
+        // .git churns constantly during commits/checkouts; ignore it.
+        assert!(is_excluded(
+            &PathBuf::from("/ws/.git/index.lock"),
+            &excludes
+        ));
+    }
 }

@@ -283,7 +283,7 @@ fn enclosing_owners(
 ///
 /// Transitive owners are included too: a module containing `Widget` receives the
 /// same rollups, so every object-like node can answer "what happens inside me?"
-fn add_member_reference_edges(graph: &mut Graph) -> (usize, usize) {
+pub(crate) fn add_member_reference_edges(graph: &mut Graph) -> (usize, usize) {
     let mut parents: HashMap<String, Vec<String>> = HashMap::new();
     for edge in graph.edge_values() {
         if !owner_relation(edge.relation.as_str()) {

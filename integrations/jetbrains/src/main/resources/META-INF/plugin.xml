@@ -1,0 +1,36 @@
+<idea-plugin>
+  <id>dev.eden.build-graph</id>
+  <name>build-graph</name>
+  <vendor email="devon@eden.dev" url="https://github.com/d-tietjen/build-graph">Eden</vendor>
+  <description><![CDATA[
+    Live Rust architecture graph from <a href="https://github.com/d-tietjen/build-graph">build-graph</a>,
+    refreshed on save and opened in your browser. Shows the cross-crate architecture graph
+    (crates, files, symbols, relationships) — it does not duplicate the IDE's own
+    go-to-def / find-usages.
+  ]]></description>
+
+  <depends>com.intellij.modules.platform</depends>
+
+  <extensions defaultExtensionNs="com.intellij">
+    <postStartupActivity implementation="dev.eden.buildgraph.AutoStartActivity"/>
+    <notificationGroup id="build-graph" displayType="BALLOON"/>
+  </extensions>
+
+  <actions>
+    <group id="BuildGraph.Menu" text="Build Graph" popup="true">
+      <add-to-group group-id="ToolsMenu" anchor="last"/>
+      <action id="BuildGraph.TriggerRebuild"
+              class="dev.eden.buildgraph.TriggerRebuildAction"
+              text="Trigger Rebuild"
+              description="Force a one-shot rebuild of the graph now"/>
+      <action id="BuildGraph.ToggleAutoBuild"
+              class="dev.eden.buildgraph.ToggleAutoBuildAction"
+              text="Resume Auto Build"
+              description="Start or stop watching the workspace (rebuild the graph on save)"/>
+      <action id="BuildGraph.OpenInBrowser"
+              class="dev.eden.buildgraph.OpenInBrowserAction"
+              text="Open Graph in Browser"
+              description="Open the graph in your default browser"/>
+    </group>
+  </actions>
+</idea-plugin>

@@ -1,0 +1,62 @@
+{
+  "name": "build-graph",
+  "displayName": "build-graph",
+  "description": "Live Rust architecture graph from build-graph, refreshed on save.",
+  "version": "0.2.0",
+  "publisher": "d-tietjen",
+  "license": "MIT",
+  "repository": { "type": "git", "url": "https://github.com/d-tietjen/build-graph" },
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Visualization", "Other"],
+  "activationEvents": ["workspaceContains:**/Cargo.toml"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "buildGraph.show", "title": "build-graph: Open Graph" },
+      { "command": "buildGraph.rebuild", "title": "build-graph: Trigger Rebuild" },
+      { "command": "buildGraph.toggle", "title": "build-graph: Start/Stop Auto Build" }
+    ],
+    "configuration": {
+      "title": "build-graph",
+      "properties": {
+        "buildGraph.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start the watcher automatically when a Cargo workspace opens."
+        },
+        "buildGraph.command": {
+          "type": "string",
+          "default": "cargo build-graph",
+          "markdownDescription": "Base command. Use `cargo build-graph` (installed) or an absolute path to the binary."
+        },
+        "buildGraph.references": {
+          "type": "string",
+          "enum": ["driver", "rust-analyzer", "none"],
+          "default": "driver",
+          "markdownDescription": "Layer 3 references backend: `driver` (fast, incremental — needs the `rustc-driver` feature build), `rust-analyzer` (`--references`), or `none` (Layers 1–2 only)."
+        },
+        "buildGraph.extraArgs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra args appended to every build-graph invocation (e.g. --nightly, --no-derives)."
+        },
+        "buildGraph.outDir": {
+          "type": "string",
+          "default": "target/build-graph",
+          "description": "Graph output directory, relative to the workspace root (must match --out)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^20",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

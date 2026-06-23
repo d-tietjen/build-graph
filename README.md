@@ -28,6 +28,19 @@ HTML viewer.
 
 ![build-graph dashboard for the shard-kv workspace](docs/assets/shard-kv-dashboard.jpg)
 
+## Editor integrations
+
+Thin shells that run `cargo build-graph watch` and show the live architecture
+graph in-editor (they don't duplicate the IDE's own go-to-def / find-usages):
+
+- **VS Code** — [`integrations/vscode`](integrations/vscode) (graph in a side
+  panel; compiles, press F5).
+- **JetBrains / RustRover** — [`integrations/jetbrains`](integrations/jetbrains)
+  (opens the live graph in your browser; builds, run with `./gradlew runIde`).
+
+The live graph also works with no editor plugin at all: `cargo build-graph watch
+--driver` plus the bundled HTML viewer / `serve`.
+
 ## GitHub Action — keep `ARCHITECTURE.md` fresh
 
 Add this workflow to any Rust repo. It builds the graph, updates the generated section of `ARCHITECTURE.md`, and
@@ -82,7 +95,7 @@ Add the build helper and a three-line `build.rs` to any crate you want graphed:
 ```toml
 # Cargo.toml
 [build-dependencies]
-build-graph = "0.1.0"
+build-graph = "0.2.0"
 ```
 
 ```rust
@@ -106,6 +119,7 @@ the CLI below. Set `BUILD_GRAPH=0` to disable; build-script errors never fail yo
 cargo install build-graph     # installs `cargo-build-graph`, invoked as `cargo build-graph`
 
 cargo build-graph build        # run `cargo build`, then refresh the graph from target/
+cargo build-graph watch        # rebuild + refresh on every save (incremental; Ctrl-C to stop)
 cargo build-graph update       # refresh from the current target/ without building
 cargo build-graph view         # open the bundled HTML viewer
 cargo build-graph build --rich # also add the nightly rustdoc symbol/type layer (Layer 2)
@@ -149,10 +163,38 @@ the semantic resolution is what matters, and it's what object-file or syntactic 
 **method calls**, **dyn-dispatch** calls (`a.method()` on a `&dyn Trait`), calls **inside `async fn`s** (which
 object code files under the generated future, not the source fn), and field/const/type uses — completely.
 
-This is the **only** reference source build-graph offers. It needs `rust-analyzer` installed
-(`rustup component add rust-analyzer`); if it's absent, the layer is **skipped with a message** (we'd rather not
-offer the feature than emit inaccurate edges). The index is whole-workspace, so `--references` re-runs it only
-when something changed. `--references` implies `--rich`.
+rust-analyzer needs to be installed (`rustup component add rust-analyzer`); if it's absent, the layer is
+**skipped with a message** (we'd rather not offer the feature than emit inaccurate edges). The index is
+whole-workspace, so `--references` re-runs it only when something changed. `--references` implies `--rich`.
+
+#### Alternative backend — the rustc driver (`--driver-bin`, experimental)
+
+`rust-analyzer scip` is a **cold, whole-workspace** index: any change re-runs the whole thing (minutes to tens of
+minutes on a large workspace). The alternative is a clippy-style **rustc driver** that reads the compiler's HIR
+during a normal `cargo check`, so it is **incremental for free** — cargo only re-runs it for the crates it
+recompiles. It's a build-time **Cargo feature** (the driver is a separate nightly `rustc_private` crate); enable it
+and turn it on per run with `--driver`:
+
+```bash
+cargo install build-graph --features rustc-driver
+cargo build-graph build --driver
+cargo build-graph watch --driver
+```
+
+(`cargo build --features rustc-driver` instead of `install` for a local build;
+`build` produces the graph once, `watch` refreshes it incrementally on every save.)
+
+`--driver` builds the driver crate ([`crates/bg-driver`](crates/bg-driver), pinned to the right nightly) on demand
+the first time (cargo caches it after); pass `--driver-bin <path>` to use a prebuilt binary, or set
+`BUILD_GRAPH_DRIVER`. It replaces the scip pass: runs `cargo check --all-targets` with the driver as
+`RUSTC_WORKSPACE_WRAPPER`, persists per-crate edge files (keyed by cargo's stable metadata hash) under
+`<out>/driver-refs`, and maps them onto the Layer-2 nodes.
+
+On a benchmark workspace (108 crates) it was ~7× faster cold and orders of magnitude faster per edit. Its
+resolution is validated against ground truth, but it is **not** byte-identical to rust-analyzer (it indexes the
+semantic def-reference graph, not rust-analyzer's syntactic occurrence graph — e.g. it sees through `use` imports
+and omits item-level type decls that Layer 2 already covers). Treat it as a faster, compiler-grounded reference
+source rather than a drop-in rust-analyzer clone.
 
 ### Nightly + rustdoc-types pin
 
@@ -272,6 +314,17 @@ Both entry points only re-do the crates whose **source files changed**:
   deterministic), and any genuinely dangling edge is pruned before writing.
 - The **build-dependency** is incremental by construction: Cargo only re-runs a changed crate's build script, so
   only that crate's fragment is rewritten before the merge.
+
+`cargo build-graph watch` turns this into a hands-free loop: it does one refresh up front, then watches the
+workspace's `.rs`/`Cargo.toml` files (skipping `target/`, the output dir, and `.git`) and re-runs the same
+incremental refresh whenever they change — a burst of saves coalesces into one rebuild. Pass `--no-build` to only
+re-extract from the current `target/` (when your editor already drives the build), `--debounce <ms>` to tune the
+settle window, and any `build` flags (`--rich`, `-p`, `--release`, …) to control what each cycle produces.
+
+> **Note on `--rich --references` under `watch`:** Layers 1–2 update per changed crate, but Layer 3
+> (`--references`) currently re-runs rust-analyzer over the whole workspace each cycle (a cold index), so a
+> reference-heavy watch is only as fast as that re-index. Keeping rust-analyzer warm for incremental per-file
+> reference updates is the planned next step.
 
 ## Limitations / future work
 
