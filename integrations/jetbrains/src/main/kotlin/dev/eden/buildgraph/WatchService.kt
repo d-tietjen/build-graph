@@ -51,6 +51,12 @@ class WatchService(private val project: Project) : Disposable {
 
     fun isRunning(): Boolean = handler?.isProcessTerminated == false
 
+    @Synchronized
+    fun stop() {
+        handler?.destroyProcess()
+        handler = null
+    }
+
     fun liveUrl(): String = "http://127.0.0.1:$port/live"
 
     override fun dispose() {

@@ -17,11 +17,25 @@
   </extensions>
 
   <actions>
-    <action id="BuildGraph.OpenLiveGraph"
-            class="dev.eden.buildgraph.OpenLiveGraphAction"
-            text="build-graph: Open Live Graph"
-            description="Run cargo build-graph watch and open the live graph in your browser">
+    <group id="BuildGraph.Menu" text="Build Graph" popup="true">
       <add-to-group group-id="ToolsMenu" anchor="last"/>
-    </action>
+      <action id="BuildGraph.OpenLiveGraph"
+              class="dev.eden.buildgraph.OpenLiveGraphAction"
+              text="Open Live Graph"
+              description="Start the watcher (if needed) and open the live graph in your browser"/>
+      <action id="BuildGraph.OpenInBrowser"
+              class="dev.eden.buildgraph.OpenInBrowserAction"
+              text="Reopen Graph in Browser"
+              description="Open the graph tab again without restarting the watcher"/>
+      <action id="BuildGraph.StopWatcher"
+              class="dev.eden.buildgraph.StopWatcherAction"
+              text="Stop Watching"
+              description="Stop the build-graph watcher for this project"/>
+      <separator/>
+      <action id="BuildGraph.AutoStartToggle"
+              class="dev.eden.buildgraph.AutoStartToggleAction"
+              text="Auto-Start on Project Open"
+              description="Automatically start watching when a Cargo project opens"/>
+    </group>
   </actions>
 </idea-plugin>
