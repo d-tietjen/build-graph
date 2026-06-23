@@ -484,12 +484,21 @@ function bootCosmos(Graph) {
   OK = true;
   [3000, 6000, 10000].forEach(function (t) { setTimeout(function () { try { graph.fitView(500); } catch (e) {} }, t); });
   setTimeout(function () { zoomReady = true; }, 11000);   // enable zoom-driven edge fade only after init fits
+  var lastSel = null, hideOthers = false;
   var bar = controlBar(stage);
   bar.appendChild(mkbtn("fit", function () { try { graph.fitView(400); } catch (e) {} }));
+  bar.appendChild(mkbtn("fit sel", function () {
+    try { if (lastSel && lastSel.length && graph.fitViewByNodeIds) graph.fitViewByNodeIds(lastSel, 400); else graph.fitView(400); }
+    catch (e) { try { graph.fitView(400); } catch (e2) {} }
+  }));
+  var hob = mkbtn("hide others", function () {
+    hideOthers = !hideOthers; hob.textContent = hideOthers ? "show others" : "hide others";
+    try { graph.setConfig({ nodeGreyoutOpacity: hideOthers ? 0 : 0.04, linkGreyoutOpacity: hideOthers ? 0 : 0.03 }); } catch (e) {}
+  }); bar.appendChild(hob);
   var paused = false; var pb = mkbtn("pause", function () { paused = !paused; pb.textContent = paused ? "resume" : "pause"; try { paused ? graph.pause() : graph.start(); } catch (e) {} }); bar.appendChild(pb);
   glcv.addEventListener("mousemove", function (ev) { if (!hovered) { hideTip(); return; } var r = glcv.getBoundingClientRect(); showTip(hovered, ev.clientX - r.left, ev.clientY - r.top); });
   var o = document.getElementById("overlay"); o.textContent = "running GPU force simulation…"; setTimeout(function () { o.style.display = "none"; }, 2500);
-  var api = { select: function (ids) { graph.selectNodesByIds(ids); }, clear: function () { graph.unselectNodes(); } };
+  var api = { select: function (ids) { lastSel = ids; graph.selectNodesByIds(ids); }, clear: function () { lastSel = null; graph.unselectNodes(); } };
   mountUI(api);
   openInitialFocus();
 }
@@ -524,10 +533,10 @@ function bootCanvas() {
     resize(); window.addEventListener("resize", function () { resize(); draw(); });
     var tree = d3.quadtree().x(function (d) { return d.x; }).y(function (d) { return d.y; }).addAll(nodes);
     var byColor = {}; nodes.forEach(function (n) { var c = KIND_COLORS[n.kind] || DEFAULT_COLOR; (byColor[c] = byColor[c] || []).push(n); });
-    var focus = null;
+    var focus = null, hideOthers = false;
     function active(n) { return focus ? focus.has(n.id) : true; }
     var transform = d3.zoomIdentity, fitK = 0;   // fitK = scale at which all nodes fit (most zoomed-out)
-    function fitToNodes() { var xs = nodes.map(function (n) { return n.x; }), ys = nodes.map(function (n) { return n.y; }); var miX = Math.min.apply(null, xs), maX = Math.max.apply(null, xs), miY = Math.min.apply(null, ys), maY = Math.max.apply(null, ys); var s = Math.min((W - 60) / Math.max(1, maX - miX), (H - 60) / Math.max(1, maY - miY)) * 0.95; transform = d3.zoomIdentity.translate((W - s * (miX + maX)) / 2, (H - s * (miY + maY)) / 2).scale(s); fitK = s; }
+    function fitToNodes(list) { list = (list && list.length) ? list : nodes; var xs = list.map(function (n) { return n.x; }), ys = list.map(function (n) { return n.y; }); var miX = Math.min.apply(null, xs), maX = Math.max.apply(null, xs), miY = Math.min.apply(null, ys), maY = Math.max.apply(null, ys); var s = Math.min((W - 60) / Math.max(1, maX - miX), (H - 60) / Math.max(1, maY - miY)) * 0.95; transform = d3.zoomIdentity.translate((W - s * (miX + maX)) / 2, (H - s * (miY + maY)) / 2).scale(s); if (list === nodes) fitK = s; }
     fitToNodes();
     var zoom = d3.zoom().scaleExtent([0.01, 60]).on("zoom", function (ev) { transform = ev.transform; draw(); });
     d3.select(cv).call(zoom).call(zoom.transform, transform).on("dblclick.zoom", null);
@@ -543,12 +552,12 @@ function bootCanvas() {
         var semantic = cat !== "struct";
         ctx.strokeStyle = EDGE_COLORS[cat]; ctx.lineWidth = (semantic ? 1.0 : 0.5) * (0.18 + 0.82 * zf) / transform.k;
         var aFull = semantic ? 0.85 : 0.45, aOut = semantic ? 0.045 : 0.015;
-        ctx.globalAlpha = sel ? 0.3 : (aOut + (aFull - aOut) * zf); ctx.beginPath();
-        for (var i = 0; i < links.length; i++) { var l = links[i]; if (l.cat !== cat) continue; ctx.moveTo(l.source.x, l.source.y); ctx.lineTo(l.target.x, l.target.y); }
+        ctx.globalAlpha = sel ? (hideOthers ? 0.7 : 0.3) : (aOut + (aFull - aOut) * zf); ctx.beginPath();
+        for (var i = 0; i < links.length; i++) { var l = links[i]; if (l.cat !== cat) continue; if (sel && hideOthers && (!active(l.source) || !active(l.target))) continue; ctx.moveTo(l.source.x, l.source.y); ctx.lineTo(l.target.x, l.target.y); }
         ctx.stroke();
       });
       ctx.globalAlpha = 1;
-      if (sel) paint(false, 0.06); paint(true, 1);
+      if (sel && !hideOthers) paint(false, 0.06); paint(true, 1);
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     }
     function paint(litOnly, alpha) {
@@ -570,7 +579,10 @@ function bootCanvas() {
 
     var api = { select: function (ids) { focus = new Set(ids); draw(); }, clear: function () { focus = null; draw(); } };
     var bar = controlBar(stage);
-    bar.appendChild(mkbtn("fit", function () { fitToNodes(); d3.select(cv).call(zoom.transform, transform); draw(); }));
+    function applyFit(list) { fitToNodes(list); d3.select(cv).call(zoom.transform, transform); draw(); }
+    bar.appendChild(mkbtn("fit", function () { applyFit(); }));
+    bar.appendChild(mkbtn("fit sel", function () { applyFit(focus ? nodes.filter(active) : nodes); }));
+    var hob = mkbtn("hide others", function () { hideOthers = !hideOthers; hob.textContent = hideOthers ? "show others" : "hide others"; draw(); }); bar.appendChild(hob);
     mountUI(api);
     openInitialFocus();
     draw();
