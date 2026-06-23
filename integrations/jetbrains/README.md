@@ -13,21 +13,26 @@ cross-crate architecture graph the IDE doesn't.
 - `StartWatchAction` (Tools → *build-graph: Start Watch*) — runs the watcher.
 - `GraphServer` — serves the output dir locally so the viewer can fetch its data.
 
-## ⚠️ Status: unbuilt scaffold
+## Status
 
-This was authored without a JVM available, so it has **not** been compiled or
-run. Treat it as a correct-shaped starting point, not a finished plugin. Before
-it works you'll likely need to:
+**Builds and loads.** `./gradlew buildPlugin` succeeds and the plugin loads into
+a headless RustRover 2024.2 during the build (`buildSearchableOptions`). The
+JCEF tool-window UI itself hasn't been exercised in a real GUI session yet — do
+that with `./gradlew runIde` (JCEF is disabled headlessly).
 
-1. Install **JDK 17+** and run `./gradlew buildPlugin` (add the Gradle wrapper
-   with `gradle wrapper` first).
-2. Adjust the platform target in [`build.gradle.kts`](build.gradle.kts) —
-   `rustRover("2024.2")` — to a RustRover version you have, and the
-   `sinceBuild`/`untilBuild` range in `plugin.xml`/Gradle accordingly.
-3. Verify the JCEF + tool-window + `BulkFileListener` APIs against your target
-   platform version (these are stable but move occasionally).
+```bash
+# A JDK 21 is bundled with RustRover; reuse it:
+export JAVA_HOME=/Applications/RustRover.app/Contents/jbr/Contents/Home
+./gradlew runIde         # launches a sandbox RustRover with the plugin
+./gradlew buildPlugin    # produces build/distributions/*.zip to install manually
+```
 
-Run in a sandbox IDE with `./gradlew runIde`.
+Notes:
+- Pinned to the IntelliJ Platform Gradle Plugin 2.1.0 (a newer 2.16.0 exists;
+  bumping needs minor `build.gradle.kts` changes, e.g. `instrumentationTools()`
+  is no longer needed).
+- `rustRover("2024.2")` / `sinceBuild = "242"` target RustRover 2024.2 — adjust
+  to your installed build if different.
 
 ## Requires
 

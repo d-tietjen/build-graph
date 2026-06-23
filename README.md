@@ -33,9 +33,9 @@ HTML viewer.
 Thin shells that run `cargo build-graph watch` and show the live architecture
 graph in-editor (they don't duplicate the IDE's own go-to-def / find-usages):
 
-- **VS Code** — [`integrations/vscode`](integrations/vscode) (builds + runs today).
+- **VS Code** — [`integrations/vscode`](integrations/vscode) (compiles; press F5).
 - **JetBrains / RustRover** — [`integrations/jetbrains`](integrations/jetbrains)
-  (scaffold; needs a JDK to build).
+  (`./gradlew runIde`; builds + loads, GUI not yet exercised).
 
 The live graph also works with no editor plugin at all: `cargo build-graph watch
 --driver` plus the bundled HTML viewer / `serve`.

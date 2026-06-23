@@ -37,5 +37,6 @@ intellijPlatform {
 }
 
 kotlin {
-    jvmToolchain(17)
+    // Matches RustRover's bundled JBR (21). Lower to 17 for older IDE targets.
+    jvmToolchain(21)
 }
