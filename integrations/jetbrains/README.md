@@ -18,8 +18,8 @@ IDE doesn't.
   when the project closes). Resolves `cargo` via `~/.cargo/bin` so it works even
   when the IDE was launched without the login-shell PATH.
 - `GraphServer` — serves the output dir locally and a `/live` page that polls
-  `/mtime` and reloads the viewer whenever the graph is rewritten on save, so the
-  browser tab stays live with no JCEF / tool window.
+  `/mtime` and asks the already-loaded viewer to patch in fresh graph data, so
+  the browser tab stays live with no JCEF / tool window.
 
 ## Build & run
 

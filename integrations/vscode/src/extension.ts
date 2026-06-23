@@ -128,8 +128,15 @@ function webviewHtml(port: number, nonce: string): string {
 <body><iframe id="g" src="${src}?t=${Date.now()}"></iframe>
 <script nonce="${nonce}">
   const f = document.getElementById('g');
+  function reloadData() {
+    if (f.contentWindow) {
+      f.contentWindow.postMessage({ type: 'build-graph:reload-data' }, '*');
+    } else {
+      f.src = 'http://127.0.0.1:${port}/graph.html?t=' + Date.now();
+    }
+  }
   window.addEventListener('message', (e) => {
-    if (e.data && e.data.type === 'reload') f.src = 'http://127.0.0.1:${port}/graph.html?t=' + Date.now();
+    if (e.data && e.data.type === 'reload') reloadData();
   });
 </script></body></html>`;
 }

@@ -10,8 +10,8 @@ import java.net.InetSocketAddress
  * load the bundled viewer. Serves the files as-is (`.gz` raw — the viewer
  * inflates it itself) plus two helpers:
  *
- *  - `GET /live`   — an auto-reloading wrapper page that polls `/mtime` and
- *                    reloads `graph.html` whenever the graph is rewritten on save.
+ *  - `GET /live`   — a live wrapper page that polls `/mtime` and asks the
+ *                    already-loaded viewer to patch in fresh graph data.
  *  - `GET /mtime`  — the graph data file's mtime (404 until the first build).
  */
 object GraphServer {
@@ -88,9 +88,16 @@ object GraphServer {
             if(t){ t=t.trim();
               if(t!==last){ last=t;
                 var g=document.getElementById('g');
-                g.src='graph.html?t='+encodeURIComponent(t);
-                g.style.display='block';
-                document.getElementById('m').style.display='none';
+                if(!g.dataset.loaded){
+                  g.onload=function(){ g.dataset.loaded='1'; };
+                  g.src='graph.html?t='+encodeURIComponent(t);
+                  g.style.display='block';
+                  document.getElementById('m').style.display='none';
+                }else if(g.contentWindow){
+                  g.contentWindow.postMessage({type:'build-graph:reload-data'}, '*');
+                }else{
+                  g.src='graph.html?t='+encodeURIComponent(t);
+                }
               }
             }
           }).catch(function(){}).finally(function(){ setTimeout(poll,1000); });

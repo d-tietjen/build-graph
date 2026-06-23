@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); this project uses
 semantic versioning.
 
+## 0.2.1
+
+### Added
+
+- **Agent integration templates** for Codex and Claude Code, with drop-in
+  `AGENTS.md`/`CLAUDE.md` guidance for using bounded `find`/`refs` queries
+  instead of text-searching blindly.
+- **GitHub Action backend selection** — `references-backend: rustc-driver`
+  installs the opt-in driver feature and runs the compiler-backed Layer 3 path;
+  `references-backend: rust-analyzer` remains the default for existing
+  workflows.
+
+### Changed
+
+- Streamlined the README into a shorter landing page and moved detailed CLI,
+  layer, output, and query reference material to `docs/cli-reference.md`.
+
+### Fixed
+
+- **Live viewer refreshes** now keep the page mounted and patch in fresh graph
+  data from VS Code / JetBrains live views, preserving layout and avoiding a
+  full GPU/WebGL rebuild when the topology did not change.
+
 ## 0.2.0
 
 ### Added

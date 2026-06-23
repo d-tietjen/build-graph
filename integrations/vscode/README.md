@@ -12,7 +12,7 @@ the cross-crate **architecture graph** (crates, files, symbols, and relationship
 ## Commands
 
 - **build-graph: Open Graph** — open the graph panel (serves the output dir
-  locally and frames the bundled viewer; auto-reloads on change).
+  locally and frames the bundled viewer; patches in fresh graph data on change).
 - **build-graph: Trigger Rebuild** — force a one-shot rebuild now.
 - **build-graph: Start/Stop Auto Build** — toggle the watcher.
 
