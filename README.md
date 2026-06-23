@@ -97,7 +97,7 @@ crate you want graphed:
 
 ```toml
 [build-dependencies]
-build-graph = "0.2.0"
+build-graph = "0.2.1"
 ```
 
 ```rust

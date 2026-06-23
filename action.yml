@@ -54,7 +54,7 @@ inputs:
   build-graph-version:
     description: "Crates.io version used when install-source is crates.io."
     required: false
-    default: "0.2.0"
+    default: "0.2.1"
   architecture-limit:
     description: "Maximum rows per generated architecture table."
     required: false

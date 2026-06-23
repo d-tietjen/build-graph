@@ -132,7 +132,7 @@ jobs:
 | `release` | `false` | Build the target workspace with `--release`. |
 | `package` | empty | Optional Cargo package passed as `-p`. |
 | `install-source` | `action` | `action`, `crates.io`, or `skip`. |
-| `build-graph-version` | `0.2.0` | Used when `install-source: crates.io`. |
+| `build-graph-version` | `0.2.1` | Used when `install-source: crates.io`. |
 | `architecture-limit` | `15` | Maximum rows in generated tables. |
 
 ## Layer 3 Backend Choice

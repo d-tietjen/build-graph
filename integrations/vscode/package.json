@@ -2,7 +2,7 @@
   "name": "build-graph",
   "displayName": "build-graph",
   "description": "Live Rust architecture graph from build-graph, refreshed on save.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "publisher": "d-tietjen",
   "license": "MIT",
   "repository": { "type": "git", "url": "https://github.com/d-tietjen/build-graph" },
