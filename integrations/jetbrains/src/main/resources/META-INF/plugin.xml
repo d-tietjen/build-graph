@@ -11,6 +11,11 @@
 
   <depends>com.intellij.modules.platform</depends>
 
+  <extensions defaultExtensionNs="com.intellij">
+    <postStartupActivity implementation="dev.eden.buildgraph.AutoStartActivity"/>
+    <notificationGroup id="build-graph" displayType="BALLOON"/>
+  </extensions>
+
   <actions>
     <action id="BuildGraph.OpenLiveGraph"
             class="dev.eden.buildgraph.OpenLiveGraphAction"

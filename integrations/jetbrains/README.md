@@ -1,14 +1,21 @@
 # build-graph for JetBrains (RustRover / IDEA)
 
-Starts [`build-graph`](../../README.md)'s watcher and opens the live
-**architecture graph in your browser** — no embedded UI. Like the VS Code
-extension, it deliberately does **not** duplicate the IDE's own go-to-def /
-find-usages; it surfaces the cross-crate architecture graph the IDE doesn't.
+Auto-starts [`build-graph`](../../README.md)'s watcher when you open a Rust
+project and opens the live **architecture graph in your browser** — no embedded
+UI. Like the VS Code extension, it deliberately does **not** duplicate the IDE's
+own go-to-def / find-usages; it surfaces the cross-crate architecture graph the
+IDE doesn't.
 
 ## What's here
 
-- `OpenLiveGraphAction` (**Tools → build-graph: Open Live Graph**) — runs
-  `cargo build-graph watch --driver` and opens the graph in your default browser.
+- `AutoStartActivity` — on opening a project with a `Cargo.toml`, starts
+  `cargo build-graph watch --driver` automatically and shows a notification with
+  **Open graph** / **Disable auto-start**. No menu click needed.
+- `OpenLiveGraphAction` (**Tools → build-graph: Open Live Graph**) — manual
+  trigger / re-enable; opens the graph in your default browser.
+- `WatchService` — per-project owner of the watcher (idempotent start; killed
+  when the project closes). Resolves `cargo` via `~/.cargo/bin` so it works even
+  when the IDE was launched without the login-shell PATH.
 - `GraphServer` — serves the output dir locally and a `/live` page that polls
   `/mtime` and reloads the viewer whenever the graph is rewritten on save, so the
   browser tab stays live with no JCEF / tool window.
