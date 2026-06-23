@@ -39,6 +39,10 @@ semantic versioning.
 - **Agent integration templates** for Codex and Claude Code, with drop-in
   `AGENTS.md`/`CLAUDE.md` guidance for using bounded `find`/`refs` queries
   instead of text-searching blindly.
+- **GitHub Action backend selection** — `references-backend: rustc-driver`
+  installs the opt-in driver feature and runs the compiler-backed Layer 3 path;
+  `references-backend: rust-analyzer` remains the default for existing
+  workflows.
 
 ### Notes
 

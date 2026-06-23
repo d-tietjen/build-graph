@@ -20,9 +20,21 @@ inputs:
     required: false
     default: "nightly-2026-02-27"
   references:
-    description: "Add rust-analyzer calls/uses edges. Implies the rich rustdoc layer."
+    description: "Add Layer 3 calls/uses edges. Implies the rich rustdoc layer."
     required: false
     default: "true"
+  references-backend:
+    description: "Layer 3 backend when references is true: rust-analyzer or rustc-driver."
+    required: false
+    default: "rust-analyzer"
+  driver-bin:
+    description: "Optional prebuilt bg-driver binary path for references-backend: rustc-driver."
+    required: false
+    default: ""
+  no-derives:
+    description: "Drop derive-generated impls from the rich symbol layer."
+    required: false
+    default: "false"
   no-compress:
     description: "Write graph.json instead of graph.json.gz."
     required: false
@@ -59,28 +71,84 @@ outputs:
 runs:
   using: "composite"
   steps:
+    - name: Validate inputs
+      shell: bash
+      env:
+        BUILD_GRAPH_REFERENCES: ${{ inputs.references }}
+        BUILD_GRAPH_REFERENCES_BACKEND: ${{ inputs.references-backend }}
+        BUILD_GRAPH_DRIVER_BIN: ${{ inputs.driver-bin }}
+        BUILD_GRAPH_NO_DERIVES: ${{ inputs.no-derives }}
+        BUILD_GRAPH_NO_COMPRESS: ${{ inputs.no-compress }}
+        BUILD_GRAPH_RELEASE: ${{ inputs.release }}
+      run: |
+        set -euo pipefail
+        for pair in \
+          "references:$BUILD_GRAPH_REFERENCES" \
+          "no-derives:$BUILD_GRAPH_NO_DERIVES" \
+          "no-compress:$BUILD_GRAPH_NO_COMPRESS" \
+          "release:$BUILD_GRAPH_RELEASE"
+        do
+          name="${pair%%:*}"
+          value="${pair#*:}"
+          case "$value" in
+            true|false) ;;
+            *)
+              echo "::error::$name must be true or false"
+              exit 1
+              ;;
+          esac
+        done
+        case "$BUILD_GRAPH_REFERENCES_BACKEND" in
+          rust-analyzer|rustc-driver) ;;
+          *)
+            echo "::error::references-backend must be rust-analyzer or rustc-driver"
+            exit 1
+            ;;
+        esac
+        if [[ -n "$BUILD_GRAPH_DRIVER_BIN" && "$BUILD_GRAPH_REFERENCES" != "true" ]]; then
+          echo "::error::driver-bin requires references: true"
+          exit 1
+        fi
+        if [[ -n "$BUILD_GRAPH_DRIVER_BIN" && "$BUILD_GRAPH_REFERENCES_BACKEND" != "rustc-driver" ]]; then
+          echo "::error::driver-bin requires references-backend: rustc-driver"
+          exit 1
+        fi
+
     - name: Install Rust tooling
       shell: bash
       env:
         BUILD_GRAPH_NIGHTLY: ${{ inputs.nightly }}
+        BUILD_GRAPH_REFERENCES: ${{ inputs.references }}
+        BUILD_GRAPH_REFERENCES_BACKEND: ${{ inputs.references-backend }}
       run: |
         set -euo pipefail
         rustup toolchain install "$BUILD_GRAPH_NIGHTLY" --profile minimal
-        rustup component add rust-analyzer || true
+        if [[ "$BUILD_GRAPH_REFERENCES" == "true" && "$BUILD_GRAPH_REFERENCES_BACKEND" == "rust-analyzer" ]]; then
+          rustup component add rust-analyzer || true
+        fi
+        if [[ "$BUILD_GRAPH_REFERENCES" == "true" && "$BUILD_GRAPH_REFERENCES_BACKEND" == "rustc-driver" ]]; then
+          rustup component add rustc-dev --toolchain "$BUILD_GRAPH_NIGHTLY"
+        fi
 
     - name: Install build-graph
       shell: bash
       env:
         BUILD_GRAPH_INSTALL_SOURCE: ${{ inputs.install-source }}
         BUILD_GRAPH_VERSION: ${{ inputs.build-graph-version }}
+        BUILD_GRAPH_REFERENCES: ${{ inputs.references }}
+        BUILD_GRAPH_REFERENCES_BACKEND: ${{ inputs.references-backend }}
       run: |
         set -euo pipefail
+        install_args=(--locked --force)
+        if [[ "$BUILD_GRAPH_REFERENCES" == "true" && "$BUILD_GRAPH_REFERENCES_BACKEND" == "rustc-driver" ]]; then
+          install_args+=(--features rustc-driver)
+        fi
         case "$BUILD_GRAPH_INSTALL_SOURCE" in
           action)
-            cargo install --path "$GITHUB_ACTION_PATH" --locked --force
+            cargo install --path "$GITHUB_ACTION_PATH" "${install_args[@]}"
             ;;
           crates.io)
-            cargo install build-graph --version "$BUILD_GRAPH_VERSION" --locked --force
+            cargo install build-graph --version "$BUILD_GRAPH_VERSION" "${install_args[@]}"
             ;;
           skip)
             command -v cargo-build-graph >/dev/null
@@ -98,6 +166,9 @@ runs:
         BUILD_GRAPH_GRAPH_DIR: ${{ inputs.graph-dir }}
         BUILD_GRAPH_NIGHTLY: ${{ inputs.nightly }}
         BUILD_GRAPH_REFERENCES: ${{ inputs.references }}
+        BUILD_GRAPH_REFERENCES_BACKEND: ${{ inputs.references-backend }}
+        BUILD_GRAPH_DRIVER_BIN: ${{ inputs.driver-bin }}
+        BUILD_GRAPH_NO_DERIVES: ${{ inputs.no-derives }}
         BUILD_GRAPH_NO_COMPRESS: ${{ inputs.no-compress }}
         BUILD_GRAPH_RELEASE: ${{ inputs.release }}
         BUILD_GRAPH_PACKAGE: ${{ inputs.package }}
@@ -105,9 +176,23 @@ runs:
         set -euo pipefail
         args=(build --manifest-path "$BUILD_GRAPH_MANIFEST_PATH" --out "$BUILD_GRAPH_GRAPH_DIR" --nightly "$BUILD_GRAPH_NIGHTLY")
         if [[ "$BUILD_GRAPH_REFERENCES" == "true" ]]; then
-          args+=(--references)
+          case "$BUILD_GRAPH_REFERENCES_BACKEND" in
+            rust-analyzer)
+              args+=(--references)
+              ;;
+            rustc-driver)
+              if [[ -n "$BUILD_GRAPH_DRIVER_BIN" ]]; then
+                args+=(--driver-bin "$BUILD_GRAPH_DRIVER_BIN")
+              else
+                args+=(--driver)
+              fi
+              ;;
+          esac
         else
           args+=(--rich)
+        fi
+        if [[ "$BUILD_GRAPH_NO_DERIVES" == "true" ]]; then
+          args+=(--no-derives)
         fi
         if [[ "$BUILD_GRAPH_NO_COMPRESS" == "true" ]]; then
           args+=(--no-compress)

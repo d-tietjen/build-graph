@@ -6,8 +6,8 @@
 The action:
 
 1. Installs the pinned nightly toolchain used for rustdoc JSON.
-2. Installs `cargo-build-graph`.
-3. Runs `cargo build-graph build --rich --references`.
+2. Installs `cargo-build-graph`, with the `rustc-driver` feature when requested.
+3. Runs `cargo build-graph build` with the selected Layer 3 backend.
 4. Writes `graph.json[.gz]`, `graph.html`, and `GRAPH_REPORT.md`.
 5. Replaces the generated build-graph block in `ARCHITECTURE.md`.
 
@@ -38,6 +38,7 @@ jobs:
         with:
           manifest-path: Cargo.toml
           architecture-path: ARCHITECTURE.md
+          references-backend: rustc-driver
 
       - name: Commit architecture update
         run: |
@@ -54,6 +55,10 @@ jobs:
 
 Use `@master` until the next repository tag includes `action.yml`; use a pinned
 tag once one exists.
+
+`references-backend: rustc-driver` installs `build-graph` with the
+`rustc-driver` feature and uses the compiler-backed Layer 3 backend. Omit it to
+keep the default rust-analyzer SCIP backend.
 
 ## PR-Based Workflow
 
@@ -85,6 +90,7 @@ jobs:
         with:
           manifest-path: Cargo.toml
           architecture-path: ARCHITECTURE.md
+          references-backend: rustc-driver
 
       - name: Open pull request
         run: |
@@ -118,7 +124,10 @@ jobs:
 | `graph-dir` | `target/build-graph` | Output directory for graph artifacts. |
 | `architecture-path` | `ARCHITECTURE.md` | Markdown file to update. |
 | `nightly` | `nightly-2026-02-27` | Must match the pinned `rustdoc-types` format. |
-| `references` | `true` | Adds rust-analyzer `calls`/`uses` edges. |
+| `references` | `true` | Adds Layer 3 `calls`/`uses` edges. Set to `false` for Layer 2 only. |
+| `references-backend` | `rust-analyzer` | Layer 3 backend when `references` is `true`: `rust-analyzer` or `rustc-driver`. |
+| `driver-bin` | empty | Optional prebuilt `bg-driver` binary path for `references-backend: rustc-driver`. |
+| `no-derives` | `false` | Drop derive-generated impls from the rich symbol layer. |
 | `no-compress` | `false` | Write plain `graph.json` instead of `graph.json.gz`. |
 | `release` | `false` | Build the target workspace with `--release`. |
 | `package` | empty | Optional Cargo package passed as `-p`. |
@@ -126,7 +135,22 @@ jobs:
 | `build-graph-version` | `0.2.0` | Used when `install-source: crates.io`. |
 | `architecture-limit` | `15` | Maximum rows in generated tables. |
 
-## AGENTS.md
+## Layer 3 Backend Choice
+
+The default `references-backend: rust-analyzer` preserves the original action
+behavior: it installs `rust-analyzer` and runs `cargo build-graph build
+--references`.
+
+For large workspaces, prefer `references-backend: rustc-driver`. The action
+installs the pinned nightly's `rustc-dev` component, installs `build-graph` with
+`--features rustc-driver`, and runs `cargo build-graph build --driver`. The
+driver builds on demand and cargo caches it, so subsequent runs reuse both the
+driver binary and the target workspace's incremental check artifacts.
+
+Set `references: false` to skip Layer 3 entirely while still generating the rich
+rustdoc symbol layer.
+
+## Agent Guidance
 
 Point agents at the generated architecture doc before they inspect code:
 
