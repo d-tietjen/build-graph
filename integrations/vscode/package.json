@@ -8,17 +8,22 @@
   "repository": { "type": "git", "url": "https://github.com/d-tietjen/build-graph" },
   "engines": { "vscode": "^1.85.0" },
   "categories": ["Visualization", "Other"],
-  "activationEvents": [],
+  "activationEvents": ["workspaceContains:**/Cargo.toml"],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [
-      { "command": "buildGraph.show", "title": "build-graph: Show Live Graph" },
-      { "command": "buildGraph.watch", "title": "build-graph: Start Watch" },
-      { "command": "buildGraph.stopWatch", "title": "build-graph: Stop Watch" }
+      { "command": "buildGraph.show", "title": "build-graph: Open Graph" },
+      { "command": "buildGraph.rebuild", "title": "build-graph: Trigger Rebuild" },
+      { "command": "buildGraph.toggle", "title": "build-graph: Start/Stop Auto Build" }
     ],
     "configuration": {
       "title": "build-graph",
       "properties": {
+        "buildGraph.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start the watcher automatically when a Cargo workspace opens."
+        },
         "buildGraph.command": {
           "type": "string",
           "default": "cargo build-graph",
