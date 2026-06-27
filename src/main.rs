@@ -286,7 +286,7 @@ fn main() -> Result<()> {
     match Cli::parse_from(args).cmd {
         Cmd::Build(a) => run_build(a),
         Cmd::Watch(w) => run_watch(w),
-        Cmd::Update(c) => run_extract(&c, &[]),
+        Cmd::Update(c) => run_extract(&c, &[], ExtractScope::Incremental),
         Cmd::View(v) => run_view(v),
         Cmd::Find(f) => run_find(f),
         Cmd::Refs(r) => run_refs(r),
@@ -296,13 +296,24 @@ fn main() -> Result<()> {
 }
 
 fn run_build(a: BuildArgs) -> Result<()> {
-    build_and_extract(&a.common, &a.cargo_args, true)
+    build_and_extract(&a.common, &a.cargo_args, true, ExtractScope::Incremental)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExtractScope {
+    Incremental,
+    AllCrates,
 }
 
 /// One refresh pass: optionally run `cargo build`, then (re)extract the graph
-/// from target/. Shared by `build` and the `watch` loop. Both the build and the
-/// extract are already incremental — only changed crates recompile/re-document.
-fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool) -> Result<()> {
+/// from target/. Normal commands reuse cached crate subgraphs; watch save events
+/// force one flattened extraction pass across every enabled layer.
+fn build_and_extract(
+    common: &CommonArgs,
+    cargo_args: &[String],
+    do_build: bool,
+    scope: ExtractScope,
+) -> Result<()> {
     let compiled = if do_build {
         let manifest = common.manifest_path.as_ref().map(Utf8PathBuf::from);
         let compiled = cargo_build::run_build(
@@ -321,13 +332,13 @@ fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool)
     } else {
         Vec::new()
     };
-    run_extract(common, &compiled)
+    run_extract(common, &compiled, scope)
 }
 
 /// Watch the workspace and re-run the incremental refresh whenever a `.rs` or
-/// `Cargo.toml` file changes. Layers 1–2 already reuse the prior graph for
-/// unchanged crates, so a save only re-does the crate(s) you touched. The graph
-/// (and anything serving it) updates in place.
+/// `Cargo.toml` file changes. Each save forces a single full extraction pass for
+/// every enabled layer; cargo/rustdoc/driver caches still do their own work
+/// reuse underneath. The graph (and anything serving it) updates in place.
 fn run_watch(a: WatchArgs) -> Result<()> {
     let manifest = a.common.manifest_path.as_ref().map(Utf8PathBuf::from);
     let meta = metadata::load(manifest.as_deref())?;
@@ -353,7 +364,12 @@ fn run_watch(a: WatchArgs) -> Result<()> {
     let interval = std::time::Duration::from_millis(a.debounce.max(50));
 
     eprintln!("[build-graph] watch: workspace {root}");
-    if let Err(e) = build_and_extract(&a.common, &a.cargo_args, do_build) {
+    if let Err(e) = build_and_extract(
+        &a.common,
+        &a.cargo_args,
+        do_build,
+        ExtractScope::Incremental,
+    ) {
         eprintln!("[build-graph] watch: initial refresh failed — {e:#}");
     }
     eprintln!("[build-graph] watch: watching .rs/Cargo.toml under {root} (Ctrl-C to stop)…");
@@ -376,7 +392,9 @@ fn run_watch(a: WatchArgs) -> Result<()> {
             fp = next;
         }
         eprintln!("[build-graph] watch: change detected — refreshing…");
-        if let Err(e) = build_and_extract(&a.common, &a.cargo_args, do_build) {
+        if let Err(e) =
+            build_and_extract(&a.common, &a.cargo_args, do_build, ExtractScope::AllCrates)
+        {
             eprintln!("[build-graph] watch: refresh failed — {e:#}");
         }
         // Rescan after the refresh so sources the build itself touched (e.g.
@@ -428,7 +446,22 @@ fn workspace_fingerprint(root: &Utf8Path, excludes: &[std::path::PathBuf]) -> u6
     hasher.finish()
 }
 
-fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Result<()> {
+fn should_extract_crate(
+    scope: ExtractScope,
+    compatible_cache: bool,
+    prior_fingerprint: Option<&str>,
+    current_fingerprint: &str,
+) -> bool {
+    scope == ExtractScope::AllCrates
+        || !compatible_cache
+        || prior_fingerprint != Some(current_fingerprint)
+}
+
+fn run_extract(
+    c: &CommonArgs,
+    _compiled: &[cargo_build::CompiledTarget],
+    scope: ExtractScope,
+) -> Result<()> {
     let manifest = c.manifest_path.as_ref().map(Utf8PathBuf::from);
     let meta = metadata::load(manifest.as_deref())?;
 
@@ -456,10 +489,11 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
     let cache_path = out.join(cache::CACHE_FILE);
     let existing = build_graph::output::find_graph(out.as_std_path());
     let prior = cache::Cache::load(cache_path.as_std_path());
-    let compatible = prior
-        .as_ref()
-        .map(|p| p.rich == rich && p.no_derives == c.no_derives && p.references == references)
-        .unwrap_or(false)
+    let compatible = scope == ExtractScope::Incremental
+        && prior
+            .as_ref()
+            .map(|p| p.rich == rich && p.no_derives == c.no_derives && p.references == references)
+            .unwrap_or(false)
         && existing.is_some();
     let mut graph = match (compatible, &existing) {
         (true, Some(p)) => load_graph(p).unwrap_or_default(),
@@ -486,7 +520,12 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
             &meta.workspace_root,
         );
         let fp = depinfo::fingerprint(&srcs);
-        if !compatible || prior_crates.get(&pkg.name) != Some(&fp) {
+        if should_extract_crate(
+            scope,
+            compatible,
+            prior_crates.get(&pkg.name).map(String::as_str),
+            &fp,
+        ) {
             dirty_sources.insert(pkg.name.clone(), srcs);
         }
         current.insert(pkg.name.clone(), fp);
@@ -579,7 +618,10 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
             match result {
                 Ok(counts) => eprintln!(
                     "[build-graph] layer 3: +{} calls, +{} uses, +{} member_calls, +{} member_uses edge(s) ({backend}, {:.1}s)",
-                    counts.calls, counts.uses, counts.member_calls, counts.member_uses,
+                    counts.calls,
+                    counts.uses,
+                    counts.member_calls,
+                    counts.member_uses,
                     t3.elapsed().as_secs_f64()
                 ),
                 Err(e) => eprintln!("[build-graph] layer 3: references skipped — {e:#}"),
@@ -831,7 +873,7 @@ fn open_in_browser(path: &str) -> Result<()> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::is_excluded;
+    use super::{ExtractScope, is_excluded, should_extract_crate};
 
     #[test]
     fn watch_skips_target_out_and_git() {
@@ -859,6 +901,28 @@ mod tests {
         assert!(is_excluded(
             &PathBuf::from("/ws/.git/index.lock"),
             &excludes
+        ));
+    }
+
+    #[test]
+    fn watch_save_scope_forces_every_crate_through_extraction() {
+        assert!(!should_extract_crate(
+            ExtractScope::Incremental,
+            true,
+            Some("same"),
+            "same"
+        ));
+        assert!(should_extract_crate(
+            ExtractScope::Incremental,
+            true,
+            Some("old"),
+            "new"
+        ));
+        assert!(should_extract_crate(
+            ExtractScope::AllCrates,
+            true,
+            Some("same"),
+            "same"
         ));
     }
 }

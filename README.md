@@ -80,7 +80,8 @@ cargo build-graph view
 
 `build` refreshes once, `watch` refreshes on every save, and `view` opens the
 bundled HTML dashboard. Use `--references` instead of `--driver` when you want
-the rust-analyzer SCIP backend.
+the rust-analyzer SCIP backend. Watch keeps Layer 1/2/3 as graph concepts, but
+save refreshes run one flattened extraction pass across every enabled layer.
 
 ```bash
 cargo install build-graph

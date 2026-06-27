@@ -3,9 +3,10 @@
 //!
 //! Runs `cargo check` with the driver installed as `RUSTC_WORKSPACE_WRAPPER`.
 //! The driver walks each workspace crate's HIR and writes resolved edges
-//! (`kind <TAB> caller_file:line <TAB> callee_file:line`) per compilation unit;
-//! here we map those `file:line` endpoints onto the Layer-2 item nodes, exactly
-//! as `scip.rs` maps SCIP occurrences (same fn/other bucketing + ±1 tolerance).
+//! (`kind <TAB> caller_file:line <TAB> callee_file:line`, plus resolved def
+//! paths in newer files) per compilation unit; here we map those endpoints onto
+//! the Layer-2 item nodes. The path columns are important for macro-expanded
+//! items whose spans can point at macro definitions or share an invocation line.
 //!
 //! Why a driver: it is far cheaper than a cold whole-workspace SCIP index and is
 //! incremental for free — cargo only re-runs the wrapper for crates it
@@ -16,10 +17,10 @@
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 
-use build_graph::Graph;
+use build_graph::{Graph, norm};
 
 use crate::scip::{ReferenceCounts, add_member_reference_edges};
 
@@ -28,14 +29,14 @@ use crate::scip::{ReferenceCounts, add_member_reference_edges};
 /// `crates/bg-driver` crate (its own nightly pin applies) and using the result.
 pub fn resolve_driver(explicit: Option<&str>) -> Result<Utf8PathBuf> {
     if let Some(p) = explicit {
-        let p = Utf8PathBuf::from(p);
+        let p = absolute_path(&Utf8PathBuf::from(p))?;
         if !p.as_std_path().exists() {
             bail!("--driver-bin {p} not found");
         }
         return Ok(p);
     }
     if let Some(env) = std::env::var_os("BUILD_GRAPH_DRIVER") {
-        let p = Utf8PathBuf::from(env.to_string_lossy().into_owned());
+        let p = absolute_path(&Utf8PathBuf::from(env.to_string_lossy().into_owned()))?;
         if !p.as_std_path().exists() {
             bail!("BUILD_GRAPH_DRIVER points at a missing file: {p}");
         }
@@ -52,7 +53,7 @@ pub fn resolve_driver(explicit: Option<&str>) -> Result<Utf8PathBuf> {
 /// baked in next to this crate (works when running a locally-built binary).
 fn driver_src() -> Option<Utf8PathBuf> {
     if let Some(s) = std::env::var_os("BUILD_GRAPH_DRIVER_SRC") {
-        let p = Utf8PathBuf::from(s.to_string_lossy().into_owned());
+        let p = absolute_path(&Utf8PathBuf::from(s.to_string_lossy().into_owned())).ok()?;
         if p.join("Cargo.toml").as_std_path().exists() {
             return Some(p);
         }
@@ -63,6 +64,15 @@ fn driver_src() -> Option<Utf8PathBuf> {
         .as_std_path()
         .exists()
         .then_some(baked)
+}
+
+fn absolute_path(path: &Utf8Path) -> Result<Utf8PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    let cwd = std::env::current_dir().context("resolving current directory")?;
+    Utf8PathBuf::from_path_buf(cwd.join(path.as_std_path()))
+        .map_err(|p| anyhow!("path is not valid UTF-8: {}", p.display()))
 }
 
 /// Strip the rustup/cargo toolchain selectors that a parent `cargo build-graph`
@@ -102,6 +112,8 @@ fn build_driver(src: &Utf8Path) -> Result<Utf8PathBuf> {
 struct Locator {
     loc_fn: HashMap<String, String>,
     loc_other: HashMap<String, String>,
+    path_fn: HashMap<String, String>,
+    path_other: HashMap<String, String>,
     /// fn/method node lines per file, sorted — for enclosing-fn rollup.
     fns_by_file: HashMap<String, Vec<(i64, String)>>,
 }
@@ -110,11 +122,28 @@ impl Locator {
     fn build(graph: &Graph) -> Self {
         let mut loc_fn = HashMap::new();
         let mut loc_other = HashMap::new();
+        let mut path_fn = HashMap::new();
+        let mut path_other = HashMap::new();
         let mut fns_by_file: HashMap<String, Vec<(i64, String)>> = HashMap::new();
         for n in graph.node_values() {
+            let kind = n.attributes.get("kind").map(String::as_str).unwrap_or("");
+            let is_fn = kind == "function" || kind == "method";
+            if let Some(path) = n.attributes.get("path") {
+                let bucket = if is_fn { &mut path_fn } else { &mut path_other };
+                bucket
+                    .entry(path.to_string())
+                    .or_insert_with(|| n.id.clone());
+                if let Some(krate) = n.attributes.get("crate") {
+                    let rustc_crate = krate.replace('-', "_");
+                    bucket
+                        .entry(format!("{rustc_crate}::{path}"))
+                        .or_insert_with(|| n.id.clone());
+                    bucket
+                        .entry(format!("{}::{path}", norm(krate)))
+                        .or_insert_with(|| n.id.clone());
+                }
+            }
             if let (Some(f), Some(l)) = (n.source_file.as_deref(), n.source_location) {
-                let kind = n.attributes.get("kind").map(String::as_str).unwrap_or("");
-                let is_fn = kind == "function" || kind == "method";
                 let bucket = if is_fn { &mut loc_fn } else { &mut loc_other };
                 bucket
                     .entry(format!("{f}:{l}"))
@@ -133,6 +162,8 @@ impl Locator {
         Locator {
             loc_fn,
             loc_other,
+            path_fn,
+            path_other,
             fns_by_file,
         }
     }
@@ -156,7 +187,9 @@ impl Locator {
         } else {
             (&self.loc_other, &self.loc_fn)
         };
-        let split = fileline.rsplit_once(':').and_then(|(f, l)| l.parse::<i64>().ok().map(|l| (f, l)));
+        let split = fileline
+            .rsplit_once(':')
+            .and_then(|(f, l)| l.parse::<i64>().ok().map(|l| (f, l)));
         for m in [primary, secondary] {
             if let Some(v) = m.get(fileline) {
                 return Some(v);
@@ -171,6 +204,19 @@ impl Locator {
             }
         }
         None
+    }
+
+    /// Resolve a rustc `def_path_str` to a node id, preferring the fn or other
+    /// bucket per `prefer_fn`, then falling back to the other bucket. This is the
+    /// macro-safe path: expanded items can share a callsite line or point at the
+    /// macro definition line, but their resolved def path is still precise.
+    fn get_path(&self, prefer_fn: bool, path: &str) -> Option<&String> {
+        let (primary, secondary) = if prefer_fn {
+            (&self.path_fn, &self.path_other)
+        } else {
+            (&self.path_other, &self.path_fn)
+        };
+        primary.get(path).or_else(|| secondary.get(path))
     }
 }
 
@@ -204,6 +250,8 @@ pub fn add_references_layer(
     driver_bin: &Utf8Path,
     nightly: &str,
 ) -> Result<ReferenceCounts> {
+    let out = absolute_path(out)?;
+    let driver_bin = absolute_path(driver_bin)?;
     if !driver_bin.as_std_path().exists() {
         bail!(
             "rustc driver not found at {driver_bin} — build it (see crates/bg-driver) \
@@ -211,7 +259,7 @@ pub fn add_references_layer(
         );
     }
     let sysroot = sysroot(nightly)?;
-    let edges_dir = out.join("driver-refs"); // persisted across runs (stable keys)
+    let edges_dir = out.join("driver-refs-v2"); // persisted across runs (stable keys)
     let target_dir = out.join("driver-check"); // isolated + persisted -> incremental
     std::fs::create_dir_all(edges_dir.as_std_path()).ok();
 
@@ -259,14 +307,23 @@ pub fn add_references_layer(
             let (Some(kind), Some(caller), Some(callee)) = (it.next(), it.next(), it.next()) else {
                 continue;
             };
+            let caller_path = it.next();
+            let callee_path = it.next();
             let is_call = kind == "call";
             // The caller is a fn/method/closure/const-initializer body owner. If
             // it maps to no node (a closure or const init — no Layer-2 item), roll
             // it up to the enclosing function so the edge survives.
-            let Some(src) = loc.get(true, caller).or_else(|| loc.enclosing_fn(caller)) else {
+            let Some(src) = caller_path
+                .and_then(|path| loc.get_path(true, path))
+                .or_else(|| loc.get(true, caller))
+                .or_else(|| loc.enclosing_fn(caller))
+            else {
                 continue;
             };
-            let Some(dst) = loc.get(is_call, callee) else {
+            let Some(dst) = callee_path
+                .and_then(|path| loc.get_path(is_call, path))
+                .or_else(|| loc.get(is_call, callee))
+            else {
                 continue;
             };
             if src == dst {
@@ -292,4 +349,66 @@ pub fn add_references_layer(
         member_calls,
         member_uses,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use build_graph::{Graph, Node};
+
+    use super::Locator;
+
+    fn item(id: &str, label: &str, kind: &str, krate: &str, path: &str) -> Node {
+        Node::new(id.to_string(), label, kind)
+            .attr("crate", krate)
+            .attr("path", path)
+    }
+
+    #[test]
+    fn resolves_def_paths_without_symbol_specific_assumptions() {
+        let mut graph = Graph::new();
+        graph.add_node(item(
+            "entrypoint",
+            "entrypoint",
+            "function",
+            "route-fixture",
+            "generated::entrypoint",
+        ));
+        graph.add_node(item(
+            "choice",
+            "Choice",
+            "enum",
+            "route-fixture",
+            "model::Choice",
+        ));
+        graph.add_node(item(
+            "selected",
+            "Selected",
+            "variant",
+            "route-fixture",
+            "model::Choice::Selected",
+        ));
+
+        let loc = Locator::build(&graph);
+
+        assert_eq!(
+            loc.get_path(true, "route_fixture::generated::entrypoint")
+                .map(String::as_str),
+            Some("entrypoint")
+        );
+        assert_eq!(
+            loc.get_path(false, "route_fixture::model::Choice")
+                .map(String::as_str),
+            Some("choice")
+        );
+        assert_eq!(
+            loc.get_path(false, "route_fixture::model::Choice::Selected")
+                .map(String::as_str),
+            Some("selected")
+        );
+        assert_eq!(
+            loc.get_path(false, "model::Choice::Selected")
+                .map(String::as_str),
+            Some("selected")
+        );
+    }
 }

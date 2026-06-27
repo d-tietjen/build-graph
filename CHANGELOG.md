@@ -20,12 +20,23 @@ semantic versioning.
 
 - Streamlined the README into a shorter landing page and moved detailed CLI,
   layer, output, and query reference material to `docs/cli-reference.md`.
+- **Watch refresh calculation** now flattens the enabled extraction layers on
+  save: the graph still has Layer 1/2/3 semantics, but a save runs one full
+  enabled-layer extraction pass instead of skipping per cached layer.
 
 ### Fixed
 
 - **Live viewer refreshes** now keep the page mounted and patch in fresh graph
   data from VS Code / JetBrains live views, preserving layout and avoiding a
   full GPU/WebGL rebuild when the topology did not change.
+- **rustc-driver reference coverage** now includes item-level signatures,
+  fields, variants, trait/impl/foreign items, and constructor-qualified enum
+  paths such as `EnumName::VariantName`.
+- **Macro-expanded references** are now included in the rustc-driver backend.
+  Driver edge files include resolved def paths, so declarative macros,
+  function-like proc macros, attribute macros, and derive-generated methods can
+  map onto graph nodes even when expansion spans point at macro definitions or
+  shared invocation lines.
 
 ## 0.2.0
 
