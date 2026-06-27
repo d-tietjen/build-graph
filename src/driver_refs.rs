@@ -16,7 +16,7 @@
 use std::collections::{HashMap, HashSet};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 
 use build_graph::Graph;
@@ -28,14 +28,14 @@ use crate::scip::{ReferenceCounts, add_member_reference_edges};
 /// `crates/bg-driver` crate (its own nightly pin applies) and using the result.
 pub fn resolve_driver(explicit: Option<&str>) -> Result<Utf8PathBuf> {
     if let Some(p) = explicit {
-        let p = Utf8PathBuf::from(p);
+        let p = absolute_path(&Utf8PathBuf::from(p))?;
         if !p.as_std_path().exists() {
             bail!("--driver-bin {p} not found");
         }
         return Ok(p);
     }
     if let Some(env) = std::env::var_os("BUILD_GRAPH_DRIVER") {
-        let p = Utf8PathBuf::from(env.to_string_lossy().into_owned());
+        let p = absolute_path(&Utf8PathBuf::from(env.to_string_lossy().into_owned()))?;
         if !p.as_std_path().exists() {
             bail!("BUILD_GRAPH_DRIVER points at a missing file: {p}");
         }
@@ -52,7 +52,7 @@ pub fn resolve_driver(explicit: Option<&str>) -> Result<Utf8PathBuf> {
 /// baked in next to this crate (works when running a locally-built binary).
 fn driver_src() -> Option<Utf8PathBuf> {
     if let Some(s) = std::env::var_os("BUILD_GRAPH_DRIVER_SRC") {
-        let p = Utf8PathBuf::from(s.to_string_lossy().into_owned());
+        let p = absolute_path(&Utf8PathBuf::from(s.to_string_lossy().into_owned())).ok()?;
         if p.join("Cargo.toml").as_std_path().exists() {
             return Some(p);
         }
@@ -63,6 +63,15 @@ fn driver_src() -> Option<Utf8PathBuf> {
         .as_std_path()
         .exists()
         .then_some(baked)
+}
+
+fn absolute_path(path: &Utf8Path) -> Result<Utf8PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    let cwd = std::env::current_dir().context("resolving current directory")?;
+    Utf8PathBuf::from_path_buf(cwd.join(path.as_std_path()))
+        .map_err(|p| anyhow!("path is not valid UTF-8: {}", p.display()))
 }
 
 /// Strip the rustup/cargo toolchain selectors that a parent `cargo build-graph`
@@ -156,7 +165,9 @@ impl Locator {
         } else {
             (&self.loc_other, &self.loc_fn)
         };
-        let split = fileline.rsplit_once(':').and_then(|(f, l)| l.parse::<i64>().ok().map(|l| (f, l)));
+        let split = fileline
+            .rsplit_once(':')
+            .and_then(|(f, l)| l.parse::<i64>().ok().map(|l| (f, l)));
         for m in [primary, secondary] {
             if let Some(v) = m.get(fileline) {
                 return Some(v);
@@ -204,6 +215,8 @@ pub fn add_references_layer(
     driver_bin: &Utf8Path,
     nightly: &str,
 ) -> Result<ReferenceCounts> {
+    let out = absolute_path(out)?;
+    let driver_bin = absolute_path(driver_bin)?;
     if !driver_bin.as_std_path().exists() {
         bail!(
             "rustc driver not found at {driver_bin} — build it (see crates/bg-driver) \

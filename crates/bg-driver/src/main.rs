@@ -20,7 +20,10 @@ extern crate rustc_span;
 use rustc_driver::{Callbacks, Compilation};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::{AmbigArg, Expr, ExprKind, HirId, Pat, PatKind, QPath, Ty, TyKind};
+use rustc_hir::{
+    AmbigArg, Expr, ExprKind, FieldDef, ForeignItem, HirId, ImplItem, Item, Pat, PatKind,
+    PathSegment, QPath, TraitItem, Ty, TyKind, Variant,
+};
 use rustc_interface::interface::Compiler;
 use rustc_middle::ty::{self, TyCtxt, TypeckResults};
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
@@ -75,15 +78,25 @@ fn extract(tcx: TyCtxt<'_>) {
     let want_edges = std::env::var_os("BG_DRIVER_EDGES").is_some();
     let mut edges: Vec<(&'static str, String, String)> = Vec::new();
 
+    // Item-like HIR covers non-body references: imports, struct/enum fields,
+    // trait method signatures, extern signatures, associated type defaults, etc.
+    // Function bodies are deliberately handled below with typeck results.
+    let mut item_v = ItemRefVisitor {
+        tcx,
+        owner_loc: None,
+        uses_count: &mut uses_count,
+        edges: &mut edges,
+    };
+    tcx.hir_visit_all_item_likes_in_crate(&mut item_v);
+
     for owner in tcx.hir_body_owners() {
         let body = tcx.hir_body_owned_by(owner);
         let typeck = tcx.typeck(owner);
         let owner_path = tcx.def_path_str(owner.to_def_id());
-        let owner_loc =
-            want_edges
-                .then(|| loc_of(tcx, owner.to_def_id()))
-                .flatten()
-                .map(|(f, l)| format!("{f}:{l}"));
+        let owner_loc = want_edges
+            .then(|| loc_of(tcx, owner.to_def_id()))
+            .flatten()
+            .map(|(f, l)| format!("{f}:{l}"));
         let mut v = CallVisitor {
             tcx,
             typeck,
@@ -98,15 +111,6 @@ fn extract(tcx: TyCtxt<'_>) {
             edges: &mut edges,
         };
         v.visit_expr(body.value);
-        // Also walk the fn signature (param/return/where types) — rust-analyzer
-        // records those type references too, attributed to the fn.
-        let node = tcx.hir_node_by_def_id(owner);
-        if let Some(decl) = node.fn_decl() {
-            intravisit::walk_fn_decl(&mut v, decl);
-        }
-        if let Some(generics) = node.generics() {
-            intravisit::walk_generics(&mut v, generics);
-        }
     }
 
     // Optional def catalog: `file:line -> DefKind` for every local def, so a
@@ -161,7 +165,11 @@ fn extract(tcx: TyCtxt<'_>) {
     // file write, so this is the honest "the driver actually executed" signal.
     if let Ok(path) = std::env::var("BG_DRIVER_LOG") {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             let _ = writeln!(f, "{krate} {} calls", calls + method_calls);
         }
     }
@@ -182,6 +190,110 @@ struct CallVisitor<'a, 'tcx> {
     uses_count: &'a mut usize,
     samples: &'a mut Vec<String>,
     edges: &'a mut Vec<(&'static str, String, String)>,
+}
+
+fn use_def_from_res(res: Res) -> Option<DefId> {
+    let Res::Def(kind, def_id) = res else {
+        return None;
+    };
+    let is_use = matches!(
+        kind,
+        DefKind::Struct
+            | DefKind::Enum
+            | DefKind::Union
+            | DefKind::Trait
+            | DefKind::TyAlias
+            | DefKind::AssocTy
+            | DefKind::TraitAlias
+            | DefKind::ForeignTy
+            | DefKind::Const
+            | DefKind::AssocConst
+            | DefKind::Static { .. }
+            | DefKind::Field
+            | DefKind::Variant
+            | DefKind::Ctor(..)
+    );
+    is_use.then_some(def_id)
+}
+
+struct ItemRefVisitor<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    owner_loc: Option<String>,
+    uses_count: &'a mut usize,
+    edges: &'a mut Vec<(&'static str, String, String)>,
+}
+
+impl<'a, 'tcx> ItemRefVisitor<'a, 'tcx> {
+    fn with_owner(&mut self, def_id: DefId, visit: impl FnOnce(&mut Self)) {
+        let prev = std::mem::replace(
+            &mut self.owner_loc,
+            loc_of(self.tcx, def_id).map(|(f, l)| format!("{f}:{l}")),
+        );
+        visit(self);
+        self.owner_loc = prev;
+    }
+
+    fn use_def(&mut self, callee: DefId) {
+        *self.uses_count += 1;
+        if let Some(caller) = self.owner_loc.clone() {
+            if let Some((f, l)) = loc_of(self.tcx, callee) {
+                if !f.starts_with('/') {
+                    self.edges.push(("use", caller, format!("{f}:{l}")));
+                }
+            }
+        }
+    }
+
+    fn use_from_res(&mut self, res: Res) {
+        if let Some(def_id) = use_def_from_res(res) {
+            self.use_def(def_id);
+        }
+    }
+}
+
+impl<'a, 'tcx> Visitor<'tcx> for ItemRefVisitor<'a, 'tcx> {
+    fn visit_item(&mut self, item: &'tcx Item<'tcx>) {
+        self.with_owner(item.owner_id.to_def_id(), |this| {
+            intravisit::walk_item(this, item)
+        });
+    }
+
+    fn visit_trait_item(&mut self, item: &'tcx TraitItem<'tcx>) {
+        self.with_owner(item.owner_id.to_def_id(), |this| {
+            intravisit::walk_trait_item(this, item)
+        });
+    }
+
+    fn visit_impl_item(&mut self, item: &'tcx ImplItem<'tcx>) {
+        self.with_owner(item.owner_id.to_def_id(), |this| {
+            intravisit::walk_impl_item(this, item)
+        });
+    }
+
+    fn visit_foreign_item(&mut self, item: &'tcx ForeignItem<'tcx>) {
+        self.with_owner(item.owner_id.to_def_id(), |this| {
+            intravisit::walk_foreign_item(this, item)
+        });
+    }
+
+    fn visit_field_def(&mut self, field: &'tcx FieldDef<'tcx>) {
+        self.with_owner(field.def_id.to_def_id(), |this| {
+            intravisit::walk_field_def(this, field)
+        });
+    }
+
+    fn visit_variant(&mut self, variant: &'tcx Variant<'tcx>) {
+        self.with_owner(variant.def_id.to_def_id(), |this| {
+            intravisit::walk_variant(this, variant)
+        });
+    }
+
+    fn visit_path_segment(&mut self, segment: &'tcx PathSegment<'tcx>) {
+        if !segment.ident.span.from_expansion() {
+            self.use_from_res(segment.res);
+        }
+        intravisit::walk_path_segment(self, segment);
+    }
 }
 
 impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
@@ -236,29 +348,11 @@ impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
     }
 
     /// A `uses` target from a path resolution: types, consts, statics, fields,
-    /// variants, etc. — but NOT fns/ctors (those are `calls`, handled separately,
-    /// and re-counting their path expr would double-count).
+    /// variants, and tuple/unit constructors. Fns are still `calls`, handled
+    /// separately.
     fn use_from_res(&mut self, res: Res) {
-        if let Res::Def(kind, def_id) = res {
-            let is_use = matches!(
-                kind,
-                DefKind::Struct
-                    | DefKind::Enum
-                    | DefKind::Union
-                    | DefKind::Trait
-                    | DefKind::TyAlias
-                    | DefKind::AssocTy
-                    | DefKind::TraitAlias
-                    | DefKind::ForeignTy
-                    | DefKind::Const
-                    | DefKind::AssocConst
-                    | DefKind::Static { .. }
-                    | DefKind::Field
-                    | DefKind::Variant
-            );
-            if is_use {
-                self.use_def(def_id);
-            }
+        if let Some(def_id) = use_def_from_res(res) {
+            self.use_def(def_id);
         }
     }
 }
@@ -274,10 +368,9 @@ impl<'a, 'tcx> Visitor<'tcx> for CallVisitor<'a, 'tcx> {
                     if let ExprKind::Path(ref qpath) = callee.kind {
                         if let Res::Def(dk, def_id) = self.typeck.qpath_res(qpath, callee.hir_id) {
                             // tuple-struct/variant construction: rustc says "call",
-                            // SCIP says "use" — match SCIP.
-                            if matches!(dk, DefKind::Ctor(..)) {
-                                self.use_def(def_id);
-                            } else {
+                            // SCIP says "use" — handled when the callee path is
+                            // walked below, not as a call.
+                            if !matches!(dk, DefKind::Ctor(..)) {
                                 self.call(def_id, false);
                             }
                         }
@@ -335,6 +428,13 @@ impl<'a, 'tcx> Visitor<'tcx> for CallVisitor<'a, 'tcx> {
         }
         intravisit::walk_pat(self, p);
     }
+
+    fn visit_path_segment(&mut self, segment: &'tcx PathSegment<'tcx>) {
+        if !segment.ident.span.from_expansion() {
+            self.use_from_res(segment.res);
+        }
+        intravisit::walk_path_segment(self, segment);
+    }
 }
 
 fn is_rustc(arg: &str) -> bool {
@@ -367,7 +467,10 @@ fn main() -> std::process::ExitCode {
         sysroot = print_sysroot(&rustc);
     }
     if let Some(sr) = sysroot {
-        if !args.iter().any(|a| a == "--sysroot" || a.starts_with("--sysroot=")) {
+        if !args
+            .iter()
+            .any(|a| a == "--sysroot" || a.starts_with("--sysroot="))
+        {
             args.push("--sysroot".into());
             args.push(sr);
         }

@@ -26,6 +26,9 @@ semantic versioning.
 - **Live viewer refreshes** now keep the page mounted and patch in fresh graph
   data from VS Code / JetBrains live views, preserving layout and avoiding a
   full GPU/WebGL rebuild when the topology did not change.
+- **rustc-driver reference coverage** now includes item-level signatures,
+  fields, variants, trait/impl/foreign items, and constructor-qualified enum
+  paths such as `EpKind::Redis`.
 
 ## 0.2.0
 
