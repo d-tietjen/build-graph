@@ -32,9 +32,11 @@ semantic versioning.
 - **rustc-driver reference coverage** now includes item-level signatures,
   fields, variants, trait/impl/foreign items, and constructor-qualified enum
   paths such as `EpKind::Redis`.
-- **Macro-expanded references** are now included in the rustc-driver backend, so
-  `macro_rules!`-generated calls and enum/type uses map onto the graph instead
-  of being dropped with expanded spans.
+- **Macro-expanded references** are now included in the rustc-driver backend.
+  Driver edge files include resolved def paths, so declarative macros,
+  function-like proc macros, attribute macros, and derive-generated methods can
+  map onto graph nodes even when expansion spans point at macro definitions or
+  shared invocation lines.
 
 ## 0.2.0
 

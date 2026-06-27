@@ -28,6 +28,14 @@ use rustc_interface::interface::Compiler;
 use rustc_middle::ty::{self, TyCtxt, TypeckResults};
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
 
+struct DriverEdge {
+    kind: &'static str,
+    caller: String,
+    callee: String,
+    caller_path: String,
+    callee_path: String,
+}
+
 struct BgCallbacks;
 
 impl Callbacks for BgCallbacks {
@@ -76,7 +84,7 @@ fn extract(tcx: TyCtxt<'_>) {
     // Full edge dump (for equivalence checking against rust-analyzer scip):
     // (kind, caller "file:line", callee "file:line"). Only collected when requested.
     let want_edges = std::env::var_os("BG_DRIVER_EDGES").is_some();
-    let mut edges: Vec<(&'static str, String, String)> = Vec::new();
+    let mut edges: Vec<DriverEdge> = Vec::new();
 
     // Item-like HIR covers non-body references: imports, struct/enum fields,
     // trait method signatures, extern signatures, associated type defaults, etc.
@@ -84,6 +92,7 @@ fn extract(tcx: TyCtxt<'_>) {
     let mut item_v = ItemRefVisitor {
         tcx,
         owner_loc: None,
+        owner_path: None,
         uses_count: &mut uses_count,
         edges: &mut edges,
     };
@@ -146,8 +155,11 @@ fn extract(tcx: TyCtxt<'_>) {
             let path = format!("{dir}/{}.tsv", unit_key(tcx, &krate.to_string()));
             if let Ok(mut f) = std::fs::File::create(&path) {
                 let mut buf = String::new();
-                for (kind, caller, callee) in &edges {
-                    buf.push_str(&format!("{kind}\t{caller}\t{callee}\n"));
+                for edge in &edges {
+                    buf.push_str(&format!(
+                        "{}\t{}\t{}\t{}\t{}\n",
+                        edge.kind, edge.caller, edge.callee, edge.caller_path, edge.callee_path
+                    ));
                 }
                 let _ = f.write_all(buf.as_bytes());
             }
@@ -189,7 +201,7 @@ struct CallVisitor<'a, 'tcx> {
     cross_crate: &'a mut usize,
     uses_count: &'a mut usize,
     samples: &'a mut Vec<String>,
-    edges: &'a mut Vec<(&'static str, String, String)>,
+    edges: &'a mut Vec<DriverEdge>,
 }
 
 fn use_def_from_res(res: Res) -> Option<DefId> {
@@ -219,26 +231,39 @@ fn use_def_from_res(res: Res) -> Option<DefId> {
 struct ItemRefVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
     owner_loc: Option<String>,
+    owner_path: Option<String>,
     uses_count: &'a mut usize,
-    edges: &'a mut Vec<(&'static str, String, String)>,
+    edges: &'a mut Vec<DriverEdge>,
 }
 
 impl<'a, 'tcx> ItemRefVisitor<'a, 'tcx> {
     fn with_owner(&mut self, def_id: DefId, visit: impl FnOnce(&mut Self)) {
-        let prev = std::mem::replace(
+        let prev_loc = std::mem::replace(
             &mut self.owner_loc,
             loc_of(self.tcx, def_id).map(|(f, l)| format!("{f}:{l}")),
         );
+        let prev_path = self
+            .owner_path
+            .replace(self.tcx.def_path_str(def_id));
         visit(self);
-        self.owner_loc = prev;
+        self.owner_loc = prev_loc;
+        self.owner_path = prev_path;
     }
 
     fn use_def(&mut self, callee: DefId) {
         *self.uses_count += 1;
-        if let Some(caller) = self.owner_loc.clone() {
+        if let (Some(caller), Some(caller_path)) =
+            (self.owner_loc.clone(), self.owner_path.clone())
+        {
             if let Some((f, l)) = loc_of(self.tcx, callee) {
                 if !f.starts_with('/') {
-                    self.edges.push(("use", caller, format!("{f}:{l}")));
+                    self.edges.push(DriverEdge {
+                        kind: "use",
+                        caller,
+                        callee: format!("{f}:{l}"),
+                        caller_path,
+                        callee_path: self.tcx.def_path_str(callee),
+                    });
                 }
             }
         }
@@ -305,7 +330,13 @@ impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
                 // dep absolute paths) — matches build-graph's reference layer and
                 // keeps the dump comparable to scip's.
                 if !f.starts_with('/') {
-                    self.edges.push((kind, caller, format!("{f}:{l}")));
+                    self.edges.push(DriverEdge {
+                        kind,
+                        caller,
+                        callee: format!("{f}:{l}"),
+                        caller_path: self.owner.clone(),
+                        callee_path: self.tcx.def_path_str(callee),
+                    });
                 }
             }
         }

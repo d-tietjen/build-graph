@@ -3,9 +3,10 @@
 //!
 //! Runs `cargo check` with the driver installed as `RUSTC_WORKSPACE_WRAPPER`.
 //! The driver walks each workspace crate's HIR and writes resolved edges
-//! (`kind <TAB> caller_file:line <TAB> callee_file:line`) per compilation unit;
-//! here we map those `file:line` endpoints onto the Layer-2 item nodes, exactly
-//! as `scip.rs` maps SCIP occurrences (same fn/other bucketing + ±1 tolerance).
+//! (`kind <TAB> caller_file:line <TAB> callee_file:line`, plus resolved def
+//! paths in newer files) per compilation unit; here we map those endpoints onto
+//! the Layer-2 item nodes. The path columns are important for macro-expanded
+//! items whose spans can point at macro definitions or share an invocation line.
 //!
 //! Why a driver: it is far cheaper than a cold whole-workspace SCIP index and is
 //! incremental for free — cargo only re-runs the wrapper for crates it
@@ -19,7 +20,7 @@ use std::process::Command;
 use anyhow::{Context, Result, anyhow, bail};
 use camino::{Utf8Path, Utf8PathBuf};
 
-use build_graph::Graph;
+use build_graph::{Graph, norm};
 
 use crate::scip::{ReferenceCounts, add_member_reference_edges};
 
@@ -111,6 +112,8 @@ fn build_driver(src: &Utf8Path) -> Result<Utf8PathBuf> {
 struct Locator {
     loc_fn: HashMap<String, String>,
     loc_other: HashMap<String, String>,
+    path_fn: HashMap<String, String>,
+    path_other: HashMap<String, String>,
     /// fn/method node lines per file, sorted — for enclosing-fn rollup.
     fns_by_file: HashMap<String, Vec<(i64, String)>>,
 }
@@ -119,11 +122,28 @@ impl Locator {
     fn build(graph: &Graph) -> Self {
         let mut loc_fn = HashMap::new();
         let mut loc_other = HashMap::new();
+        let mut path_fn = HashMap::new();
+        let mut path_other = HashMap::new();
         let mut fns_by_file: HashMap<String, Vec<(i64, String)>> = HashMap::new();
         for n in graph.node_values() {
+            let kind = n.attributes.get("kind").map(String::as_str).unwrap_or("");
+            let is_fn = kind == "function" || kind == "method";
+            if let Some(path) = n.attributes.get("path") {
+                let bucket = if is_fn { &mut path_fn } else { &mut path_other };
+                bucket
+                    .entry(path.to_string())
+                    .or_insert_with(|| n.id.clone());
+                if let Some(krate) = n.attributes.get("crate") {
+                    let rustc_crate = krate.replace('-', "_");
+                    bucket
+                        .entry(format!("{rustc_crate}::{path}"))
+                        .or_insert_with(|| n.id.clone());
+                    bucket
+                        .entry(format!("{}::{path}", norm(krate)))
+                        .or_insert_with(|| n.id.clone());
+                }
+            }
             if let (Some(f), Some(l)) = (n.source_file.as_deref(), n.source_location) {
-                let kind = n.attributes.get("kind").map(String::as_str).unwrap_or("");
-                let is_fn = kind == "function" || kind == "method";
                 let bucket = if is_fn { &mut loc_fn } else { &mut loc_other };
                 bucket
                     .entry(format!("{f}:{l}"))
@@ -142,6 +162,8 @@ impl Locator {
         Locator {
             loc_fn,
             loc_other,
+            path_fn,
+            path_other,
             fns_by_file,
         }
     }
@@ -182,6 +204,19 @@ impl Locator {
             }
         }
         None
+    }
+
+    /// Resolve a rustc `def_path_str` to a node id, preferring the fn or other
+    /// bucket per `prefer_fn`, then falling back to the other bucket. This is the
+    /// macro-safe path: expanded items can share a callsite line or point at the
+    /// macro definition line, but their resolved def path is still precise.
+    fn get_path(&self, prefer_fn: bool, path: &str) -> Option<&String> {
+        let (primary, secondary) = if prefer_fn {
+            (&self.path_fn, &self.path_other)
+        } else {
+            (&self.path_other, &self.path_fn)
+        };
+        primary.get(path).or_else(|| secondary.get(path))
     }
 }
 
@@ -224,7 +259,7 @@ pub fn add_references_layer(
         );
     }
     let sysroot = sysroot(nightly)?;
-    let edges_dir = out.join("driver-refs"); // persisted across runs (stable keys)
+    let edges_dir = out.join("driver-refs-v2"); // persisted across runs (stable keys)
     let target_dir = out.join("driver-check"); // isolated + persisted -> incremental
     std::fs::create_dir_all(edges_dir.as_std_path()).ok();
 
@@ -272,14 +307,23 @@ pub fn add_references_layer(
             let (Some(kind), Some(caller), Some(callee)) = (it.next(), it.next(), it.next()) else {
                 continue;
             };
+            let caller_path = it.next();
+            let callee_path = it.next();
             let is_call = kind == "call";
             // The caller is a fn/method/closure/const-initializer body owner. If
             // it maps to no node (a closure or const init — no Layer-2 item), roll
             // it up to the enclosing function so the edge survives.
-            let Some(src) = loc.get(true, caller).or_else(|| loc.enclosing_fn(caller)) else {
+            let Some(src) = caller_path
+                .and_then(|path| loc.get_path(true, path))
+                .or_else(|| loc.get(true, caller))
+                .or_else(|| loc.enclosing_fn(caller))
+            else {
                 continue;
             };
-            let Some(dst) = loc.get(is_call, callee) else {
+            let Some(dst) = callee_path
+                .and_then(|path| loc.get_path(is_call, path))
+                .or_else(|| loc.get(is_call, callee))
+            else {
                 continue;
             };
             if src == dst {
