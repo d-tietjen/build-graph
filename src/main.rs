@@ -579,7 +579,10 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
             match result {
                 Ok(counts) => eprintln!(
                     "[build-graph] layer 3: +{} calls, +{} uses, +{} member_calls, +{} member_uses edge(s) ({backend}, {:.1}s)",
-                    counts.calls, counts.uses, counts.member_calls, counts.member_uses,
+                    counts.calls,
+                    counts.uses,
+                    counts.member_calls,
+                    counts.member_uses,
                     t3.elapsed().as_secs_f64()
                 ),
                 Err(e) => eprintln!("[build-graph] layer 3: references skipped — {e:#}"),
