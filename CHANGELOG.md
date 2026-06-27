@@ -32,6 +32,9 @@ semantic versioning.
 - **rustc-driver reference coverage** now includes item-level signatures,
   fields, variants, trait/impl/foreign items, and constructor-qualified enum
   paths such as `EpKind::Redis`.
+- **Macro-expanded references** are now included in the rustc-driver backend, so
+  `macro_rules!`-generated calls and enum/type uses map onto the graph instead
+  of being dropped with expanded spans.
 
 ## 0.2.0
 

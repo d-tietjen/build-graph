@@ -289,9 +289,7 @@ impl<'a, 'tcx> Visitor<'tcx> for ItemRefVisitor<'a, 'tcx> {
     }
 
     fn visit_path_segment(&mut self, segment: &'tcx PathSegment<'tcx>) {
-        if !segment.ident.span.from_expansion() {
-            self.use_from_res(segment.res);
-        }
+        self.use_from_res(segment.res);
         intravisit::walk_path_segment(self, segment);
     }
 }
@@ -359,80 +357,69 @@ impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
 
 impl<'a, 'tcx> Visitor<'tcx> for CallVisitor<'a, 'tcx> {
     fn visit_expr(&mut self, ex: &'tcx Expr<'tcx>) {
-        // Skip references in macro-expanded code: rust-analyzer's SCIP works on
-        // source tokens, so it doesn't emit occurrences for derive/`?`-desugar
-        // generated calls. User code spliced into a macro arg keeps its own span.
-        if !ex.span.from_expansion() {
-            match ex.kind {
-                ExprKind::Call(callee, _args) => {
-                    if let ExprKind::Path(ref qpath) = callee.kind {
-                        if let Res::Def(dk, def_id) = self.typeck.qpath_res(qpath, callee.hir_id) {
-                            // tuple-struct/variant construction: rustc says "call",
-                            // SCIP says "use" — handled when the callee path is
-                            // walked below, not as a call.
-                            if !matches!(dk, DefKind::Ctor(..)) {
-                                self.call(def_id, false);
-                            }
+        match ex.kind {
+            ExprKind::Call(callee, _args) => {
+                if let ExprKind::Path(ref qpath) = callee.kind {
+                    if let Res::Def(dk, def_id) = self.typeck.qpath_res(qpath, callee.hir_id) {
+                        // tuple-struct/variant construction: rustc says "call",
+                        // SCIP says "use" — handled when the callee path is
+                        // walked below, not as a call.
+                        if !matches!(dk, DefKind::Ctor(..)) {
+                            self.call(def_id, false);
                         }
                     }
                 }
-                ExprKind::MethodCall(..) => {
-                    if let Some(def_id) = self.typeck.type_dependent_def_id(ex.hir_id) {
-                        let target = self.method_target(def_id, ex.hir_id);
-                        self.call(target, true);
-                    }
-                }
-                // value paths to consts/statics/variants used as values → use
-                ExprKind::Path(ref qpath) => {
-                    self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id));
-                }
-                // struct/enum-variant literal → use of the type/variant
-                ExprKind::Struct(qpath, ..) => {
-                    self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id));
-                }
-                // field access → use of the field def
-                ExprKind::Field(recv, _) => {
-                    let ty = self.typeck.expr_ty_adjusted(recv);
-                    if let ty::Adt(adt, _) = ty.kind() {
-                        if adt.is_struct() || adt.is_union() {
-                            let idx = self.typeck.field_index(ex.hir_id);
-                            if let Some(field) = adt.non_enum_variant().fields.get(idx) {
-                                self.use_def(field.did);
-                            }
-                        }
-                    }
-                }
-                _ => {}
             }
+            ExprKind::MethodCall(..) => {
+                if let Some(def_id) = self.typeck.type_dependent_def_id(ex.hir_id) {
+                    let target = self.method_target(def_id, ex.hir_id);
+                    self.call(target, true);
+                }
+            }
+            // value paths to consts/statics/variants used as values → use
+            ExprKind::Path(ref qpath) => {
+                self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id));
+            }
+            // struct/enum-variant literal → use of the type/variant
+            ExprKind::Struct(qpath, ..) => {
+                self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id));
+            }
+            // field access → use of the field def
+            ExprKind::Field(recv, _) => {
+                let ty = self.typeck.expr_ty_adjusted(recv);
+                if let ty::Adt(adt, _) = ty.kind() {
+                    if adt.is_struct() || adt.is_union() {
+                        let idx = self.typeck.field_index(ex.hir_id);
+                        if let Some(field) = adt.non_enum_variant().fields.get(idx) {
+                            self.use_def(field.did);
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
         intravisit::walk_expr(self, ex);
     }
 
     fn visit_ty(&mut self, t: &'tcx Ty<'tcx, AmbigArg>) {
-        if !t.span.from_expansion() {
-            if let TyKind::Path(QPath::Resolved(_, path)) = t.kind {
-                self.use_from_res(path.res);
-            }
+        if let TyKind::Path(QPath::Resolved(_, path)) = t.kind {
+            self.use_from_res(path.res);
         }
         intravisit::walk_ty(self, t);
     }
 
     fn visit_pat(&mut self, p: &'tcx Pat<'tcx>) {
-        if !p.span.from_expansion() {
-            match p.kind {
-                PatKind::TupleStruct(ref qpath, ..) | PatKind::Struct(ref qpath, ..) => {
-                    self.use_from_res(self.typeck.qpath_res(qpath, p.hir_id));
-                }
-                _ => {}
+        match p.kind {
+            PatKind::TupleStruct(ref qpath, ..) | PatKind::Struct(ref qpath, ..) => {
+                self.use_from_res(self.typeck.qpath_res(qpath, p.hir_id));
             }
+            _ => {}
         }
         intravisit::walk_pat(self, p);
     }
 
     fn visit_path_segment(&mut self, segment: &'tcx PathSegment<'tcx>) {
-        if !segment.ident.span.from_expansion() {
-            self.use_from_res(segment.res);
-        }
+        self.use_from_res(segment.res);
         intravisit::walk_path_segment(self, segment);
     }
 }

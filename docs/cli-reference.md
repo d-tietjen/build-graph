@@ -89,9 +89,9 @@ time and cargo caches it after that. Pass `--driver-bin <path>` or set
 The driver replaces the SCIP pass: it runs `cargo check --all-targets` with the
 driver as `RUSTC_WORKSPACE_WRAPPER`, persists per-crate edge files under
 `<out>/driver-refs`, and maps them onto Layer 2 nodes. It indexes the semantic
-def-reference graph, not rust-analyzer's syntactic occurrence graph, so treat it
-as a faster compiler-grounded reference source rather than a byte-identical
-rust-analyzer clone.
+def-reference graph, including macro-expanded HIR, not rust-analyzer's syntactic
+occurrence graph. Treat it as a faster compiler-grounded reference source rather
+than a byte-identical rust-analyzer clone.
 
 ## Nightly + rustdoc-types Pin
 
