@@ -350,3 +350,65 @@ pub fn add_references_layer(
         member_uses,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use build_graph::{Graph, Node};
+
+    use super::Locator;
+
+    fn item(id: &str, label: &str, kind: &str, krate: &str, path: &str) -> Node {
+        Node::new(id.to_string(), label, kind)
+            .attr("crate", krate)
+            .attr("path", path)
+    }
+
+    #[test]
+    fn resolves_def_paths_without_symbol_specific_assumptions() {
+        let mut graph = Graph::new();
+        graph.add_node(item(
+            "entrypoint",
+            "entrypoint",
+            "function",
+            "route-fixture",
+            "generated::entrypoint",
+        ));
+        graph.add_node(item(
+            "choice",
+            "Choice",
+            "enum",
+            "route-fixture",
+            "model::Choice",
+        ));
+        graph.add_node(item(
+            "selected",
+            "Selected",
+            "variant",
+            "route-fixture",
+            "model::Choice::Selected",
+        ));
+
+        let loc = Locator::build(&graph);
+
+        assert_eq!(
+            loc.get_path(true, "route_fixture::generated::entrypoint")
+                .map(String::as_str),
+            Some("entrypoint")
+        );
+        assert_eq!(
+            loc.get_path(false, "route_fixture::model::Choice")
+                .map(String::as_str),
+            Some("choice")
+        );
+        assert_eq!(
+            loc.get_path(false, "route_fixture::model::Choice::Selected")
+                .map(String::as_str),
+            Some("selected")
+        );
+        assert_eq!(
+            loc.get_path(false, "model::Choice::Selected")
+                .map(String::as_str),
+            Some("selected")
+        );
+    }
+}

@@ -31,7 +31,7 @@ semantic versioning.
   full GPU/WebGL rebuild when the topology did not change.
 - **rustc-driver reference coverage** now includes item-level signatures,
   fields, variants, trait/impl/foreign items, and constructor-qualified enum
-  paths such as `EpKind::Redis`.
+  paths such as `EnumName::VariantName`.
 - **Macro-expanded references** are now included in the rustc-driver backend.
   Driver edge files include resolved def paths, so declarative macros,
   function-like proc macros, attribute macros, and derive-generated methods can
