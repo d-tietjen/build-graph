@@ -20,6 +20,9 @@ semantic versioning.
 
 - Streamlined the README into a shorter landing page and moved detailed CLI,
   layer, output, and query reference material to `docs/cli-reference.md`.
+- **Watch refresh calculation** now flattens the enabled extraction layers on
+  save: the graph still has Layer 1/2/3 semantics, but a save runs one full
+  enabled-layer extraction pass instead of skipping per cached layer.
 
 ### Fixed
 

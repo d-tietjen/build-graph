@@ -169,10 +169,13 @@ edges into a re-extracted crate survive because IDs are deterministic.
 
 `cargo build-graph watch` does one refresh up front, then watches workspace
 `.rs` and `Cargo.toml` files while skipping `target/`, the output dir, and
-`.git`. A burst of saves coalesces into one rebuild. Pass `--no-build` to
-re-extract from the current `target/`, `--debounce <ms>` to tune the settle
-window, and normal build flags such as `--rich`, `-p`, and `--release` to control
-each cycle.
+`.git`. A burst of saves coalesces into one rebuild. On save, watch runs one
+flattened extraction pass across every enabled graph layer, so Layer 1/2/3 stay
+in lockstep even though they remain separate concepts in the output graph.
+Cargo, rustdoc, and the rustc-driver backend still reuse their own caches under
+that pass. Pass `--no-build` to re-extract from the current `target/`,
+`--debounce <ms>` to tune the settle window, and normal build flags such as
+`--rich`, `-p`, and `--release` to control each cycle.
 
 Under `watch`, `--rich --references` still uses rust-analyzer's cold
 whole-workspace SCIP index. For incremental Layer 3 refreshes, use
