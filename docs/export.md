@@ -38,13 +38,17 @@ graph's `source_location` remains its start line.
 
 Each layer reports `complete`, `skipped`, or `partial`. Item outcomes also identify
 each package and its reason. A successful CLI exit can still produce partial or
-skipped layers. Package restrictions and packages without library targets are
-explicit skips; a mixture of complete and skipped packages is a partial workspace
-layer. A failed `cargo doc --keep-going` run can ingest existing JSON, but that
-output is partial with unknown freshness, even if every JSON file parses.
+skipped layers. Package restrictions, packages without library targets, and
+libraries with `doc = false` are explicit skips; a mixture of complete and skipped
+packages is a partial workspace layer. Documentation selects library targets only.
+Retained JSON for each selected library is removed before the doc invocation, so
+a successful command without newly produced JSON reports partial status with
+unknown freshness. A failed `cargo doc --keep-going` run can ingest newly produced
+JSON, but that output is partial with unknown freshness, even if every file parses.
 
-`current` freshness means successful extraction associated with an unchanged,
-fully read observed source set. `stale` means that observed sources changed.
+`current` item freshness requires a successful doc invocation, a newly produced
+parseable artifact for that package, and an unchanged, fully read observed source
+set. `stale` means that observed sources changed.
 `unknown` means no such association was established. Source observations cover
 `.rs`, `Cargo.toml`, and `Cargo.lock` files under each package root; target/output
 and hidden directories are excluded. This does not enumerate every compiler input,
@@ -67,6 +71,10 @@ sidecar, call `ExportManifest::matches_graph(&graph)` (or implement the same che
 to ensure its graph binding matches. Missing, unsupported, or mismatched metadata
 does not establish completeness. Incremental extraction only reuses provenance
 that matches the graph and source observations. Partial item packages are retried.
+Incremental replacement invalidates all current packages sharing a normalized
+graph namespace with a changed or removed package. Definitions and provenance
+are rebuilt together with those nodes; packages outside the requested item scope
+report a skip and discard invalidated definitions.
 
 Content fingerprints are stable FNV-1a 64-bit markers encoded
 `fnv1a64:<16 lowercase hex digits>`. The graph marker covers its compact,

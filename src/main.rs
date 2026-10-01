@@ -15,6 +15,8 @@ mod render;
 mod rustdoc;
 mod scip;
 mod serve;
+#[cfg(test)]
+mod test_support;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
@@ -436,7 +438,25 @@ fn workspace_fingerprint(root: &Utf8Path, excludes: &[std::path::PathBuf]) -> u6
 fn run_extract(c: &CommonArgs, compiled: Option<&[cargo_build::CompiledTarget]>) -> Result<()> {
     let manifest = c.manifest_path.as_ref().map(Utf8PathBuf::from);
     let meta = metadata::load(manifest.as_deref())?;
+    run_extract_with_item_layer(c, compiled, meta, rustdoc::add_item_layer)
+}
 
+type ItemLayerExtractor = fn(
+    &mut Graph,
+    &cargo_metadata::Metadata,
+    &Utf8Path,
+    Option<&str>,
+    &[String],
+    bool,
+    bool,
+) -> Result<rustdoc::ItemLayerResult>;
+
+fn run_extract_with_item_layer(
+    c: &CommonArgs,
+    compiled: Option<&[cargo_build::CompiledTarget]>,
+    meta: cargo_metadata::Metadata,
+    extract_items: ItemLayerExtractor,
+) -> Result<()> {
     let target_dir = c
         .target_dir
         .as_ref()
@@ -501,7 +521,8 @@ fn run_extract(c: &CommonArgs, compiled: Option<&[cargo_build::CompiledTarget]>)
         })
         .collect();
     let mut current: BTreeMap<String, String> = BTreeMap::new();
-    let mut dirty_sources: HashMap<String, Vec<depinfo::SourceFile>> = HashMap::new();
+    let mut all_sources: HashMap<String, Vec<depinfo::SourceFile>> = HashMap::new();
+    let mut dirty = HashSet::new();
     for &pkg in &ws_pkgs {
         let manifest_dir = pkg
             .manifest_path
@@ -538,11 +559,21 @@ fn run_extract(c: &CommonArgs, compiled: Option<&[cargo_build::CompiledTarget]>)
             || !export_reusable
             || !items_reusable
         {
-            dirty_sources.insert(pkg.name.clone(), srcs);
+            dirty.insert(pkg.name.clone());
         }
+        all_sources.insert(pkg.name.clone(), srcs);
         current.insert(pkg.name.clone(), fp);
     }
-    let dirty: HashSet<String> = dirty_sources.keys().cloned().collect();
+    let removed: Vec<String> = prior_crates
+        .keys()
+        .filter(|k| !current.contains_key(*k))
+        .cloned()
+        .collect();
+    expand_dirty_namespaces(&mut dirty, &removed, &current);
+    let dirty_sources: HashMap<_, _> = all_sources
+        .into_iter()
+        .filter(|(name, _)| dirty.contains(name))
+        .collect();
     let mut definitions = prior_export
         .as_ref()
         .map(|manifest| manifest.definitions.clone())
@@ -560,6 +591,8 @@ fn run_extract(c: &CommonArgs, compiled: Option<&[cargo_build::CompiledTarget]>)
                 Some("package outside requested item scope")
             } else if !pkg.targets.iter().any(rustdoc::is_lib_target) {
                 Some("no library target")
+            } else if !pkg.targets.iter().any(rustdoc::is_documented_lib_target) {
+                Some("library documentation disabled")
             } else {
                 None
             };
@@ -623,12 +656,6 @@ fn run_extract(c: &CommonArgs, compiled: Option<&[cargo_build::CompiledTarget]>)
     if references {
         reference_report.status = ExtractionStatus::Partial;
     }
-    let removed: Vec<String> = prior_crates
-        .keys()
-        .filter(|k| !current.contains_key(*k))
-        .cloned()
-        .collect();
-
     // Drop changed/removed crates before re-extracting them.
     for name in dirty.iter().chain(removed.iter()) {
         graph.remove_crate(&norm(name));
@@ -654,14 +681,14 @@ fn run_extract(c: &CommonArgs, compiled: Option<&[cargo_build::CompiledTarget]>)
             .iter()
             .filter(|p| dirty.contains(&p.name))
             .filter(|p| want.is_empty() || want.contains(p.name.as_str()))
-            .filter(|p| p.targets.iter().any(rustdoc::is_lib_target))
+            .filter(|p| p.targets.iter().any(rustdoc::is_documented_lib_target))
             .map(|p| p.name.clone())
             .collect();
         if rich_dirty.is_empty() {
             eprintln!("[build-graph] layer 2: no changed crates to re-document");
         } else {
             let t2 = std::time::Instant::now();
-            let result = rustdoc::add_item_layer(
+            let result = extract_items(
                 &mut graph,
                 &meta,
                 &target_dir,
@@ -833,6 +860,23 @@ fn run_extract(c: &CommonArgs, compiled: Option<&[cargo_build::CompiledTarget]>)
     eprintln!("[build-graph] wrote {out}/{wrote} ({nodes} nodes, {edges} edges)");
     eprintln!("[build-graph] view: cargo build-graph view --out {out}");
     Ok(())
+}
+
+/// `remove_crate` removes a normalized namespace, which can be shared by
+/// multiple exact Cargo package names. Invalidate every surviving member of
+/// any namespace being replaced before reusing its definitions or reports.
+fn expand_dirty_namespaces(
+    dirty: &mut HashSet<String>,
+    removed: &[String],
+    current: &BTreeMap<String, String>,
+) {
+    let namespaces: HashSet<String> = dirty.iter().chain(removed).map(|name| norm(name)).collect();
+    dirty.extend(
+        current
+            .keys()
+            .filter(|name| namespaces.contains(&norm(name)))
+            .cloned(),
+    );
 }
 
 fn run_view(v: ViewArgs) -> Result<()> {
@@ -1052,7 +1096,218 @@ fn open_in_browser(path: &str) -> Result<()> {
 mod tests {
     use std::path::PathBuf;
 
-    use super::is_excluded;
+    use build_graph::export::{DefinitionIdentity, DefinitionRecord};
+    use build_graph::{Node, crate_id, item_id};
+
+    use super::*;
+    use crate::test_support::Workspace;
+
+    fn fixture_items(
+        graph: &mut Graph,
+        meta: &cargo_metadata::Metadata,
+        _target_dir: &Utf8Path,
+        _nightly: Option<&str>,
+        packages: &[String],
+        _release: bool,
+        _no_derives: bool,
+    ) -> Result<rustdoc::ItemLayerResult> {
+        let mut result = rustdoc::ItemLayerResult {
+            items: 0,
+            definitions: Vec::new(),
+            packages: Vec::new(),
+        };
+        for pkg in meta.workspace_packages() {
+            if !packages.contains(&pkg.name) {
+                continue;
+            }
+            let source = std::fs::read_to_string(&pkg.targets[0].src_path)?;
+            let name = source
+                .trim()
+                .strip_prefix("pub struct ")
+                .and_then(|source| source.strip_suffix(';'))
+                .expect("fixture struct declaration");
+            let id = item_id(&pkg.name, name, "struct");
+            graph.add_node(Node::new(id.clone(), name, "struct"));
+            graph.add_edge(crate_id(&pkg.name), &id, "contains", None, None);
+            result.definitions.push(DefinitionRecord {
+                graph_node_id: id,
+                identity: DefinitionIdentity {
+                    package: pkg.name.clone(),
+                    def_path: name.into(),
+                    kind: "struct".into(),
+                },
+                span: None,
+            });
+            result.packages.push(PackageReport {
+                package: pkg.name.clone(),
+                status: ExtractionStatus::Complete,
+                freshness: ArtifactFreshness::Current,
+                reason: None,
+            });
+            result.items += 1;
+        }
+        Ok(result)
+    }
+
+    fn fixture_args(workspace: &Workspace) -> CommonArgs {
+        let out = workspace.root.join("target/build-graph");
+        let cli = Cli::try_parse_from([
+            "cargo-build-graph",
+            "update",
+            "--rich",
+            "--no-compress",
+            "--out",
+            out.as_str(),
+        ])
+        .expect("fixture CLI arguments");
+        match cli.cmd {
+            Cmd::Update(args) => args,
+            _ => panic!("fixture update command"),
+        }
+    }
+
+    fn refresh_fixture(workspace: &Workspace, args: &CommonArgs) -> (GraphJson, ExportManifest) {
+        run_extract_with_item_layer(args, Some(&[]), workspace.meta.clone(), fixture_items)
+            .expect("fixture extraction");
+        let out = Utf8Path::new(args.out.as_ref().expect("fixture output"));
+        let graph = build_graph::output::read_graph(out.join("graph.json").as_std_path())
+            .expect("written graph");
+        let export = build_graph::output::read_export(out.as_std_path()).expect("written sidecar");
+        assert!(export.matches_graph(&graph).expect("graph binding"));
+        for definition in &export.definitions {
+            assert!(
+                graph
+                    .nodes
+                    .iter()
+                    .any(|node| node.id == definition.graph_node_id)
+            );
+        }
+        (graph, export)
+    }
+
+    fn item_report<'a>(export: &'a ExportManifest, package: &str) -> &'a PackageReport {
+        export
+            .layers
+            .iter()
+            .find(|layer| layer.layer == Layer::Items)
+            .expect("item layer")
+            .packages
+            .iter()
+            .find(|report| report.package == package)
+            .expect("item package report")
+    }
+
+    fn collision_workspace() -> Workspace {
+        let workspace = Workspace::new(&[("pkg-a", "first_lib"), ("pkg_a", "second_lib")]);
+        workspace.change_source("pkg-a", "Alpha");
+        workspace.change_source("pkg_a", "Beta");
+        workspace
+    }
+
+    #[test]
+    fn incremental_edit_rebuilds_colliding_package_names() {
+        let workspace = collision_workspace();
+        let args = fixture_args(&workspace);
+        refresh_fixture(&workspace, &args);
+        workspace.change_source("pkg-a", "NewAlpha");
+        let (graph, export) = refresh_fixture(&workspace, &args);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.id == item_id("pkg-a", "NewAlpha", "struct"))
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.id == item_id("pkg_a", "Beta", "struct"))
+        );
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| node.id == item_id("pkg-a", "Alpha", "struct"))
+        );
+        assert_eq!(export.definitions.len(), 2);
+        for package in ["pkg-a", "pkg_a"] {
+            let report = item_report(&export, package);
+            assert_eq!(report.status, ExtractionStatus::Complete);
+            assert_eq!(report.freshness, ArtifactFreshness::Current);
+        }
+    }
+
+    #[test]
+    fn removed_package_rebuilds_surviving_namespace_member() {
+        let mut workspace = collision_workspace();
+        let args = fixture_args(&workspace);
+        refresh_fixture(&workspace, &args);
+        let removed = workspace.meta.packages[0].id.clone();
+        workspace.meta.workspace_members.retain(|id| id != &removed);
+        workspace.meta.packages.retain(|pkg| pkg.id != removed);
+        let (graph, export) = refresh_fixture(&workspace, &args);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.id == item_id("pkg_a", "Beta", "struct"))
+        );
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| node.id == item_id("pkg-a", "Alpha", "struct"))
+        );
+        assert_eq!(export.definitions.len(), 1);
+        assert_eq!(export.definitions[0].identity.package, "pkg_a");
+        let report = item_report(&export, "pkg_a");
+        assert_eq!(report.status, ExtractionStatus::Complete);
+        assert_eq!(report.freshness, ArtifactFreshness::Current);
+    }
+
+    #[test]
+    fn scoped_edit_drops_invalidated_out_of_scope_definitions() {
+        let workspace = collision_workspace();
+        let mut args = fixture_args(&workspace);
+        refresh_fixture(&workspace, &args);
+        workspace.change_source("pkg-a", "NewAlpha");
+        args.packages = vec!["pkg-a".into()];
+        let (graph, export) = refresh_fixture(&workspace, &args);
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| node.id == item_id("pkg_a", "Beta", "struct"))
+        );
+        assert_eq!(export.definitions.len(), 1);
+        assert_eq!(export.definitions[0].identity.package, "pkg-a");
+        let report = item_report(&export, "pkg_a");
+        assert_eq!(report.status, ExtractionStatus::Skipped);
+        assert_eq!(report.freshness, ArtifactFreshness::Unknown);
+        assert_eq!(
+            report.reason.as_deref(),
+            Some("package outside requested item scope")
+        );
+    }
+
+    #[test]
+    fn disabled_library_docs_drop_cached_items_and_report_skip() {
+        let mut workspace = Workspace::new(&[("demo", "demo")]);
+        let args = fixture_args(&workspace);
+        refresh_fixture(&workspace, &args);
+        workspace.disable_docs("demo");
+        workspace.change_source("demo", "NewDefinition");
+        let (graph, export) = refresh_fixture(&workspace, &args);
+        assert!(!graph.nodes.iter().any(|node| node.id.starts_with("item__")));
+        assert!(export.definitions.is_empty());
+        let report = item_report(&export, "demo");
+        assert_eq!(report.status, ExtractionStatus::Skipped);
+        assert_eq!(report.freshness, ArtifactFreshness::Unknown);
+        assert_eq!(
+            report.reason.as_deref(),
+            Some("library documentation disabled")
+        );
+    }
 
     #[test]
     fn watch_skips_target_out_and_git() {
