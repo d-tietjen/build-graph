@@ -38,6 +38,7 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod export;
 pub mod fragment;
 pub mod graph;
 pub mod merge;

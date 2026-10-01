@@ -15,7 +15,17 @@ use camino::Utf8Path;
 use cargo_metadata::{Metadata, Package, Target};
 use rustdoc_types::{Attribute, Crate, Id, Item, ItemEnum, StructKind, Type, VariantKind};
 
+use build_graph::export::{
+    ArtifactFreshness, DefinitionIdentity, DefinitionRecord, DefinitionSpan, ExtractionStatus,
+    PackageReport, SourcePosition,
+};
 use build_graph::{Graph, Node, crate_id, item_id, norm};
+
+pub struct ItemLayerResult {
+    pub items: usize,
+    pub definitions: Vec<DefinitionRecord>,
+    pub packages: Vec<PackageReport>,
+}
 
 /// Run rustdoc JSON for the selected workspace libraries and add their items.
 pub fn add_item_layer(
@@ -26,12 +36,16 @@ pub fn add_item_layer(
     packages: &[String],
     release: bool,
     no_derives: bool,
-) -> Result<usize> {
+) -> Result<ItemLayerResult> {
     let toolchain = nightly.unwrap_or("nightly");
     let selected = select_lib_packages(meta, packages);
     if selected.is_empty() {
         eprintln!("[build-graph] rich layer: no library targets to document");
-        return Ok(0);
+        return Ok(ItemLayerResult {
+            items: 0,
+            definitions: Vec::new(),
+            packages: Vec::new(),
+        });
     }
 
     let workspace_crate_names: HashSet<String> = meta
@@ -45,19 +59,46 @@ pub fn add_item_layer(
     // workspace far better than one rustdoc invocation per crate.
     let n = selected.len();
     eprintln!("[build-graph] rich layer: documenting {n} crate(s) with {toolchain} (one pass)…");
-    run_doc_json(meta, target_dir, toolchain, packages, release)?;
+    let doc_succeeded = run_doc_json(meta, target_dir, toolchain, packages, release)?;
 
     let mut total = 0usize;
     let mut done = 0usize;
     let mut pending: Vec<Pending> = Vec::new();
+    let mut definitions = Vec::new();
+    let mut reports = Vec::new();
     for pkg in selected {
         match ingest_pkg(graph, target_dir, pkg, &workspace_crate_names, no_derives) {
-            Ok((added, refs)) => {
+            Ok((added, refs, records)) => {
                 total += added;
                 done += 1;
                 pending.extend(refs);
+                definitions.extend(records);
+                reports.push(PackageReport {
+                    package: pkg.name.clone(),
+                    status: if doc_succeeded {
+                        ExtractionStatus::Complete
+                    } else {
+                        ExtractionStatus::Partial
+                    },
+                    freshness: if doc_succeeded {
+                        ArtifactFreshness::Current
+                    } else {
+                        ArtifactFreshness::Unknown
+                    },
+                    reason: (!doc_succeeded).then(|| {
+                        "cargo doc failed; retained JSON may be from an earlier run".into()
+                    }),
+                });
             }
-            Err(e) => eprintln!("[build-graph] rich layer: skipped {} ({e:#})", pkg.name),
+            Err(e) => {
+                eprintln!("[build-graph] rich layer: skipped {} ({e:#})", pkg.name);
+                reports.push(PackageReport {
+                    package: pkg.name.clone(),
+                    status: ExtractionStatus::Partial,
+                    freshness: ArtifactFreshness::Unknown,
+                    reason: Some(format!("{e:#}")),
+                });
+            }
         }
     }
 
@@ -78,7 +119,11 @@ pub fn add_item_layer(
     eprintln!(
         "[build-graph] rich layer: +{total} item nodes from {done}/{n} crate(s), {cross} cross-crate edge(s)"
     );
-    Ok(total)
+    Ok(ItemLayerResult {
+        items: total,
+        definitions,
+        packages: reports,
+    })
 }
 
 pub fn is_lib_target(t: &Target) -> bool {
@@ -111,7 +156,7 @@ fn ingest_pkg(
     pkg: &Package,
     workspace_crate_names: &HashSet<String>,
     no_derives: bool,
-) -> Result<(usize, Vec<Pending>)> {
+) -> Result<(usize, Vec<Pending>, Vec<DefinitionRecord>)> {
     let json_path = target_dir
         .join("doc")
         .join(format!("{}.json", lib_crate_name(pkg)));
@@ -129,6 +174,12 @@ fn ingest_pkg(
             rustdoc_types::FORMAT_VERSION
         );
     }
+    if !matches!(
+        krate.index.get(&krate.root).map(|item| &item.inner),
+        Some(ItemEnum::Module(_))
+    ) {
+        bail!("rustdoc JSON {json_path} has no root module to extract");
+    }
 
     let mut ingest = Ingest::new(&krate, &pkg.name, workspace_crate_names.clone(), no_derives);
     ingest.run(&crate_id(&pkg.name));
@@ -142,7 +193,7 @@ fn run_doc_json(
     toolchain: &str,
     packages: &[String],
     release: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let manifest = meta.workspace_root.join("Cargo.toml");
     let mut cmd = Command::new("rustup");
     // `--document-private-items`: a code graph needs the *private* helpers too,
@@ -183,7 +234,7 @@ fn run_doc_json(
             "[build-graph] rich layer: doc build reported errors; ingesting crates that succeeded"
         );
     }
-    Ok(())
+    Ok(status.success())
 }
 
 struct EdgeSpec {
@@ -219,6 +270,7 @@ struct Ingest<'a> {
     workspace_crate_names: HashSet<String>,
     map: HashMap<Id, String>,
     nodes: Vec<Node>,
+    definitions: Vec<DefinitionRecord>,
     edges: Vec<EdgeSpec>,
     /// (owner type node id, impl item id) for the type pass.
     impls: Vec<(String, Id)>,
@@ -241,6 +293,7 @@ impl<'a> Ingest<'a> {
             workspace_crate_names,
             map: HashMap::new(),
             nodes: Vec::new(),
+            definitions: Vec::new(),
             edges: Vec::new(),
             impls: Vec::new(),
             pending: Vec::new(),
@@ -283,7 +336,18 @@ impl<'a> Ingest<'a> {
         let node_id = item_id(self.pkg, &my_path, kind);
         self.map.insert(id, node_id.clone());
 
-        let (file, line) = span_of(item);
+        let span = span_of(item);
+        let file = span.as_ref().map(|s| s.file.clone());
+        let line = span.as_ref().and_then(|s| u32::try_from(s.begin.line).ok());
+        self.definitions.push(DefinitionRecord {
+            graph_node_id: node_id.clone(),
+            identity: DefinitionIdentity {
+                package: self.pkg.to_string(),
+                def_path: my_path.clone(),
+                kind: kind.to_string(),
+            },
+            span,
+        });
         self.nodes.push(
             Node::new(node_id.clone(), name, kind)
                 .with_source(file, line)
@@ -489,7 +553,7 @@ impl<'a> Ingest<'a> {
 
     /// Apply collected nodes + local edges to the graph; return the number of
     /// new nodes and the deferred cross-crate references.
-    fn apply(self, graph: &mut Graph) -> (usize, Vec<Pending>) {
+    fn apply(self, graph: &mut Graph) -> (usize, Vec<Pending>, Vec<DefinitionRecord>) {
         let before = graph.node_count();
         for node in self.nodes {
             graph.add_node(node);
@@ -499,7 +563,7 @@ impl<'a> Ingest<'a> {
                 graph.add_edge(e.src, e.tgt, e.rel, None, None);
             }
         }
-        (graph.node_count() - before, self.pending)
+        (graph.node_count() - before, self.pending, self.definitions)
     }
 }
 
@@ -562,12 +626,45 @@ fn variant_fields(v: &rustdoc_types::Variant) -> Vec<Id> {
     }
 }
 
-fn span_of(item: &Item) -> (Option<String>, Option<u32>) {
-    match &item.span {
-        Some(span) => (
-            Some(span.filename.to_string_lossy().replace('\\', "/")),
-            Some(span.begin.0 as u32),
-        ),
-        None => (None, None),
+fn span_of(item: &Item) -> Option<DefinitionSpan> {
+    item.span.as_ref().map(definition_span)
+}
+
+fn definition_span(span: &rustdoc_types::Span) -> DefinitionSpan {
+    DefinitionSpan {
+        file: span.filename.to_string_lossy().replace('\\', "/"),
+        begin: SourcePosition {
+            line: span.begin.0,
+            column: span.begin.1,
+        },
+        end: SourcePosition {
+            line: span.end.0,
+            column: span.end.1,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_definition_span_is_retained() {
+        let span = rustdoc_types::Span {
+            filename: "src/lib.rs".into(),
+            begin: (2, 3),
+            end: (9, 17),
+        };
+        assert_eq!(
+            definition_span(&span),
+            DefinitionSpan {
+                file: "src/lib.rs".into(),
+                begin: SourcePosition { line: 2, column: 3 },
+                end: SourcePosition {
+                    line: 9,
+                    column: 17
+                },
+            }
+        );
     }
 }

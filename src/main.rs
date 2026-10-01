@@ -7,6 +7,7 @@ mod cargo_build;
 mod depinfo;
 #[cfg(feature = "rustc-driver")]
 mod driver_refs;
+mod export_sources;
 mod metadata;
 mod qserve;
 mod query;
@@ -17,9 +18,13 @@ mod serve;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
-use std::path::Path;
 
 use anyhow::{Context, Result, bail};
+use build_graph::export::{
+    ArtifactFreshness, CompilerArtifact, CompilerReport, CompilerStatus, EXPORT_SCHEMA_VERSION,
+    ExportManifest, ExtractionStatus, GraphArtifact, Layer, LayerReport, PackageReport,
+    content_fingerprint,
+};
 use build_graph::{Graph, GraphJson, norm};
 use camino::{Utf8Path, Utf8PathBuf};
 use clap::{Args, Parser, Subcommand};
@@ -286,7 +291,7 @@ fn main() -> Result<()> {
     match Cli::parse_from(args).cmd {
         Cmd::Build(a) => run_build(a),
         Cmd::Watch(w) => run_watch(w),
-        Cmd::Update(c) => run_extract(&c, &[]),
+        Cmd::Update(c) => run_extract(&c, None),
         Cmd::View(v) => run_view(v),
         Cmd::Find(f) => run_find(f),
         Cmd::Refs(r) => run_refs(r),
@@ -317,11 +322,11 @@ fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool)
             compiled.len(),
             changed
         );
-        compiled
+        Some(compiled)
     } else {
-        Vec::new()
+        None
     };
-    run_extract(common, &compiled)
+    run_extract(common, compiled.as_deref())
 }
 
 /// Watch the workspace and re-run the incremental refresh whenever a `.rs` or
@@ -428,7 +433,7 @@ fn workspace_fingerprint(root: &Utf8Path, excludes: &[std::path::PathBuf]) -> u6
     hasher.finish()
 }
 
-fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Result<()> {
+fn run_extract(c: &CommonArgs, compiled: Option<&[cargo_build::CompiledTarget]>) -> Result<()> {
     let manifest = c.manifest_path.as_ref().map(Utf8PathBuf::from);
     let meta = metadata::load(manifest.as_deref())?;
 
@@ -461,8 +466,17 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
         .map(|p| p.rich == rich && p.no_derives == c.no_derives && p.references == references)
         .unwrap_or(false)
         && existing.is_some();
+    let mut prior_export = None;
     let mut graph = match (compatible, &existing) {
-        (true, Some(p)) => load_graph(p).unwrap_or_default(),
+        (true, Some(path)) => match build_graph::output::read_graph(path) {
+            Ok(doc) => {
+                prior_export = build_graph::output::read_export(out.as_std_path())
+                    .ok()
+                    .filter(|manifest| manifest.matches_graph(&doc).unwrap_or(false));
+                Graph::load(doc)
+            }
+            Err(_) => Graph::new(),
+        },
         _ => Graph::new(),
     };
     let prior_crates = match (compatible, prior) {
@@ -473,6 +487,19 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
     // Fingerprint every crate by its sources' mtimes; dirty = changed/new.
     let depidx = depinfo::DepIndex::build(&target_dir, profiles);
     let ws_pkgs = meta.workspace_packages();
+    let sources: BTreeMap<_, _> = ws_pkgs
+        .iter()
+        .map(|pkg| {
+            let root = pkg
+                .manifest_path
+                .parent()
+                .unwrap_or(meta.workspace_root.as_path());
+            (
+                pkg.name.clone(),
+                export_sources::capture(root, &meta.workspace_root, &[&target_dir, &out]),
+            )
+        })
+        .collect();
     let mut current: BTreeMap<String, String> = BTreeMap::new();
     let mut dirty_sources: HashMap<String, Vec<depinfo::SourceFile>> = HashMap::new();
     for &pkg in &ws_pkgs {
@@ -486,12 +513,116 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
             &meta.workspace_root,
         );
         let fp = depinfo::fingerprint(&srcs);
-        if !compatible || prior_crates.get(&pkg.name) != Some(&fp) {
+        let export_reusable = prior_export.as_ref().is_some_and(|manifest| {
+            manifest.sources.get(&pkg.name) == sources.get(&pkg.name)
+                && sources
+                    .get(&pkg.name)
+                    .is_some_and(|snapshot| snapshot.complete)
+        });
+        let items_reusable = !rich
+            || prior_export.as_ref().is_some_and(|manifest| {
+                manifest
+                    .layers
+                    .iter()
+                    .find(|layer| layer.layer == Layer::Items)
+                    .and_then(|layer| {
+                        layer
+                            .packages
+                            .iter()
+                            .find(|report| report.package == pkg.name)
+                    })
+                    .is_some_and(|report| report.status == ExtractionStatus::Complete)
+            });
+        if !compatible
+            || prior_crates.get(&pkg.name) != Some(&fp)
+            || !export_reusable
+            || !items_reusable
+        {
             dirty_sources.insert(pkg.name.clone(), srcs);
         }
         current.insert(pkg.name.clone(), fp);
     }
     let dirty: HashSet<String> = dirty_sources.keys().cloned().collect();
+    let mut definitions = prior_export
+        .as_ref()
+        .map(|manifest| manifest.definitions.clone())
+        .unwrap_or_default();
+    definitions.retain(|record| {
+        !dirty.contains(&record.identity.package) && current.contains_key(&record.identity.package)
+    });
+    let want: HashSet<&str> = c.packages.iter().map(|s| s.as_str()).collect();
+    let mut item_reports: BTreeMap<String, PackageReport> = ws_pkgs
+        .iter()
+        .map(|pkg| {
+            let reason = if !rich {
+                Some("layer not requested")
+            } else if !want.is_empty() && !want.contains(pkg.name.as_str()) {
+                Some("package outside requested item scope")
+            } else if !pkg.targets.iter().any(rustdoc::is_lib_target) {
+                Some("no library target")
+            } else {
+                None
+            };
+            let mut report = if let Some(reason) = reason {
+                PackageReport {
+                    package: pkg.name.clone(),
+                    status: ExtractionStatus::Skipped,
+                    freshness: ArtifactFreshness::Unknown,
+                    reason: Some(reason.into()),
+                }
+            } else if !dirty.contains(&pkg.name) {
+                prior_export
+                    .as_ref()
+                    .and_then(|manifest| {
+                        manifest
+                            .layers
+                            .iter()
+                            .find(|layer| layer.layer == Layer::Items)
+                    })
+                    .and_then(|layer| {
+                        layer
+                            .packages
+                            .iter()
+                            .find(|report| report.package == pkg.name)
+                    })
+                    .cloned()
+                    .unwrap_or_else(|| PackageReport {
+                        package: pkg.name.clone(),
+                        status: ExtractionStatus::Partial,
+                        freshness: ArtifactFreshness::Unknown,
+                        reason: Some("cached items have no supported provenance".into()),
+                    })
+            } else {
+                PackageReport {
+                    package: pkg.name.clone(),
+                    status: ExtractionStatus::Partial,
+                    freshness: ArtifactFreshness::Unknown,
+                    reason: Some("items not extracted".into()),
+                }
+            };
+            if compiled.is_none()
+                && !dirty.contains(&pkg.name)
+                && report.status != ExtractionStatus::Skipped
+            {
+                report.status = ExtractionStatus::Partial;
+                report.freshness = ArtifactFreshness::Unknown;
+                report.reason = Some("cached items reused without a compiler run".into());
+            }
+            (pkg.name.clone(), report)
+        })
+        .collect();
+    let mut reference_report = LayerReport::from_packages(Layer::References, Vec::new());
+    reference_report.reason = Some(
+        if references {
+            "cached reference coverage is unknown"
+        } else {
+            "layer not requested"
+        }
+        .into(),
+    );
+    if references {
+        reference_report.status = ExtractionStatus::Partial;
+    }
     let removed: Vec<String> = prior_crates
         .keys()
         .filter(|k| !current.contains_key(*k))
@@ -519,7 +650,6 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
 
     // Layer 2: rich items, re-documenting only the dirty crates.
     if rich {
-        let want: HashSet<&str> = c.packages.iter().map(|s| s.as_str()).collect();
         let rich_dirty: Vec<String> = ws_pkgs
             .iter()
             .filter(|p| dirty.contains(&p.name))
@@ -531,7 +661,7 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
             eprintln!("[build-graph] layer 2: no changed crates to re-document");
         } else {
             let t2 = std::time::Instant::now();
-            let items = rustdoc::add_item_layer(
+            let result = rustdoc::add_item_layer(
                 &mut graph,
                 &meta,
                 &target_dir,
@@ -540,8 +670,13 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
                 c.release,
                 c.no_derives,
             )?;
+            definitions.extend(result.definitions);
+            for report in result.packages {
+                item_reports.insert(report.package.clone(), report);
+            }
             eprintln!(
-                "[build-graph] layer 2: +{items} item node(s) ({} crate(s), {:.1}s)",
+                "[build-graph] layer 2: +{} item node(s) ({} crate(s), {:.1}s)",
+                result.items,
                 rich_dirty.len(),
                 t2.elapsed().as_secs_f64()
             );
@@ -577,41 +712,127 @@ fn run_extract(c: &CommonArgs, _compiled: &[cargo_build::CompiledTarget]) -> Res
                 backend = "rust-analyzer";
             }
             match result {
-                Ok(counts) => eprintln!(
-                    "[build-graph] layer 3: +{} calls, +{} uses, +{} member_calls, +{} member_uses edge(s) ({backend}, {:.1}s)",
-                    counts.calls, counts.uses, counts.member_calls, counts.member_uses,
-                    t3.elapsed().as_secs_f64()
-                ),
-                Err(e) => eprintln!("[build-graph] layer 3: references skipped — {e:#}"),
+                Ok(counts) => {
+                    reference_report.status = ExtractionStatus::Partial;
+                    reference_report.reason = Some(format!(
+                        "{backend} completed; per-target reference coverage is not measured"
+                    ));
+                    eprintln!(
+                        "[build-graph] layer 3: +{} calls, +{} uses, +{} member_calls, +{} member_uses edge(s) ({backend}, {:.1}s)",
+                        counts.calls,
+                        counts.uses,
+                        counts.member_calls,
+                        counts.member_uses,
+                        t3.elapsed().as_secs_f64()
+                    );
+                }
+                Err(e) => {
+                    reference_report.status = ExtractionStatus::Skipped;
+                    reference_report.reason = Some(format!(
+                        "references skipped: {e:#}; retained reference artifacts have unknown freshness"
+                    ));
+                    eprintln!("[build-graph] layer 3: references skipped — {e:#}");
+                }
             }
         }
     }
 
     graph.prune_dangling_edges();
+    let mut source_reports = Vec::new();
+    for pkg in &ws_pkgs {
+        let root = pkg
+            .manifest_path
+            .parent()
+            .unwrap_or(meta.workspace_root.as_path());
+        let after = export_sources::capture(root, &meta.workspace_root, &[&target_dir, &out]);
+        let before = sources.get(&pkg.name);
+        let fully_observed = after.complete && before.is_some_and(|snapshot| snapshot.complete);
+        let stable = before == Some(&after) && fully_observed;
+        let freshness = if fully_observed && !stable {
+            ArtifactFreshness::Stale
+        } else {
+            ArtifactFreshness::Unknown
+        };
+        source_reports.push(PackageReport {
+            package: pkg.name.clone(),
+            status: ExtractionStatus::Partial,
+            freshness,
+            reason: Some(
+                if stable {
+                    "dep-info input coverage is not measured"
+                } else {
+                    "source set changed or could not be fully observed during extraction"
+                }
+                .into(),
+            ),
+        });
+        if !stable {
+            if let Some(report) = item_reports.get_mut(&pkg.name)
+                && report.status != ExtractionStatus::Skipped
+            {
+                report.status = ExtractionStatus::Partial;
+                report.freshness = freshness;
+                report.reason = Some(
+                    "source set changed or could not be fully observed during extraction".into(),
+                );
+            }
+            if references {
+                reference_report.status = ExtractionStatus::Partial;
+                reference_report.reason = Some(
+                    "source set changed or could not be fully observed during extraction".into(),
+                );
+            }
+        }
+    }
+    definitions.sort();
     let (nodes, edges) = (graph.node_count(), graph.edge_count());
-    let title = meta.workspace_root.file_name().unwrap_or("build-graph");
-    build_graph::output::write_graph_with_title(
-        out.as_std_path(),
-        &graph.into_doc(),
-        c.compress,
-        title,
-    )
-    .with_context(|| format!("writing graph to {out}"))?;
-    cache::Cache::new(rich, c.no_derives, references, current)
-        .save(cache_path.as_std_path())
-        .with_context(|| format!("writing cache to {cache_path}"))?;
+    let doc = graph.into_doc();
     let wrote = if c.compress {
         build_graph::output::GRAPH_JSON_GZ
     } else {
         build_graph::output::GRAPH_JSON
     };
+    let export = ExportManifest {
+        schema_version: EXPORT_SCHEMA_VERSION,
+        graph: GraphArtifact {
+            filename: wrote.into(),
+            content_fingerprint: content_fingerprint(&serde_json::to_vec(&doc)?),
+        },
+        compiler: CompilerReport {
+            status: if compiled.is_some() {
+                CompilerStatus::Succeeded
+            } else {
+                CompilerStatus::Unknown
+            },
+            artifacts: compiled
+                .unwrap_or(&[])
+                .iter()
+                .map(|artifact| CompilerArtifact {
+                    package_id: artifact.package_id.to_string(),
+                    target_name: artifact.target_name.clone(),
+                    fresh: artifact.fresh,
+                })
+                .collect(),
+        },
+        sources,
+        layers: vec![
+            LayerReport::from_packages(Layer::Sources, source_reports),
+            LayerReport::from_packages(Layer::Items, item_reports.into_values().collect()),
+            reference_report,
+        ],
+        definitions,
+    };
+    let title = meta.workspace_root.file_name().unwrap_or("build-graph");
+    build_graph::output::write_graph_with_title(out.as_std_path(), &doc, c.compress, title)
+        .with_context(|| format!("writing graph to {out}"))?;
+    build_graph::output::write_export(out.as_std_path(), &export)
+        .with_context(|| format!("writing export metadata to {out}"))?;
+    cache::Cache::new(rich, c.no_derives, references, current)
+        .save(cache_path.as_std_path())
+        .with_context(|| format!("writing cache to {cache_path}"))?;
     eprintln!("[build-graph] wrote {out}/{wrote} ({nodes} nodes, {edges} edges)");
     eprintln!("[build-graph] view: cargo build-graph view --out {out}");
     Ok(())
-}
-
-fn load_graph(path: &Path) -> Option<Graph> {
-    build_graph::output::read_graph(path).ok().map(Graph::load)
 }
 
 fn run_view(v: ViewArgs) -> Result<()> {

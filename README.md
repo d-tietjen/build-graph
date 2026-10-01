@@ -177,6 +177,8 @@ Artifacts are written to `target/build-graph/` by default:
 - `graph.json.gz` or `graph.json` - graphify-compatible data with deterministic
   IDs.
 - `graph.html` - the bundled offline viewer.
+- `graph-export.json` - versioned definition identities, full spans, and
+  extraction provenance from the CLI; see [export metadata](docs/export.md).
 - `GRAPH_REPORT.md` - counts, largest crates, and highly connected nodes.
 - `ARCHITECTURE.md` - optional generated architecture section, refreshed by the
   GitHub Action.
