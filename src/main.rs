@@ -4,6 +4,7 @@
 
 mod cache;
 mod cargo_build;
+mod compiler_observer;
 mod depinfo;
 #[cfg(feature = "rustc-driver")]
 mod driver_refs;
@@ -111,6 +112,12 @@ struct CommonArgs {
     /// Restrict extraction to these packages.
     #[arg(short = 'p', long = "package")]
     packages: Vec<String>,
+    /// Attach portable observations from this build's actual rustc invocations.
+    #[arg(long)]
+    observe_compiler_inputs: bool,
+    /// Additional approved input root: dependencies|host_tools|cargo_config=PATH.
+    #[arg(long, value_name = "NAME=PATH", requires = "observe_compiler_inputs")]
+    compiler_input_root: Vec<String>,
     /// Use the release profile.
     #[arg(long)]
     release: bool,
@@ -287,13 +294,21 @@ struct ViewArgs {
 fn main() -> Result<()> {
     // When invoked as `cargo build-graph …`, cargo passes "build-graph" as argv[1].
     let mut args: Vec<OsString> = std::env::args_os().collect();
+    if compiler_observer::is_wrapper(&args) {
+        std::process::exit(compiler_observer::wrapper(&args[1..]));
+    }
     if args.get(1).map(|s| s == "build-graph").unwrap_or(false) {
         args.remove(1);
     }
     match Cli::parse_from(args).cmd {
         Cmd::Build(a) => run_build(a),
         Cmd::Watch(w) => run_watch(w),
-        Cmd::Update(c) => run_extract(&c, None),
+        Cmd::Update(c) => {
+            if c.observe_compiler_inputs {
+                bail!("compiler observation requires an actual build");
+            }
+            run_extract(&c, None)
+        }
         Cmd::View(v) => run_view(v),
         Cmd::Find(f) => run_find(f),
         Cmd::Refs(r) => run_refs(r),
@@ -310,14 +325,31 @@ fn run_build(a: BuildArgs) -> Result<()> {
 /// from target/. Shared by `build` and the `watch` loop. Both the build and the
 /// extract are already incremental — only changed crates recompile/re-document.
 fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool) -> Result<()> {
+    if common.observe_compiler_inputs && !do_build {
+        bail!("compiler observation requires an actual build");
+    }
+    let mut observations = None;
     let compiled = if do_build {
         let manifest = common.manifest_path.as_ref().map(Utf8PathBuf::from);
+        let mut session = if common.observe_compiler_inputs {
+            let meta = metadata::load(manifest.as_deref())?;
+            let target = meta.target_directory.as_std_path().to_path_buf();
+            Some(compiler_observer::Session::new(
+                meta,
+                &target,
+                &common.compiler_input_root,
+            )?)
+        } else {
+            None
+        };
         let compiled = cargo_build::run_build(
             manifest.as_deref(),
             common.release,
             &common.packages,
             cargo_args,
+            session.as_mut(),
         )?;
+        observations = session.as_ref().map(compiler_observer::Session::finish);
         let changed = compiled.iter().filter(|t| t.changed()).count();
         eprintln!(
             "[build-graph] build ok: {} artifact(s), {} recompiled",
@@ -328,7 +360,15 @@ fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool)
     } else {
         None
     };
-    run_extract(common, compiled.as_deref())
+    let manifest = common.manifest_path.as_ref().map(Utf8PathBuf::from);
+    let meta = metadata::load(manifest.as_deref())?;
+    run_extract_observed(
+        common,
+        compiled.as_deref(),
+        meta,
+        rustdoc::add_item_layer,
+        observations,
+    )
 }
 
 /// Watch the workspace and re-run the incremental refresh whenever a `.rs` or
@@ -456,6 +496,16 @@ fn run_extract_with_item_layer(
     compiled: Option<&[cargo_build::CompiledTarget]>,
     meta: cargo_metadata::Metadata,
     extract_items: ItemLayerExtractor,
+) -> Result<()> {
+    run_extract_observed(c, compiled, meta, extract_items, None)
+}
+
+fn run_extract_observed(
+    c: &CommonArgs,
+    compiled: Option<&[cargo_build::CompiledTarget]>,
+    meta: cargo_metadata::Metadata,
+    extract_items: ItemLayerExtractor,
+    compiler_invocations: Option<build_graph::compiler_invocation::CompilerInvocationsV1>,
 ) -> Result<()> {
     let target_dir = c
         .target_dir
@@ -841,6 +891,7 @@ fn run_extract_with_item_layer(
                 })
                 .collect(),
         },
+        compiler_invocations,
         sources,
         layers: vec![
             LayerReport::from_packages(Layer::Sources, source_reports),

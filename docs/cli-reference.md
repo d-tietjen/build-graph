@@ -187,3 +187,18 @@ whole-workspace SCIP index. For incremental Layer 3 refreshes, use
   methods from the rich layer.
 - Without `--references` or `--driver`, body-level references (`calls`, `uses`,
   `member_calls`, `member_uses`) are not produced.
+
+## Observing compiler inputs
+
+```bash
+cargo build-graph build --observe-compiler-inputs
+cargo build-graph build --observe-compiler-inputs \
+  --compiler-input-root dependencies=/approved/dependencies -- --features selected
+```
+
+This stable opt-in observes the actual build's compiler invocations and attaches
+portable, bounded facts to `graph-export.json`. It does not need `rustc-driver`.
+Existing `RUSTC_WRAPPER` configurations must be removed or left unobserved;
+the CLI refuses to replace them. `update` and `watch --no-build` reject this flag.
+See [the observation contract](export.md#optional-compiler-observations) for root
+names, redaction, explicit gaps, budgets and compatibility.

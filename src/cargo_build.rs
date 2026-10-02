@@ -36,6 +36,7 @@ pub fn run_build(
     release: bool,
     packages: &[String],
     extra_args: &[String],
+    mut observation: Option<&mut crate::compiler_observer::Session>,
 ) -> Result<Vec<CompiledTarget>> {
     let mut cmd = Command::new("cargo");
     cmd.arg("build")
@@ -51,6 +52,9 @@ pub fn run_build(
     }
     cmd.args(extra_args);
     cmd.stdout(Stdio::piped());
+    if let Some(session) = observation.as_mut() {
+        session.configure(&mut cmd)?;
+    }
 
     let mut child = cmd.spawn().context("failed to spawn `cargo build`")?;
     let stdout = child
@@ -62,6 +66,13 @@ pub fn run_build(
     let mut compiled = Vec::new();
     for message in Message::parse_stream(reader) {
         let message = message.context("failed to read cargo message stream")?;
+        if let Some(session) = observation.as_mut() {
+            match &message {
+                Message::CompilerArtifact(artifact) => session.artifact(artifact),
+                Message::BuildScriptExecuted(script) => session.build_script(script),
+                _ => {}
+            }
+        }
         if let Message::CompilerArtifact(artifact) = message {
             compiled.push(CompiledTarget {
                 package_id: artifact.package_id,
