@@ -147,11 +147,22 @@ unavailable identity; no query retry is made.
 Budgets are 128 invocations/build scripts, 512 arguments per invocation,
 128 files/env entries per record, 4 KiB text, 32 KiB serialized invocation,
 8 MiB serialized attachment, 8 MiB per file and 32 MiB read bytes per phase.
+Each descriptor's initial size is reserved before reading; failed, short or
+unstable reads keep that charge. Compiler executable reads share the pre-build
+phase quota, and dep-info parsing rereads share the post-build quota. A growing
+file cannot add read work beyond its reserved size and is rejected as unstable.
 Oversized argument vectors emit only a bounded budget witness, without a
 truncated command/unit that could hide differing argument tails. Every dropped
 collection records `truncations` with `collection`, `observed`, `retained`, and
 `count_exact`; an inexact count is a lower bound. Oversized generated directory
 scopes drop that scope rather than retain an arbitrary enumeration subset.
+Cargo binding is checked against the invocation byte cap before admission.
+Aggregate admission counts JSON bytes without retaining a serialized copy;
+`assembled_invocations` and `assembled_generators` give exact observed/retained
+record counts when these size limits drop records. Space for loss witnesses is
+also counted, evicting additional records with updated counts when needed.
+Actual malformed records keep `malformed_observation` and do not discard valid
+records merely because another record is malformed.
 Malformed, stale, conflicting or oversized attachments reject through
 `CompilerInvocationsV1::from_json`/`validate` and the export read/write helpers.
 

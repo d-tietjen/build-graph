@@ -165,7 +165,7 @@ struct WatchArgs {
     /// Don't run `cargo build` each cycle — just re-extract from the current
     /// target/. Use when your editor/rust-analyzer already drives the build and
     /// you only want the graph to track what's already compiled.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "observe_compiler_inputs")]
     no_build: bool,
     /// Extra arguments forwarded to `cargo build` (after `--`).
     #[arg(last = true)]
@@ -376,6 +376,9 @@ fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool)
 /// unchanged crates, so a save only re-does the crate(s) you touched. The graph
 /// (and anything serving it) updates in place.
 fn run_watch(a: WatchArgs) -> Result<()> {
+    if a.no_build && a.common.observe_compiler_inputs {
+        bail!("compiler observation requires an actual build");
+    }
     let manifest = a.common.manifest_path.as_ref().map(Utf8PathBuf::from);
     let meta = metadata::load(manifest.as_deref())?;
     let root = meta.workspace_root.clone();
@@ -1152,6 +1155,32 @@ mod tests {
 
     use super::*;
     use crate::test_support::Workspace;
+
+    #[test]
+    fn watch_observation_conflict_is_rejected_by_clap() {
+        for args in [
+            [
+                "cargo-build-graph",
+                "watch",
+                "--no-build",
+                "--observe-compiler-inputs",
+            ],
+            [
+                "cargo-build-graph",
+                "watch",
+                "--observe-compiler-inputs",
+                "--no-build",
+            ],
+        ] {
+            let error = Cli::try_parse_from(args).err().expect("static conflict");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+        assert!(Cli::try_parse_from(["cargo-build-graph", "watch", "--no-build"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["cargo-build-graph", "watch", "--observe-compiler-inputs"])
+                .is_ok()
+        );
+    }
 
     fn fixture_items(
         graph: &mut Graph,

@@ -19,6 +19,34 @@ const FILE_BYTES: u64 = 8 * 1024 * 1024;
 const UNIT_READ_BYTES: u64 = 32 * 1024 * 1024;
 const QUERY_BYTES: usize = 16 * 1024;
 
+#[derive(Default)]
+struct QueryOutput {
+    bytes: Vec<u8>,
+    unavailable: bool,
+}
+
+impl QueryOutput {
+    fn retain(&mut self, bytes: &[u8]) {
+        let retained = bytes.len().min(QUERY_BYTES - self.bytes.len());
+        self.bytes.extend_from_slice(&bytes[..retained]);
+        self.unavailable |= retained < bytes.len();
+    }
+}
+
+fn read_reserved(reader: impl Read, bytes: u64) -> std::io::Result<Vec<u8>> {
+    let mut raw = Vec::new();
+    reader.take(bytes).read_to_end(&mut raw)?;
+    Ok(raw)
+}
+
+fn reserve_read(bytes: u64, maximum: u64, budget: &mut u64) -> Result<(), ObservationGap> {
+    if bytes > maximum || bytes > *budget {
+        return Err(ObservationGap::BudgetExceeded);
+    }
+    *budget -= bytes;
+    Ok(())
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct RootBinding {
     kind: InputRoot,
@@ -175,7 +203,7 @@ impl Session {
         if self.artifacts.len() < MAX_INVOCATIONS * 4
             && artifact.features.len() <= MAX_FILES
             && artifact.filenames.len() <= MAX_FILES
-            && serde_json::to_vec(artifact).is_ok_and(|v| v.len() <= MAX_INVOCATION_BYTES)
+            && bounded_json_size(artifact, MAX_INVOCATION_BYTES).is_ok()
         {
             self.artifacts.push(artifact.clone());
         }
@@ -188,34 +216,32 @@ impl Session {
             && script.cfgs.len() <= MAX_FILES
             && script.linked_libs.len() <= MAX_FILES
             && script.linked_paths.len() <= MAX_FILES
-            && serde_json::to_vec(script).is_ok_and(|v| v.len() <= MAX_INVOCATION_BYTES)
+            && bounded_json_size(script, MAX_INVOCATION_BYTES).is_ok()
         {
             self.scripts.push(script.clone());
         }
     }
 
     pub fn finish(&self) -> CompilerInvocationsV1 {
+        let mut budget = UNIT_READ_BYTES;
         let mut result = CompilerInvocationsV1 {
             schema_version: COMPILER_INVOCATIONS_VERSION,
-            cargo: tool_identity("cargo", &self.config.roots),
+            cargo: tool_identity("cargo", &self.config.roots, &mut budget),
             cargo_command: self.cargo_command.clone(),
             cargo_cwd: std::env::current_dir()
                 .ok()
                 .and_then(|p| normalized(&p, &self.config.roots)),
             cargo_environment: vec![],
-            wrapper: std::env::current_exe().ok().map(|path| {
-                let mut budget = UNIT_READ_BYTES;
-                ToolObservation {
-                    executable: Some(file_observation(
-                        &path,
-                        FileRole::Compiler,
-                        true,
-                        &self.config.roots,
-                        &mut budget,
-                    )),
-                    verbose_identity: BTreeMap::new(),
-                    gaps: vec![ObservationGap::UnobservedExecutionInputs],
-                }
+            wrapper: std::env::current_exe().ok().map(|path| ToolObservation {
+                executable: Some(file_observation(
+                    &path,
+                    FileRole::Compiler,
+                    true,
+                    &self.config.roots,
+                    &mut budget,
+                )),
+                verbose_identity: BTreeMap::new(),
+                gaps: vec![ObservationGap::UnobservedExecutionInputs],
             }),
             invocations: vec![],
             generators: vec![],
@@ -302,6 +328,7 @@ impl Session {
             result.gaps.push(ObservationGap::MalformedObservation);
         }
         let mut keys = BTreeSet::new();
+        let mut assembly = AssemblyBudget::new(&result);
         for path in paths.into_iter().take(MAX_INVOCATIONS) {
             let raw = match bounded_read(&path, MAX_INVOCATION_BYTES as u64) {
                 Ok(raw) => raw,
@@ -317,8 +344,7 @@ impl Session {
                     continue;
                 }
             };
-            if invocation.expected_unit_key().ok().as_deref() != Some(invocation.unit_key.as_str())
-            {
+            if invocation.validate().is_err() {
                 result.gaps.push(ObservationGap::MalformedObservation);
                 continue;
             }
@@ -352,10 +378,23 @@ impl Session {
                     ObservationGap::ConflictingUnit
                 });
             }
+            let Some(bytes) = assembly.admissible_size(
+                &invocation,
+                MAX_INVOCATION_BYTES,
+                !result.invocations.is_empty(),
+            ) else {
+                assembly.dropped_invocations += 1;
+                continue;
+            };
             if invocation.bind_unit_key().is_err() || !keys.insert(invocation.unit_key.clone()) {
                 result.gaps.push(ObservationGap::ConflictingUnit);
                 continue;
             }
+            if invocation.validate().is_err() {
+                result.gaps.push(ObservationGap::MalformedObservation);
+                continue;
+            }
+            assembly.bytes += bytes;
             result.invocations.push(invocation);
         }
         if self.artifacts.iter().any(|a| a.fresh) {
@@ -440,7 +479,7 @@ impl Session {
             ))
             .ok()
             .map(|b| content_fingerprint(&b));
-            result.generators.push(GeneratorObservation {
+            let generator = GeneratorObservation {
                 package: {
                     let matches: Vec<_> = self
                         .artifacts
@@ -477,7 +516,21 @@ impl Session {
                 .chain((!truncations.is_empty()).then_some(ObservationGap::BudgetExceeded))
                 .collect(),
                 truncations,
-            });
+            };
+            let Some(bytes) = assembly.admissible_size(
+                &generator,
+                MAX_ATTACHMENT_BYTES,
+                !result.generators.is_empty(),
+            ) else {
+                assembly.dropped_generators += 1;
+                continue;
+            };
+            if generator.validate().is_err() {
+                result.gaps.push(ObservationGap::MalformedObservation);
+                continue;
+            }
+            assembly.bytes += bytes;
+            result.generators.push(generator);
         }
         if !result.truncations.is_empty() {
             result.gaps.push(ObservationGap::BudgetExceeded);
@@ -493,12 +546,7 @@ impl Session {
             .sort_by(|a, b| a.collection.cmp(&b.collection));
         result.gaps.sort();
         result.gaps.dedup();
-        if result.validate().is_err() {
-            result.invocations.clear();
-            result.generators.clear();
-            result.gaps.push(ObservationGap::MalformedObservation);
-        }
-        result
+        assembly.finish(result)
     }
 
     fn cargo_unit(&self, artifact: &Artifact) -> CargoUnitObservation {
@@ -559,6 +607,144 @@ impl Drop for Session {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.config.directory);
     }
+}
+
+/// Charge the encoded empty arrays once, then each record and its comma. No
+/// oversized record is serialized into a Vec or retained in the attachment.
+struct AssemblyBudget {
+    bytes: usize,
+    dropped_invocations: u64,
+    dropped_generators: u64,
+}
+
+impl AssemblyBudget {
+    fn new(header: &CompilerInvocationsV1) -> Self {
+        Self {
+            bytes: bounded_json_size(header, MAX_ATTACHMENT_BYTES).unwrap_or(MAX_ATTACHMENT_BYTES),
+            dropped_invocations: 0,
+            dropped_generators: 0,
+        }
+    }
+
+    fn admissible_size(
+        &self,
+        record: &impl Serialize,
+        maximum: usize,
+        comma: bool,
+    ) -> Option<usize> {
+        let bytes = bounded_json_size(record, maximum)
+            .ok()?
+            .checked_add(usize::from(comma))?;
+        (bytes <= MAX_ATTACHMENT_BYTES.saturating_sub(self.bytes)).then_some(bytes)
+    }
+
+    fn losses(&self, result: &mut CompilerInvocationsV1) {
+        result.truncations.retain(|v| {
+            !matches!(
+                v.collection.as_str(),
+                "assembled_invocations" | "assembled_generators"
+            )
+        });
+        note_truncation(
+            &mut result.truncations,
+            "assembled_invocations",
+            result.invocations.len() as u64 + self.dropped_invocations,
+            result.invocations.len(),
+            true,
+        );
+        note_truncation(
+            &mut result.truncations,
+            "assembled_generators",
+            result.generators.len() as u64 + self.dropped_generators,
+            result.generators.len(),
+            true,
+        );
+        if !result.truncations.is_empty() {
+            result.gaps.push(ObservationGap::BudgetExceeded);
+        }
+        result.gaps.sort();
+        result.gaps.dedup();
+    }
+
+    fn finish(mut self, mut result: CompilerInvocationsV1) -> CompilerInvocationsV1 {
+        // Loss witnesses also occupy bytes. Evict records when necessary to
+        // fit those exact counts, rather than silently losing the attachment.
+        loop {
+            self.losses(&mut result);
+            if bounded_json_size(&result, MAX_ATTACHMENT_BYTES).is_ok() {
+                break;
+            }
+            if result.generators.pop().is_some() {
+                self.dropped_generators += 1;
+            } else if result.invocations.pop().is_some() {
+                self.dropped_invocations += 1;
+            } else {
+                note_truncation(
+                    &mut result.truncations,
+                    "attachment_metadata_bytes",
+                    (MAX_ATTACHMENT_BYTES + 1) as u64,
+                    0,
+                    false,
+                );
+                result.gaps.push(ObservationGap::BudgetExceeded);
+                return gap_attachment(result);
+            }
+        }
+        result
+            .truncations
+            .sort_by(|a, b| a.collection.cmp(&b.collection));
+        if result.validate().is_err() {
+            result.gaps.push(ObservationGap::MalformedObservation);
+            return gap_attachment(result);
+        }
+        result
+    }
+}
+
+fn gap_attachment(mut result: CompilerInvocationsV1) -> CompilerInvocationsV1 {
+    let observed = result.truncations.len();
+    result.truncations.retain(|v| {
+        v.observed > v.retained
+            && !v.collection.is_empty()
+            && v.collection.len() <= 64
+            && v.collection
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    });
+    result.truncations.truncate(MAX_FILES - 1);
+    for witness in &mut result.truncations {
+        if matches!(
+            witness.collection.as_str(),
+            "assembled_invocations" | "assembled_generators"
+        ) {
+            witness.retained = 0;
+        }
+    }
+    let retained = result.truncations.len();
+    note_truncation(
+        &mut result.truncations,
+        "budget_witnesses",
+        observed as u64,
+        retained,
+        true,
+    );
+    if !result.truncations.is_empty() {
+        result.gaps.push(ObservationGap::BudgetExceeded);
+    }
+    result.gaps.sort();
+    result.gaps.dedup();
+    result.cargo = ToolObservation {
+        executable: None,
+        verbose_identity: BTreeMap::new(),
+        gaps: vec![ObservationGap::CompilerIdentityUnavailable],
+    };
+    result.cargo_command = None;
+    result.cargo_cwd = None;
+    result.cargo_environment.clear();
+    result.wrapper = None;
+    result.invocations.clear();
+    result.generators.clear();
+    result
 }
 
 fn private_mode(path: &Path, mode: u32) -> std::io::Result<()> {
@@ -760,6 +946,7 @@ fn anchored_read(
     root: &RootBinding,
     relative: &Path,
     maximum: u64,
+    budget: &mut u64,
     after_open: impl FnOnce(),
 ) -> Result<(Vec<u8>, fs::Metadata), ObservationGap> {
     use std::os::unix::fs::MetadataExt;
@@ -796,15 +983,12 @@ fn anchored_read(
     {
         return Err(ObservationGap::UnstableFile);
     }
-    if start.len() > maximum {
-        return Err(ObservationGap::BudgetExceeded);
-    }
+    // Reserve the complete descriptor size before any read or test hook. A
+    // failed/short/unstable read never refunds work. Read only this size; the
+    // descriptor and named-chain rechecks reject growth without an extra byte.
+    reserve_read(start.len(), maximum, budget)?;
     after_open();
-    let mut raw = Vec::new();
-    (&file)
-        .take(maximum + 1)
-        .read_to_end(&mut raw)
-        .map_err(fail)?;
+    let raw = read_reserved(&file, start.len()).map_err(fail)?;
     let end = file.metadata().map_err(fail)?;
     // Reopen the complete chain from the named root and compare to every held
     // directory. An ancestor replacement cannot turn an outside read into an
@@ -850,6 +1034,7 @@ fn anchored_read(
     _: &RootBinding,
     _: &Path,
     _: u64,
+    _: &mut u64,
     _: impl FnOnce(),
 ) -> Result<(Vec<u8>, fs::Metadata), ObservationGap> {
     // Unsupported descriptor semantics are uncertainty, never a weaker read.
@@ -860,10 +1045,11 @@ fn observed_bytes(
     path: &Path,
     roots: &[RootBinding],
     maximum: u64,
+    budget: &mut u64,
 ) -> Result<(ObservedPath, Vec<u8>, fs::Metadata), ObservationGap> {
     let (portable, root, relative) =
         lexical_binding(path, roots).ok_or(ObservationGap::PathOutsideRoots)?;
-    let (bytes, metadata) = anchored_read(&root, &relative, maximum, || {})?;
+    let (bytes, metadata) = anchored_read(&root, &relative, maximum, budget, || {})?;
     Ok((portable, bytes, metadata))
 }
 
@@ -881,9 +1067,8 @@ fn file_observation(
         after: None,
         gaps: vec![],
     };
-    match observed_bytes(path, roots, FILE_BYTES.min(*budget)) {
+    match observed_bytes(path, roots, FILE_BYTES, budget) {
         Ok((_, bytes, metadata)) => {
-            *budget = budget.saturating_sub(bytes.len() as u64);
             #[cfg(unix)]
             let mode = {
                 use std::os::unix::fs::MetadataExt;
@@ -1065,7 +1250,7 @@ fn query(program: &Path, args: &[&str]) -> Option<String> {
         }
         return None;
     }
-    let mut bytes = Vec::new();
+    let mut output = QueryOutput::default();
     let mut eof = false;
     let mut cancelled = false;
     let mut status = None;
@@ -1074,11 +1259,11 @@ fn query(program: &Path, args: &[&str]) -> Option<String> {
             let mut buffer = [0u8; 1024];
             match pipe.read(&mut buffer) {
                 Ok(0) => eof = true,
-                Ok(count) => bytes.extend_from_slice(&buffer[..count]),
+                Ok(count) => output.retain(&buffer[..count]),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(_) => {
                     eof = true;
-                    bytes.resize(QUERY_BYTES + 1, 0);
+                    output.unavailable = true;
                 }
             }
         }
@@ -1095,7 +1280,7 @@ fn query(program: &Path, args: &[&str]) -> Option<String> {
             })
             .unwrap_or(false);
         if !cancelled
-            && (exited || bytes.len() > QUERY_BYTES || std::time::Instant::now() >= work_deadline)
+            && (exited || output.unavailable || std::time::Instant::now() >= work_deadline)
         {
             cancelled = true;
             let _ = linux_owned::signal_group(pid, 9);
@@ -1116,10 +1301,10 @@ fn query(program: &Path, args: &[&str]) -> Option<String> {
     // qualification more conservative if the old group number was recycled.
     let group_absent =
         linux_owned::signal_group(pid, 0).is_err_and(|e| e.raw_os_error() == Some(3));
-    if !eof || !group_absent || bytes.len() > QUERY_BYTES || !status?.success() {
+    if !eof || !group_absent || output.unavailable || !status?.success() {
         return None;
     }
-    String::from_utf8(bytes).ok()
+    String::from_utf8(output.bytes).ok()
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1127,7 +1312,7 @@ fn query(_: &Path, _: &[&str]) -> Option<String> {
     None
 }
 
-fn tool_identity(program: &str, roots: &[RootBinding]) -> ToolObservation {
+fn tool_identity(program: &str, roots: &[RootBinding], budget: &mut u64) -> ToolObservation {
     let mut result = ToolObservation {
         executable: None,
         verbose_identity: BTreeMap::new(),
@@ -1139,13 +1324,12 @@ fn tool_identity(program: &str, roots: &[RootBinding]) -> ToolObservation {
             .push(ObservationGap::CompilerIdentityUnavailable);
         return result;
     };
-    let mut budget = UNIT_READ_BYTES;
     result.executable = Some(file_observation(
         &path,
         FileRole::Compiler,
         true,
         &roots,
-        &mut budget,
+        budget,
     ));
     if let Some(text) = query(Path::new(program), &["-vV"]) {
         for line in text.lines() {
@@ -1173,7 +1357,38 @@ fn tool_identity(program: &str, roots: &[RootBinding]) -> ToolObservation {
 }
 
 pub fn is_wrapper(args: &[OsString]) -> bool {
-    std::env::var_os(CONFIG_ENV).is_some() && args.get(1).is_some_and(|arg| arg != "build-graph")
+    std::env::var_os(CONFIG_ENV).is_some()
+        && args.get(1..).and_then(wrapper_compiler_index).is_some()
+}
+
+fn wrapper_compiler_index(command: &[OsString]) -> Option<usize> {
+    if command
+        .first()
+        .and_then(|arg| arg.to_str())
+        .is_some_and(|arg| {
+            arg.starts_with('-')
+                || matches!(
+                    arg,
+                    "build"
+                        | "watch"
+                        | "update"
+                        | "find"
+                        | "refs"
+                        | "context"
+                        | "view"
+                        | "serve"
+                        | "build-graph"
+                        | "help"
+                )
+        })
+    {
+        return None;
+    }
+    command.iter().take(2).position(|arg| {
+        Path::new(arg)
+            .file_stem()
+            .is_some_and(|name| name == "rustc")
+    })
 }
 
 /// Delegation uses the original OsString vector, never the normalized export.
@@ -1186,11 +1401,7 @@ pub fn wrapper(args: &[OsString]) -> i32 {
         .and_then(|path| bounded_read(Path::new(&path), MAX_ATTACHMENT_BYTES as u64).ok())
         .and_then(|bytes| serde_json::from_slice::<Config>(&bytes).ok());
     // Cargo can nest RUSTC_WORKSPACE_WRAPPER outside the actual rustc path.
-    let compiler_index = usize::from(args.get(1).is_some_and(|arg| {
-        Path::new(arg)
-            .file_stem()
-            .is_some_and(|name| name == "rustc")
-    }));
+    let compiler_index = wrapper_compiler_index(args).unwrap_or(0);
     let rustc_args = args.get(compiler_index + 1..).unwrap_or_default();
     let capture = config
         .as_ref()
@@ -1234,44 +1445,46 @@ pub fn wrapper(args: &[OsString]) -> i32 {
                     file_observation(path, FileRole::DepInfo, false, &roots, &mut budget);
                 dep_seen |= dep_info.after.is_some();
                 invocation.inputs.push(dep_info);
-                if let Ok((_, raw, _)) = observed_bytes(path, &roots, FILE_BYTES.min(budget)) {
-                    budget = budget.saturating_sub(raw.len() as u64);
-                    if let Ok(text) = String::from_utf8(raw) {
-                        let (paths, limited) = dep_inputs(&text);
-                        if limited {
-                            note_truncation(
-                                &mut invocation.truncations,
-                                "dep_info_membership",
-                                (MAX_FILES + 1) as u64,
-                                MAX_FILES,
-                                false,
-                            );
-                        }
-                        for path in paths.into_iter().take(MAX_FILES) {
-                            let path = PathBuf::from(path);
-                            if invocation
-                                .inputs
-                                .iter()
-                                .any(|input| input.path == normalized(&path, &roots))
-                            {
-                                continue;
+                match observed_bytes(path, &roots, FILE_BYTES, &mut budget) {
+                    Ok((_, raw, _)) => {
+                        if let Ok(text) = String::from_utf8(raw) {
+                            let (paths, limited) = dep_inputs(&text);
+                            if limited {
+                                note_truncation(
+                                    &mut invocation.truncations,
+                                    "dep_info_membership",
+                                    (MAX_FILES + 1) as u64,
+                                    MAX_FILES,
+                                    false,
+                                );
                             }
-                            let mut input = file_observation(
-                                &path,
-                                FileRole::Source,
-                                false,
-                                &roots,
-                                &mut budget,
-                            );
-                            input.gaps.push(ObservationGap::InputObservedOnlyAfter);
-                            invocation.inputs.push(input);
+                            for path in paths.into_iter().take(MAX_FILES) {
+                                let path = PathBuf::from(path);
+                                if invocation
+                                    .inputs
+                                    .iter()
+                                    .any(|input| input.path == normalized(&path, &roots))
+                                {
+                                    continue;
+                                }
+                                let mut input = file_observation(
+                                    &path,
+                                    FileRole::Source,
+                                    false,
+                                    &roots,
+                                    &mut budget,
+                                );
+                                input.gaps.push(ObservationGap::InputObservedOnlyAfter);
+                                invocation.inputs.push(input);
+                            }
+                            if text.lines().any(|line| line.starts_with("# env-dep:")) {
+                                invocation.gaps.push(ObservationGap::EnvironmentWithheld);
+                            }
+                        } else {
+                            invocation.gaps.push(ObservationGap::NonUtf8);
                         }
-                        if text.lines().any(|line| line.starts_with("# env-dep:")) {
-                            invocation.gaps.push(ObservationGap::EnvironmentWithheld);
-                        }
-                    } else {
-                        invocation.gaps.push(ObservationGap::NonUtf8);
                     }
+                    Err(gap) => invocation.gaps.push(gap),
                 }
             }
         }
@@ -1300,8 +1513,8 @@ pub fn wrapper(args: &[OsString]) -> i32 {
         invocation.gaps.sort();
         invocation.gaps.dedup();
         let _ = invocation.bind_unit_key();
-        if let Ok(bytes) = serde_json::to_vec(&invocation)
-            && bytes.len() <= MAX_INVOCATION_BYTES
+        if bounded_json_size(&invocation, MAX_INVOCATION_BYTES).is_ok()
+            && let Ok(bytes) = serde_json::to_vec(&invocation)
         {
             let path = config.directory.join(format!("unit-{slot}.json"));
             if exclusive_write(&path, &bytes).is_err() {
@@ -1519,7 +1732,7 @@ fn prepare(
     config_files.truncate(MAX_FILES);
     let environment = environment(&roots, "compiler_environment", &mut truncations);
     let normalized_command = normalize_command(command, &roots);
-    let compiler_identity = tool_identity(program, &roots);
+    let compiler_identity = tool_identity(program, &roots, &mut budget);
     let target_triple = option(&text, "--target")
         .filter(|s| identifier(s))
         .map(str::to_owned)
@@ -2153,19 +2366,34 @@ mod tests {
         let workspace = Workspace::new(&[("demo", "demo_lib")]);
         let root = RootBinding::new(InputRoot::Source, workspace.root.as_std_path()).expect("root");
         let file = workspace.root.join("demo/src/lib.rs");
-        let result = anchored_read(&root, Path::new("demo/src/lib.rs"), FILE_BYTES, || {
-            fs::rename(&file, file.with_extension("old")).expect("replace leaf");
-            symlink("/etc/passwd", &file).expect("outside symlink");
-        });
+        let mut budget = UNIT_READ_BYTES;
+        let result = anchored_read(
+            &root,
+            Path::new("demo/src/lib.rs"),
+            FILE_BYTES,
+            &mut budget,
+            || {
+                fs::rename(&file, file.with_extension("old")).expect("replace leaf");
+                symlink("/etc/passwd", &file).expect("outside symlink");
+            },
+        );
         assert!(result.is_err());
         fs::remove_file(&file).expect("remove alias");
         fs::write(&file, "original").expect("restore");
         let directory = workspace.root.join("demo/src");
-        let result = anchored_read(&root, Path::new("demo/src/lib.rs"), FILE_BYTES, || {
-            fs::rename(&directory, workspace.root.join("demo/held-src")).expect("move ancestor");
-            fs::create_dir(&directory).expect("replace ancestor");
-            fs::write(directory.join("lib.rs"), "outside replacement").expect("replacement file");
-        });
+        let result = anchored_read(
+            &root,
+            Path::new("demo/src/lib.rs"),
+            FILE_BYTES,
+            &mut budget,
+            || {
+                fs::rename(&directory, workspace.root.join("demo/held-src"))
+                    .expect("move ancestor");
+                fs::create_dir(&directory).expect("replace ancestor");
+                fs::write(directory.join("lib.rs"), "outside replacement")
+                    .expect("replacement file");
+            },
+        );
         assert!(result.is_err());
         let mut budget = UNIT_READ_BYTES;
         symlink("/etc/passwd", workspace.root.join("outside.rs")).expect("outside leaf");
@@ -2213,7 +2441,7 @@ mod tests {
     fn query_deadline_covers_closed_stdout_overflow_and_descendant_pipe() {
         for source in [
             "exec 1>&-; sleep 30",
-            "head -c 20000 /dev/zero; sleep 30",
+            "head -c 1048576 /dev/zero; sleep 30",
             "sleep 30 & printf 'host: fixture\\n'; exit 0",
         ] {
             let start = std::time::Instant::now();
@@ -2248,5 +2476,341 @@ mod tests {
             .parse()
             .expect("PID");
         assert!(linux_owned::signal_group(pid, 0).is_err_and(|e| e.raw_os_error() == Some(3)));
+    }
+
+    fn attachment() -> CompilerInvocationsV1 {
+        CompilerInvocationsV1 {
+            schema_version: COMPILER_INVOCATIONS_VERSION,
+            cargo: ToolObservation {
+                executable: None,
+                verbose_identity: BTreeMap::new(),
+                gaps: vec![],
+            },
+            cargo_command: None,
+            cargo_cwd: None,
+            cargo_environment: vec![],
+            wrapper: None,
+            invocations: vec![],
+            generators: vec![],
+            gaps: vec![ObservationGap::UnobservedExecutionInputs],
+            truncations: vec![],
+        }
+    }
+
+    fn sized_invocation(bytes: usize) -> CompilerInvocation {
+        let mut record = invocation();
+        record.command.extend((0..8).map(|_| token("")));
+        let mut padding = bytes - bounded_json_size(&record, bytes).expect("base invocation");
+        for argument in record.command.iter_mut().skip(2) {
+            let length = padding.min(MAX_TEXT_BYTES);
+            argument.token = Some("x".repeat(length));
+            padding -= length;
+        }
+        assert_eq!(padding, 0);
+        record.bind_unit_key().expect("padded key");
+        assert_eq!(
+            bounded_json_size(&record, bytes).expect("exact record"),
+            bytes
+        );
+        record.validate().expect("valid padded record");
+        record
+    }
+
+    fn sized_generator(bytes: usize) -> GeneratorObservation {
+        let mut record = GeneratorObservation {
+            package: None,
+            out_dir: None,
+            command: None,
+            inputs: vec![],
+            outputs: vec![
+                FileObservation {
+                    path: Some(ObservedPath {
+                        root: InputRoot::Target,
+                        relative: String::new()
+                    }),
+                    role: FileRole::Generated,
+                    before: None,
+                    after: None,
+                    gaps: vec![ObservationGap::ReadFailed],
+                };
+                MAX_FILES
+            ],
+            environment: vec![],
+            directive_fingerprint: None,
+            gaps: vec![ObservationGap::GeneratorInputsNotObserved],
+            truncations: vec![],
+        };
+        let mut padding = bytes - bounded_json_size(&record, bytes).expect("base generator");
+        for file in &mut record.outputs {
+            let length = padding.min(MAX_TEXT_BYTES);
+            file.path.as_mut().expect("path").relative = "x".repeat(length);
+            padding -= length;
+        }
+        assert_eq!(padding, 0);
+        record.validate().expect("valid padded generator");
+        assert_eq!(
+            bounded_json_size(&record, bytes).expect("exact generator"),
+            bytes
+        );
+        record
+    }
+
+    #[test]
+    fn query_retention_discards_all_bytes_after_the_exact_cap() {
+        let mut output = QueryOutput::default();
+        for _ in 0..QUERY_BYTES / 1024 {
+            output.retain(&[b'x'; 1024]);
+        }
+        assert_eq!(output.bytes.len(), QUERY_BYTES);
+        assert!(!output.unavailable);
+        for _ in 0..1024 {
+            output.retain(&[b'y'; 1024]);
+            assert_eq!(output.bytes.len(), QUERY_BYTES);
+        }
+        assert!(output.unavailable);
+        assert!(output.bytes.iter().all(|byte| *byte == b'x'));
+    }
+
+    #[test]
+    fn wrapper_shape_preserves_direct_cli_and_nested_compiler_arguments() {
+        for command in [
+            "build",
+            "watch",
+            "update",
+            "find",
+            "refs",
+            "context",
+            "view",
+            "serve",
+            "build-graph",
+            "--help",
+            "--version",
+        ] {
+            let args = [OsString::from(command), OsString::from("--help")];
+            assert_eq!(wrapper_compiler_index(&args), None);
+            assert_eq!(
+                wrapper_compiler_index(&[command.into(), "rustc".into()]),
+                None
+            );
+        }
+        assert_eq!(
+            wrapper_compiler_index(&["/toolchain/bin/rustc".into(), "-vV".into()]),
+            Some(0)
+        );
+        assert_eq!(
+            wrapper_compiler_index(&[
+                "/tools/workspace-wrapper".into(),
+                "/toolchain/bin/rustc".into(),
+                "--crate-name".into(),
+                "demo".into()
+            ]),
+            Some(1)
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn failed_and_unstable_reads_spend_quota_and_compiler_shares_it() {
+        struct PartialFailure(bool);
+        impl Read for PartialFailure {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if self.0 {
+                    return Err(std::io::Error::other("fixture partial failure"));
+                }
+                self.0 = true;
+                bytes[0] = b'x';
+                Ok(1)
+            }
+        }
+        let mut budget = 8;
+        reserve_read(8, FILE_BYTES, &mut budget).expect("read reservation");
+        assert!(read_reserved(PartialFailure(false), 8).is_err());
+        assert_eq!(budget, 0, "partial failure cannot refund admitted work");
+        assert_eq!(
+            reserve_read(1, FILE_BYTES, &mut budget),
+            Err(ObservationGap::BudgetExceeded)
+        );
+
+        let workspace = Workspace::new(&[("demo", "demo_lib")]);
+        let root = RootBinding::new(InputRoot::Source, workspace.root.as_std_path()).expect("root");
+        let path = workspace.root.join("demo/src/lib.rs");
+        let mut budget = UNIT_READ_BYTES;
+        for _ in 0..4 {
+            fs::write(&path, vec![b'x'; FILE_BYTES as usize]).expect("large source");
+            let read = anchored_read(
+                &root,
+                Path::new("demo/src/lib.rs"),
+                FILE_BYTES,
+                &mut budget,
+                || {
+                    fs::write(&path, b"changed").expect("unstable source");
+                },
+            );
+            assert_eq!(read.err(), Some(ObservationGap::UnstableFile));
+        }
+        assert_eq!(budget, 0);
+        let read = file_observation(
+            path.as_std_path(),
+            FileRole::Source,
+            true,
+            &[root.clone()],
+            &mut budget,
+        );
+        assert_eq!(read.gaps, [ObservationGap::BudgetExceeded]);
+        assert!(read.before.is_none());
+
+        let compiler = workspace.root.join("rustc");
+        fs::write(&compiler, b"compiler fixture").expect("compiler source");
+        let identity = tool_identity(compiler.as_str(), &[root], &mut budget);
+        let executable = identity.executable.expect("compiler observation");
+        assert!(executable.before.is_none());
+        assert_eq!(executable.gaps, [ObservationGap::BudgetExceeded]);
+        assert_eq!(budget, 0, "compiler cannot create a fresh phase quota");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_reservation_preserves_empty_exact_and_over_budget_boundaries() {
+        let workspace = Workspace::new(&[("demo", "demo_lib")]);
+        let root = RootBinding::new(InputRoot::Source, workspace.root.as_std_path()).expect("root");
+        let path = workspace.root.join("demo/src/lib.rs");
+        fs::write(&path, b"").expect("empty source");
+        let empty = file_observation(
+            path.as_std_path(),
+            FileRole::Source,
+            true,
+            &[root.clone()],
+            &mut 0,
+        );
+        assert_eq!(empty.before.expect("zero byte read").bytes, 0);
+        fs::write(&path, b"exact").expect("source");
+        let mut budget = 5;
+        let exact = observed_bytes(path.as_std_path(), &[root.clone()], FILE_BYTES, &mut budget)
+            .expect("exact admitted read");
+        assert_eq!(exact.1, b"exact");
+        assert_eq!(budget, 0);
+        assert_eq!(
+            observed_bytes(path.as_std_path(), &[root.clone()], FILE_BYTES, &mut budget).err(),
+            Some(ObservationGap::BudgetExceeded)
+        );
+        let mut budget = 4;
+        assert_eq!(
+            observed_bytes(path.as_std_path(), &[root], FILE_BYTES, &mut budget).err(),
+            Some(ObservationGap::BudgetExceeded)
+        );
+        assert_eq!(budget, 4, "a denied read performs no read work");
+    }
+
+    #[test]
+    fn cargo_join_size_loss_keeps_exact_count_and_budget_gap() {
+        let workspace = Workspace::new(&[("demo", "demo_lib")]);
+        let mut session = session(&workspace);
+        let record = sized_invocation(MAX_INVOCATION_BYTES - 1);
+        exclusive_write(
+            &session.config.directory.join("unit-0.json"),
+            &serde_json::to_vec(&record).expect("record JSON"),
+        )
+        .expect("record");
+        session.artifact(&artifact(&workspace, false));
+        let result = session.finish();
+        result.validate().expect("bounded gap attachment");
+        assert!(result.invocations.is_empty());
+        assert!(result.gaps.contains(&ObservationGap::BudgetExceeded));
+        assert!(!result.gaps.contains(&ObservationGap::MalformedObservation));
+        let witness = result
+            .truncations
+            .iter()
+            .find(|v| v.collection == "assembled_invocations")
+            .expect("joined record loss");
+        assert_eq!(
+            (witness.observed, witness.retained, witness.count_exact),
+            (1, 0, true)
+        );
+    }
+
+    #[test]
+    fn exact_record_and_aggregate_limits_preserve_facts_and_account_for_overflow() {
+        let mut result = attachment();
+        let mut budget = AssemblyBudget::new(&result);
+        let record = sized_invocation(MAX_INVOCATION_BYTES);
+        let bytes = budget
+            .admissible_size(&record, MAX_INVOCATION_BYTES, false)
+            .expect("exact record limit");
+        budget.bytes += bytes;
+        result.invocations.push(record);
+        let result = budget.finish(result);
+        assert_eq!(result.invocations.len(), 1);
+        assert!(result.truncations.is_empty());
+
+        let mut result = attachment();
+        let mut budget = AssemblyBudget::new(&result);
+        for _ in 0..15 {
+            let record = sized_generator(512 * 1024);
+            let bytes = budget
+                .admissible_size(&record, MAX_ATTACHMENT_BYTES, !result.generators.is_empty())
+                .expect("generator fits");
+            budget.bytes += bytes;
+            result.generators.push(record);
+        }
+        let record = sized_generator(MAX_ATTACHMENT_BYTES - budget.bytes - 1);
+        let bytes = budget
+            .admissible_size(&record, MAX_ATTACHMENT_BYTES, true)
+            .expect("exact aggregate boundary");
+        budget.bytes += bytes;
+        result.generators.push(record);
+        assert_eq!(budget.bytes, MAX_ATTACHMENT_BYTES);
+        let exact = budget.finish(result);
+        exact.validate().expect("valid exact aggregate");
+        assert_eq!(
+            bounded_json_size(&exact, MAX_ATTACHMENT_BYTES).expect("bounded exact aggregate"),
+            MAX_ATTACHMENT_BYTES
+        );
+        assert_eq!(exact.generators.len(), 16);
+        assert!(exact.truncations.is_empty());
+
+        let mut budget = AssemblyBudget::new(&exact);
+        assert!(
+            budget
+                .admissible_size(&sized_generator(512 * 1024), MAX_ATTACHMENT_BYTES, true)
+                .is_none()
+        );
+        budget.dropped_generators = 1;
+        let bounded = budget.finish(exact);
+        bounded.validate().expect("bounded overflow attachment");
+        assert!(bounded.gaps.contains(&ObservationGap::BudgetExceeded));
+        assert!(!bounded.gaps.contains(&ObservationGap::MalformedObservation));
+        let witness = bounded
+            .truncations
+            .iter()
+            .find(|v| v.collection == "assembled_generators")
+            .expect("aggregate loss count");
+        assert_eq!(witness.observed, 17);
+        assert_eq!(witness.retained, bounded.generators.len() as u64);
+        assert!(witness.count_exact && witness.retained < 16);
+        assert!(bounded_json_size(&bounded, MAX_ATTACHMENT_BYTES).is_ok());
+    }
+
+    #[test]
+    fn malformed_record_does_not_discard_other_valid_records() {
+        let workspace = Workspace::new(&[("demo", "demo_lib")]);
+        let session = session(&workspace);
+        exclusive_write(
+            &session.config.directory.join("unit-0.json"),
+            &serde_json::to_vec(&invocation()).expect("record"),
+        )
+        .expect("unit");
+        let mut malformed = invocation();
+        malformed.command[0].token = Some("/invalid/host-path".into());
+        malformed.bind_unit_key().expect("malformed key");
+        exclusive_write(
+            &session.config.directory.join("unit-1.json"),
+            &serde_json::to_vec(&malformed).expect("record"),
+        )
+        .expect("unit");
+        let result = session.finish();
+        result.validate().expect("valid partial result");
+        assert_eq!(result.invocations.len(), 1);
+        assert!(result.gaps.contains(&ObservationGap::MalformedObservation));
+        assert!(!result.gaps.contains(&ObservationGap::BudgetExceeded));
     }
 }

@@ -5,6 +5,7 @@
 //! bytes, roots, toolchains and any execution inputs this observer cannot see.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,47 @@ pub const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ARGUMENTS: usize = 512;
 pub const MAX_FILES: usize = 128;
 pub const MAX_TEXT_BYTES: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationSizeError {
+    BudgetExceeded,
+    SerializationFailed,
+}
+
+/// Count JSON bytes without allocating a serialized copy, stopping at the cap.
+pub fn bounded_json_size(
+    value: &impl Serialize,
+    maximum: usize,
+) -> Result<usize, ObservationSizeError> {
+    struct Counter {
+        bytes: usize,
+        maximum: usize,
+        exceeded: bool,
+    }
+    impl Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.maximum.saturating_sub(self.bytes) {
+                self.exceeded = true;
+                return Err(std::io::Error::other("observation budget exceeded"));
+            }
+            self.bytes += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter {
+        bytes: 0,
+        maximum,
+        exceeded: false,
+    };
+    match serde_json::to_writer(&mut counter, value) {
+        Ok(()) => Ok(counter.bytes),
+        Err(_) if counter.exceeded => Err(ObservationSizeError::BudgetExceeded),
+        Err(_) => Err(ObservationSizeError::SerializationFailed),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -248,7 +290,6 @@ pub struct CompilerInvocationsV1 {
     pub generators: Vec<GeneratorObservation>,
     pub gaps: Vec<ObservationGap>,
     pub truncations: Vec<CollectionTruncation>,
-    pub truncations: Vec<CollectionTruncation>,
 }
 
 impl CompilerInvocationsV1 {
@@ -271,11 +312,14 @@ impl CompilerInvocationsV1 {
         {
             return Err("unsupported or oversized compiler observations".into());
         }
-        let raw = serde_json::to_vec(self)
-            .map_err(|_| "compiler observations could not be serialized".to_string())?;
-        if raw.len() > MAX_ATTACHMENT_BYTES {
-            return Err("compiler observation attachment exceeds budget".into());
-        }
+        bounded_json_size(self, MAX_ATTACHMENT_BYTES).map_err(|error| match error {
+            ObservationSizeError::BudgetExceeded => {
+                "compiler observation attachment exceeds budget"
+            }
+            ObservationSizeError::SerializationFailed => {
+                "compiler observations could not be serialized"
+            }
+        })?;
         validate_portable_values(
             &serde_json::to_value(self)
                 .map_err(|_| "compiler observations could not be serialized".to_string())?,
@@ -292,85 +336,110 @@ impl CompilerInvocationsV1 {
         validate_environment(&self.cargo_environment)?;
         validate_truncations(&self.truncations)?;
         let mut keys = BTreeSet::new();
-        for tool in std::iter::once(&self.cargo)
-            .chain(self.wrapper.iter())
-            .chain(self.invocations.iter().map(|v| &v.compiler))
-        {
-            if let Some(file) = &tool.executable {
-                validate_file(file)?;
-            }
-            if tool.verbose_identity.iter().any(|(key, value)| {
-                !matches!(
-                    key.as_str(),
-                    "release" | "commit-hash" | "commit-date" | "host" | "LLVM version"
-                ) || !value
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || " ._+-".contains(c))
-            }) {
-                return Err("invalid tool observation".into());
-            }
+        for tool in std::iter::once(&self.cargo).chain(self.wrapper.iter()) {
+            tool.validate()?;
         }
         for invocation in &self.invocations {
-            validate_truncations(&invocation.truncations)?;
-            validate_arguments(&invocation.command)?;
-            validate_environment(&invocation.environment)?;
-            for file in invocation
-                .inputs
-                .iter()
-                .chain(&invocation.outputs)
-                .chain(&invocation.config_files)
-            {
-                validate_file(file)?;
-            }
-            if invocation.command.len() > MAX_ARGUMENTS
-                || invocation.inputs.len() > MAX_FILES
-                || invocation.outputs.len() > MAX_FILES
-                || invocation.config_files.len() > MAX_FILES
-                || invocation.environment.len() > MAX_FILES
-                || (!invocation.truncations.is_empty()
-                    && !invocation.gaps.contains(&ObservationGap::BudgetExceeded))
-                || serde_json::to_vec(invocation)
-                    .map_err(|_| "invalid invocation")?
-                    .len()
-                    > MAX_INVOCATION_BYTES
-                || invocation
-                    .expected_unit_key()
-                    .map_err(|_| "invalid unit binding")?
-                    != invocation.unit_key
-                || !keys.insert(&invocation.unit_key)
-                || invocation
-                    .unit
-                    .cargo
-                    .as_ref()
-                    .is_some_and(|cargo| cargo.source != invocation.unit.source)
-            {
-                return Err("oversized, stale or conflicting compiler invocation".into());
+            invocation.validate()?;
+            if !keys.insert(&invocation.unit_key) {
+                return Err("conflicting compiler invocation".into());
             }
         }
         for generator in &self.generators {
-            validate_truncations(&generator.truncations)?;
-            if let Some(args) = &generator.command {
-                validate_arguments(args)?;
-            }
-            validate_environment(&generator.environment)?;
-            for file in generator.inputs.iter().chain(&generator.outputs) {
-                validate_file(file)?;
-            }
-            if generator.inputs.len() > MAX_FILES
-                || generator.outputs.len() > MAX_FILES
-                || generator.environment.len() > MAX_FILES
-                || generator
-                    .command
-                    .as_ref()
-                    .is_some_and(|v| v.len() > MAX_ARGUMENTS)
-                || (!generator.truncations.is_empty()
-                    && !generator.gaps.contains(&ObservationGap::BudgetExceeded))
-            {
-                return Err("oversized or unaccounted generator observations".into());
-            }
+            generator.validate()?;
         }
         if !self.truncations.is_empty() && !self.gaps.contains(&ObservationGap::BudgetExceeded) {
             return Err("unaccounted observation truncation".into());
+        }
+        Ok(())
+    }
+}
+
+impl CompilerInvocation {
+    /// Validate one bounded record before joining it into an attachment.
+    pub fn validate(&self) -> Result<(), String> {
+        bounded_json_size(self, MAX_INVOCATION_BYTES)
+            .map_err(|_| "oversized compiler invocation")?;
+        validate_portable_values(&serde_json::to_value(self).map_err(|_| "invalid invocation")?)?;
+        self.compiler.validate()?;
+        validate_truncations(&self.truncations)?;
+        validate_arguments(&self.command)?;
+        validate_environment(&self.environment)?;
+        for file in self
+            .inputs
+            .iter()
+            .chain(&self.outputs)
+            .chain(&self.config_files)
+        {
+            validate_file(file)?;
+        }
+        if self.command.len() > MAX_ARGUMENTS
+            || self.inputs.len() > MAX_FILES
+            || self.outputs.len() > MAX_FILES
+            || self.config_files.len() > MAX_FILES
+            || self.environment.len() > MAX_FILES
+            || (!self.truncations.is_empty()
+                && !self.gaps.contains(&ObservationGap::BudgetExceeded))
+            || self
+                .expected_unit_key()
+                .map_err(|_| "invalid unit binding")?
+                != self.unit_key
+            || self
+                .unit
+                .cargo
+                .as_ref()
+                .is_some_and(|cargo| cargo.source != self.unit.source)
+        {
+            return Err("oversized, stale or conflicting compiler invocation".into());
+        }
+        Ok(())
+    }
+}
+
+impl GeneratorObservation {
+    /// Validate a generator within the aggregate bound before retaining it.
+    pub fn validate(&self) -> Result<(), String> {
+        bounded_json_size(self, MAX_ATTACHMENT_BYTES)
+            .map_err(|_| "oversized generator observation")?;
+        validate_portable_values(&serde_json::to_value(self).map_err(|_| "invalid generator")?)?;
+        validate_truncations(&self.truncations)?;
+        if let Some(args) = &self.command {
+            validate_arguments(args)?;
+        }
+        validate_environment(&self.environment)?;
+        for file in self.inputs.iter().chain(&self.outputs) {
+            validate_file(file)?;
+        }
+        if self.inputs.len() > MAX_FILES
+            || self.outputs.len() > MAX_FILES
+            || self.environment.len() > MAX_FILES
+            || self
+                .command
+                .as_ref()
+                .is_some_and(|v| v.len() > MAX_ARGUMENTS)
+            || (!self.truncations.is_empty()
+                && !self.gaps.contains(&ObservationGap::BudgetExceeded))
+        {
+            return Err("oversized or unaccounted generator observations".into());
+        }
+        Ok(())
+    }
+}
+
+impl ToolObservation {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(file) = &self.executable {
+            validate_file(file)?;
+        }
+        if self.verbose_identity.iter().any(|(key, value)| {
+            !matches!(
+                key.as_str(),
+                "release" | "commit-hash" | "commit-date" | "host" | "LLVM version"
+            ) || !value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || " ._+-".contains(c))
+        }) {
+            return Err("invalid tool observation".into());
         }
         Ok(())
     }
@@ -506,6 +575,24 @@ fn validate_portable_values(value: &serde_json::Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serialized_size_counts_exact_bytes_without_retaining_overflow() {
+        let value = "x".repeat(MAX_ATTACHMENT_BYTES - 2);
+        assert_eq!(
+            bounded_json_size(&value, MAX_ATTACHMENT_BYTES),
+            Ok(MAX_ATTACHMENT_BYTES)
+        );
+        assert_eq!(
+            bounded_json_size(&value, MAX_ATTACHMENT_BYTES - 1),
+            Err(ObservationSizeError::BudgetExceeded)
+        );
+        assert_eq!(bounded_json_size(&"", 2), Ok(2));
+        assert_eq!(
+            bounded_json_size(&"", 0),
+            Err(ObservationSizeError::BudgetExceeded)
+        );
+    }
 
     #[test]
     fn paths_reject_host_absolute_parent_and_oversized_forms() {
