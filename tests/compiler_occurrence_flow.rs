@@ -2,7 +2,9 @@
 //! supply the already built, matching driver. Missing prerequisites fail.
 #![cfg(all(target_os = "linux", feature = "rustc-driver"))]
 
-use build_graph::compiler_invocation::{CompilerInvocationsV1, ObservationGap};
+use build_graph::compiler_invocation::{
+    CargoOperationKind, CompilerInvocationsV1, InputRoot, ObservationGap,
+};
 use build_graph::compiler_occurrence::{
     OccurrenceGap, OccurrenceRange, OccurrenceRoot, fingerprint,
 };
@@ -52,6 +54,27 @@ impl Fixture {
         selected: bool,
         rich: bool,
     ) -> build_graph::export::ExportManifest {
+        self.build_with_cargo(occurrences, selected, rich, None)
+    }
+
+    fn build_with_cargo(
+        &self,
+        occurrences: bool,
+        selected: bool,
+        rich: bool,
+        cargo: Option<&Path>,
+    ) -> build_graph::export::ExportManifest {
+        self.build_with_cargo_mode(occurrences, selected, rich, cargo, true)
+    }
+
+    fn build_with_cargo_mode(
+        &self,
+        occurrences: bool,
+        selected: bool,
+        rich: bool,
+        cargo: Option<&Path>,
+        use_test_selection: bool,
+    ) -> build_graph::export::ExportManifest {
         let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-build-graph"));
         command
             .args(["build", "--manifest-path"])
@@ -67,7 +90,16 @@ impl Fixture {
             command
                 .arg("--observe-definition-occurrences")
                 .env("BUILD_GRAPH_DRIVER", driver);
-            if let Some(cargo) = std::env::var_os("BUILD_GRAPH_TEST_OCCURRENCE_CARGO") {
+            if let Some(cargo) = cargo {
+                command
+                    .arg("--occurrence-cargo")
+                    .arg(cargo)
+                    .arg("--compiler-input-root")
+                    .arg(format!("host_tools={}", cargo.parent().unwrap().display()));
+            } else if let Some(cargo) = use_test_selection
+                .then(|| std::env::var_os("BUILD_GRAPH_TEST_OCCURRENCE_CARGO"))
+                .flatten()
+            {
                 command.arg("--occurrence-cargo").arg(cargo);
             }
         }
@@ -258,6 +290,249 @@ fn actual_driver_generated_buffers_keep_unknown_generator_and_stable_absence() {
         .compiler_invocations
         .expect("ordinary stable facts");
     assert!(stable.invocations.iter().all(|u| u.occurrences.is_none()));
+    assert!(stable.cargo_operations.is_none());
+}
+
+fn forwarding_cargo(fixture: &Fixture, fail_docs: bool) -> (PathBuf, PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let actual = std::env::var_os("BUILD_GRAPH_TEST_OCCURRENCE_CARGO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let output = Command::new("rustup")
+                .args(["which", "--toolchain", "nightly-2026-02-27", "cargo"])
+                .output()
+                .expect("actual pinned Cargo path");
+            assert!(
+                output.status.success(),
+                "matching nightly prerequisite required"
+            );
+            PathBuf::from(std::str::from_utf8(&output.stdout).unwrap().trim())
+        });
+    assert!(
+        actual.is_absolute() && actual.is_file(),
+        "actual matching Cargo required"
+    );
+    let tools = fixture.0.join("tools");
+    fs::create_dir(&tools).unwrap();
+    let path = tools.join("selected-cargo");
+    let log = fixture.0.join("operation-log");
+    let quote = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+    let failure = if fail_docs {
+        "if [ \"$1\" = doc ]; then exit 7; fi\n"
+    } else {
+        ""
+    };
+    fs::write(&path, format!("#!/bin/sh\ncase \"$1\" in metadata|build|doc) printf '%s %s\\n' \"$1\" \"$BUILD_GRAPH_CARGO_OPERATION\" >> {};; esac\n{}exec {} \"$@\"\n", quote(&log), failure, quote(&actual))).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    (path, log)
+}
+
+#[test]
+fn actual_selected_cargo_routes_metadata_build_docs_with_fresh_request_and_cleanup() {
+    let fixture = Fixture::new();
+    let (cargo, log) = forwarding_cargo(&fixture, false);
+    let first = fixture.build_with_cargo(true, false, true, Some(&cargo));
+    let operations = first
+        .compiler_invocations
+        .as_ref()
+        .unwrap()
+        .cargo_operations
+        .as_ref()
+        .expect("actual launches");
+    operations.validate().expect("original bounded reader");
+    assert_eq!(
+        operations
+            .operations
+            .iter()
+            .map(|value| value.kind)
+            .collect::<Vec<_>>(),
+        vec![
+            CargoOperationKind::Metadata,
+            CargoOperationKind::Build,
+            CargoOperationKind::Metadata,
+            CargoOperationKind::Docs
+        ]
+    );
+    let log_lines: Vec<_> = fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(log_lines.len(), operations.operations.len());
+    for (value, line) in operations.operations.iter().zip(&log_lines) {
+        let name = match value.kind {
+            CargoOperationKind::Metadata => "metadata",
+            CargoOperationKind::Build => "build",
+            CargoOperationKind::Docs => "doc",
+        };
+        assert_eq!(line, &format!("{name} {}", value.request));
+        assert!(value.started && value.success && value.exit_code == Some(0));
+        assert!(
+            value
+                .gaps
+                .contains(&ObservationGap::UnobservedExecutionInputs)
+        );
+        let endpoint = value
+            .executable
+            .path
+            .as_ref()
+            .expect("selected forwarding program, not delegated Cargo");
+        assert_eq!(endpoint.root, InputRoot::HostTools);
+        assert_eq!(endpoint.relative, "selected-cargo");
+        assert_eq!(
+            value
+                .environment
+                .iter()
+                .find(|env| env.name == "RUSTUP_TOOLCHAIN")
+                .unwrap()
+                .value
+                .as_deref(),
+            Some("nightly-2026-02-27")
+        );
+        // The explicitly delivered matching tools are outside this fixture's
+        // approved host_tools directory; no portable identity is invented.
+        assert!(value.gaps.contains(&ObservationGap::PathOutsideRoots));
+        if value.kind != CargoOperationKind::Build {
+            assert!(value.compiler_wrapper.is_none() && value.workspace_wrapper.is_none());
+        }
+    }
+    let runs = fixture.0.join("target/build-graph-observer");
+    assert_eq!(
+        fs::read_dir(&runs).unwrap().count(),
+        0,
+        "original owned observer cleanup after export"
+    );
+    let second = fixture.build_with_cargo(true, true, true, Some(&cargo));
+    let second = second
+        .compiler_invocations
+        .as_ref()
+        .unwrap()
+        .cargo_operations
+        .as_ref()
+        .unwrap();
+    assert_ne!(second.session, operations.session);
+    assert!(second.operations.iter().all(|value| {
+        !operations
+            .operations
+            .iter()
+            .any(|old| old.request == value.request)
+    }));
+    assert!(
+        second
+            .operations
+            .iter()
+            .any(|value| value.kind == CargoOperationKind::Docs)
+    );
+    assert_eq!(fs::read_dir(&runs).unwrap().count(), 0);
+}
+
+#[test]
+fn actual_default_nightly_route_records_direct_operations_without_selected_override() {
+    let fixture = Fixture::new();
+    let facts = fixture
+        .build_with_cargo_mode(true, false, true, None, false)
+        .compiler_invocations
+        .unwrap();
+    let operations = facts.cargo_operations.expect("actual default route");
+    operations.validate().unwrap();
+    assert_eq!(operations.operations.len(), 4);
+    for value in operations.operations {
+        assert!(value.success);
+        assert!(
+            !value
+                .command
+                .unwrap()
+                .iter()
+                .any(|argument| argument.token.as_deref() == Some("run"))
+        );
+        assert!(
+            value
+                .gaps
+                .contains(&ObservationGap::UnobservedExecutionInputs)
+        );
+    }
+}
+
+#[test]
+fn actual_selected_doc_failure_preserves_exit_and_original_partial_freshness_cleanup() {
+    use build_graph::export::{ArtifactFreshness, ExtractionStatus, Layer};
+    let fixture = Fixture::new();
+    let (cargo, _) = forwarding_cargo(&fixture, true);
+    let export = fixture.build_with_cargo(true, false, true, Some(&cargo));
+    let operations = export
+        .compiler_invocations
+        .as_ref()
+        .unwrap()
+        .cargo_operations
+        .as_ref()
+        .unwrap();
+    let docs = operations
+        .operations
+        .iter()
+        .find(|value| value.kind == CargoOperationKind::Docs)
+        .unwrap();
+    assert!(docs.started && !docs.success);
+    assert_eq!(docs.exit_code, Some(7));
+    let items = export
+        .layers
+        .iter()
+        .find(|value| value.layer == Layer::Items)
+        .unwrap();
+    assert!(
+        items
+            .packages
+            .iter()
+            .all(|value| value.status != ExtractionStatus::Complete
+                && value.freshness != ArtifactFreshness::Current)
+    );
+    assert_eq!(
+        fs::read_dir(fixture.0.join("target/build-graph-observer"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn actual_selected_build_failure_removes_owned_session_without_publishing_export() {
+    let fixture = Fixture::new();
+    let (cargo, log) = forwarding_cargo(&fixture, true);
+    let script = fs::read_to_string(&cargo)
+        .unwrap()
+        .replace("\"$1\" = doc", "\"$1\" = build");
+    fs::write(&cargo, script).unwrap();
+    let driver = std::env::var_os("BUILD_GRAPH_DRIVER")
+        .expect("shared job must supply actual pinned driver");
+    assert!(Path::new(&driver).is_file());
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-build-graph"))
+        .args(["build", "--manifest-path"])
+        .arg(fixture.0.join("Cargo.toml"))
+        .args([
+            "--observe-compiler-inputs",
+            "--observe-definition-occurrences",
+            "--nightly",
+            "nightly-2026-02-27",
+            "--occurrence-cargo",
+        ])
+        .arg(&cargo)
+        .current_dir(&fixture.0)
+        .env("BUILD_GRAPH_DRIVER", driver)
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let launches = fs::read_to_string(log).unwrap();
+    assert!(launches.lines().any(|line| line.starts_with("metadata ")));
+    assert!(launches.lines().any(|line| line.starts_with("build ")));
+    assert!(!launches.lines().any(|line| line.starts_with("doc ")));
+    assert_eq!(
+        fs::read_dir(fixture.0.join("target/build-graph-observer"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert!(!fixture.0.join("target/build-graph").exists());
 }
 
 #[test]

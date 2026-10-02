@@ -194,7 +194,11 @@ With the `rustc-driver` feature, `--observe-definition-occurrences` additionally
 captures actual analysis-callback definitions/references in that original build.
 It requires `--observe-compiler-inputs`, matching nightly Cargo/rustc-dev and a
 matching `bg-driver`. `--occurrence-cargo PATH` can select the actual matching
-Cargo producer. See [the occurrence contract](compiler-occurrences.md).
+Cargo producer for actual metadata, build and rich docs launches. Matching rustc
+and rustdoc are delivered explicitly. Optional bounded `cargo_operations` records
+the actual per-pass launch requests and outcomes; paths/requests are observational
+and cannot authenticate nested process lineage. See
+[the occurrence contract](compiler-occurrences.md).
 
 ```bash
 cargo build-graph build --observe-compiler-inputs

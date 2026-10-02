@@ -55,6 +55,45 @@ actual_driver_unicode_columns_match_pinned_rustdoc_without_byte_rebasing
 actual_driver_near_cap_keeps_callback_and_explicit_budget_outcome
 ```
 
+## Selected Cargo launch observations
+
+The shared job also includes the following authored routing contracts. They use
+the same CLI/driver artifacts above; no separate build is needed. All existing
+default/feature selectors remain required. The actual forwarding-program case
+delegates to the genuine matching Cargo and checks the selected program endpoint
+without claiming that endpoint authenticates the delegated binary or ancestry.
+
+```bash
+cargo test --locked --lib compiler_invocation::tests
+cargo test --locked --bin cargo-build-graph cargo_launch::tests
+cargo test --locked --bin cargo-build-graph rustdoc::tests
+BUILD_GRAPH_DRIVER=/approved/bg-driver cargo test --locked --features rustc-driver --test compiler_occurrence_flow
+```
+
+```text
+compiler_invocation::tests::cargo_operation_absence_and_optional_round_trip_preserve_legacy_shape
+compiler_invocation::tests::cargo_operation_request_kind_order_status_and_missing_facts_reject
+compiler_invocation::tests::cargo_operation_bounds_and_loss_witness_are_checked_by_original_reader
+cargo_launch::tests::repeated_commands_have_fresh_ordered_correlations_and_no_custody_grant
+cargo_launch::tests::actual_command_overlay_removes_keys_and_withholds_sensitive_bytes
+cargo_launch::tests::argument_environment_and_operation_overflow_keep_explicit_bounded_loss
+cargo_launch::tests::foreign_command_and_duplicate_root_fail_before_launch
+cargo_launch::tests::configured_tool_paths_and_environment_byte_cap_are_actual_and_bounded
+cargo_launch::tests::actual_build_failure_and_spawn_failure_preserve_status_and_selected_program
+rustdoc::tests::selected_doc_command_is_direct_and_preserves_original_flags_and_packages
+actual_selected_cargo_routes_metadata_build_docs_with_fresh_request_and_cleanup
+actual_default_nightly_route_records_direct_operations_without_selected_override
+actual_selected_doc_failure_preserves_exit_and_original_partial_freshness_cleanup
+actual_selected_build_failure_removes_owned_session_without_publishing_export
+```
+
+The tests inspect real launch outcomes, default omission, count/byte loss,
+fresh correlations, selected commands, redaction and original owned cleanup.
+None authenticates an installed private artifact/Session or complete input
+custody. The private consumer still needs qualified outer/Cargo artifacts, actual
+fork/exec/birth lineage, operation/configuration/read receipts and original
+admission/lifetime binding. All execution evidence remains pending.
+
 ## Existing stable observation gates
 
 These commands are prepared for the engineering validation owner on the

@@ -52,7 +52,7 @@ fn reserve_read(bytes: u64, maximum: u64, budget: &mut u64) -> Result<(), Observ
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-struct RootBinding {
+pub(crate) struct RootBinding {
     kind: InputRoot,
     path: PathBuf,
     device: u64,
@@ -60,7 +60,7 @@ struct RootBinding {
 }
 
 impl RootBinding {
-    fn new(kind: InputRoot, path: &Path) -> std::io::Result<Self> {
+    pub(crate) fn new(kind: InputRoot, path: &Path) -> std::io::Result<Self> {
         let path = fs::canonicalize(path)?;
         let metadata = fs::symlink_metadata(&path)?;
         if !metadata.is_dir() {
@@ -221,6 +221,10 @@ impl Session {
         self.driver.as_ref().map(|d| d.cargo.as_path())
     }
 
+    pub(crate) fn roots(&self) -> &[RootBinding] {
+        &self.config.roots
+    }
+
     pub fn configure(&mut self, command: &mut Command) -> Result<()> {
         if let Some(driver) = &self.driver {
             command
@@ -296,6 +300,13 @@ impl Session {
     }
 
     pub fn finish(&self) -> CompilerInvocationsV1 {
+        self.finish_with_operations(None)
+    }
+
+    pub fn finish_with_operations(
+        &self,
+        cargo_operations: Option<CargoOperationsV1>,
+    ) -> CompilerInvocationsV1 {
         let mut budget = UNIT_READ_BYTES;
         let mut result = CompilerInvocationsV1 {
             schema_version: COMPILER_INVOCATIONS_VERSION,
@@ -330,6 +341,7 @@ impl Session {
                 ObservationGap::OtherCompilerPhasesNotObserved,
             ],
             truncations: self.cargo_truncations.clone(),
+            cargo_operations,
         };
         result.cargo_environment = environment(
             &self.config.roots,
@@ -840,6 +852,7 @@ fn gap_attachment(mut result: CompilerInvocationsV1) -> CompilerInvocationsV1 {
     result.cargo_command = None;
     result.cargo_cwd = None;
     result.cargo_environment.clear();
+    result.cargo_operations = None;
     result.wrapper = None;
     result.invocations.clear();
     result.generators.clear();
@@ -885,7 +898,7 @@ fn bounded_read(path: &Path, maximum: u64) -> std::io::Result<Vec<u8>> {
     Ok(raw)
 }
 
-fn normalized(path: &Path, roots: &[RootBinding]) -> Option<ObservedPath> {
+pub(crate) fn normalized(path: &Path, roots: &[RootBinding]) -> Option<ObservedPath> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1152,7 +1165,7 @@ fn observed_bytes(
     Ok((portable, bytes, metadata))
 }
 
-fn file_observation(
+pub(crate) fn file_observation(
     path: &Path,
     role: FileRole,
     before: bool,
@@ -1194,7 +1207,7 @@ fn file_observation(
     result
 }
 
-fn env_allowed(name: &str) -> bool {
+pub(crate) fn env_allowed(name: &str) -> bool {
     matches!(
         name,
         "CARGO_PKG_NAME"
@@ -1272,7 +1285,7 @@ fn environment(
     result
 }
 
-fn safe_env_value(name: &str, value: &str) -> bool {
+pub(crate) fn safe_env_value(name: &str, value: &str) -> bool {
     let semantic = matches!(
         name,
         "CARGO_PKG_NAME"
@@ -2367,7 +2380,10 @@ fn normalize_command(args: &[OsString], roots: &[RootBinding]) -> Vec<Invocation
     result
 }
 
-fn normalize_cargo_command(args: &[OsString], roots: &[RootBinding]) -> Vec<InvocationArgument> {
+pub(crate) fn normalize_cargo_command(
+    args: &[OsString],
+    roots: &[RootBinding],
+) -> Vec<InvocationArgument> {
     let mut result = normalize_command(args, roots);
     let mut previous = "";
     for (index, arg) in args.iter().enumerate() {
@@ -2379,6 +2395,12 @@ fn normalize_cargo_command(args: &[OsString], roots: &[RootBinding]) -> Vec<Invo
             result[index] = if matches!(
                 value,
                 "build"
+                    | "metadata"
+                    | "doc"
+                    | "--format-version"
+                    | "--lib"
+                    | "--no-deps"
+                    | "--keep-going"
                     | "--release"
                     | "--locked"
                     | "--offline"
@@ -2400,7 +2422,7 @@ fn normalize_cargo_command(args: &[OsString], roots: &[RootBinding]) -> Vec<Invo
                 path_argument(value, None, roots)
             } else if matches!(
                 previous,
-                "--features" | "-p" | "--package" | "--target" | "--profile"
+                "--features" | "-p" | "--package" | "--target" | "--profile" | "--format-version"
             ) && value.split(',').all(identifier)
             {
                 token(value)
@@ -2935,6 +2957,7 @@ mod tests {
             generators: vec![],
             gaps: vec![ObservationGap::UnobservedExecutionInputs],
             truncations: vec![],
+            cargo_operations: None,
         }
     }
 

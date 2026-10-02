@@ -4,6 +4,7 @@
 
 mod cache;
 mod cargo_build;
+mod cargo_launch;
 mod compiler_observer;
 mod depinfo;
 #[cfg(feature = "rustc-driver")]
@@ -120,8 +121,8 @@ struct CommonArgs {
     #[cfg(feature = "rustc-driver")]
     #[arg(long, requires = "observe_compiler_inputs")]
     observe_definition_occurrences: bool,
-    /// Actual Cargo executable for the occurrence build (default: matching
-    /// nightly Cargo). Can select an independently qualified Cargo producer.
+    /// Actual Cargo executable for occurrence metadata/build/docs (default:
+    /// matching nightly Cargo). A path is observational, not authentication.
     #[cfg(feature = "rustc-driver")]
     #[arg(long, value_name = "PATH", requires = "observe_definition_occurrences")]
     occurrence_cargo: Option<String>,
@@ -347,11 +348,13 @@ fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool)
     if common.observe_compiler_inputs && !do_build {
         bail!("compiler observation requires an actual build");
     }
+    let mut selected_cargo = selected_occurrence_cargo(common)?;
     let mut observations = None;
+    let mut selected_observation = None;
     let compiled = if do_build {
         let manifest = common.manifest_path.as_ref().map(Utf8PathBuf::from);
         let mut session = if common.observe_compiler_inputs {
-            let meta = metadata::load(manifest.as_deref())?;
+            let meta = metadata::load_routed(manifest.as_deref(), selected_cargo.as_mut())?;
             let target = meta.target_directory.as_std_path().to_path_buf();
             Some(compiler_observer::Session::new(
                 meta,
@@ -365,21 +368,24 @@ fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool)
         if common.observe_definition_occurrences {
             let binary = driver_refs::resolve_driver(common.driver_bin.as_deref())?;
             let nightly = common.nightly.as_deref().unwrap_or(DEFAULT_DRIVER_NIGHTLY);
-            let cargo = match &common.occurrence_cargo {
-                Some(path) => std::path::PathBuf::from(path),
-                None => driver_refs::tool_program(nightly, "cargo")?,
-            };
-            let rustc = driver_refs::tool_program(nightly, "rustc")?;
-            let library = std::path::PathBuf::from(driver_refs::sysroot(nightly)?).join("lib");
+            let selected = selected_cargo
+                .as_mut()
+                .context("selected occurrence Cargo missing")?;
+            selected.set_roots(
+                session
+                    .as_ref()
+                    .context("compiler observation missing")?
+                    .roots(),
+            );
             session
                 .as_mut()
                 .context("occurrence capture requires compiler observation")?
                 .enable_driver(
                     binary.into_std_path_buf(),
-                    cargo,
-                    rustc,
+                    selected.cargo.clone(),
+                    selected.rustc.clone(),
                     nightly.into(),
-                    library,
+                    selected.library.clone(),
                 )?;
         }
         let compiled = cargo_build::run_build(
@@ -388,8 +394,14 @@ fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool)
             &common.packages,
             cargo_args,
             session.as_mut(),
+            selected_cargo.as_mut(),
         )?;
-        observations = session.as_ref().map(compiler_observer::Session::finish);
+        if selected_cargo.is_some() {
+            selected_observation = session;
+        } else {
+            // Preserve ordinary capture's original post-build finish/cleanup.
+            observations = session.as_ref().map(compiler_observer::Session::finish);
+        }
         let changed = compiled.iter().filter(|t| t.changed()).count();
         eprintln!(
             "[build-graph] build ok: {} artifact(s), {} recompiled",
@@ -401,14 +413,40 @@ fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool)
         None
     };
     let manifest = common.manifest_path.as_ref().map(Utf8PathBuf::from);
-    let meta = metadata::load(manifest.as_deref())?;
+    let meta = metadata::load_routed(manifest.as_deref(), selected_cargo.as_mut())?;
     run_extract_observed(
         common,
         compiled.as_deref(),
         meta,
         rustdoc::add_item_layer,
         observations,
+        selected_observation,
+        selected_cargo,
     )
+}
+
+fn selected_occurrence_cargo(
+    common: &CommonArgs,
+) -> Result<Option<cargo_launch::CargoLaunchSession>> {
+    #[cfg(feature = "rustc-driver")]
+    if common.observe_definition_occurrences {
+        let nightly = common.nightly.as_deref().unwrap_or(DEFAULT_DRIVER_NIGHTLY);
+        let cargo = match &common.occurrence_cargo {
+            Some(path) => std::path::PathBuf::from(path),
+            None => driver_refs::tool_program(nightly, "cargo")?,
+        };
+        return Ok(Some(cargo_launch::CargoLaunchSession::new(
+            cargo,
+            driver_refs::tool_program(nightly, "rustc")?,
+            driver_refs::tool_program(nightly, "rustdoc")?,
+            nightly.into(),
+            std::path::PathBuf::from(driver_refs::sysroot(nightly)?).join("lib"),
+            &common.compiler_input_root,
+        )?));
+    }
+    #[cfg(not(feature = "rustc-driver"))]
+    let _ = common;
+    Ok(None)
 }
 
 /// Watch the workspace and re-run the incremental refresh whenever a `.rs` or
@@ -420,7 +458,8 @@ fn run_watch(a: WatchArgs) -> Result<()> {
         bail!("compiler observation requires an actual build");
     }
     let manifest = a.common.manifest_path.as_ref().map(Utf8PathBuf::from);
-    let meta = metadata::load(manifest.as_deref())?;
+    let mut initial_cargo = selected_occurrence_cargo(&a.common)?;
+    let meta = metadata::load_routed(manifest.as_deref(), initial_cargo.as_mut())?;
     let root = meta.workspace_root.clone();
     let target_dir = a
         .common
@@ -540,7 +579,7 @@ fn run_extract_with_item_layer(
     meta: cargo_metadata::Metadata,
     extract_items: ItemLayerExtractor,
 ) -> Result<()> {
-    run_extract_observed(c, compiled, meta, extract_items, None)
+    run_extract_observed(c, compiled, meta, extract_items, None, None, None)
 }
 
 fn run_extract_observed(
@@ -549,6 +588,8 @@ fn run_extract_observed(
     meta: cargo_metadata::Metadata,
     extract_items: ItemLayerExtractor,
     compiler_invocations: Option<build_graph::compiler_invocation::CompilerInvocationsV1>,
+    compiler_observation: Option<compiler_observer::Session>,
+    mut selected_cargo: Option<cargo_launch::CargoLaunchSession>,
 ) -> Result<()> {
     let target_dir = c
         .target_dir
@@ -781,15 +822,27 @@ fn run_extract_observed(
             eprintln!("[build-graph] layer 2: no changed crates to re-document");
         } else {
             let t2 = std::time::Instant::now();
-            let result = extract_items(
-                &mut graph,
-                &meta,
-                &target_dir,
-                c.nightly.as_deref(),
-                &rich_dirty,
-                c.release,
-                c.no_derives,
-            )?;
+            let result = if let Some(selected) = selected_cargo.as_mut() {
+                rustdoc::add_item_layer_routed(
+                    &mut graph,
+                    &meta,
+                    &target_dir,
+                    &rich_dirty,
+                    c.release,
+                    c.no_derives,
+                    selected,
+                )
+            } else {
+                extract_items(
+                    &mut graph,
+                    &meta,
+                    &target_dir,
+                    c.nightly.as_deref(),
+                    &rich_dirty,
+                    c.release,
+                    c.no_derives,
+                )
+            }?;
             definitions.extend(result.definitions);
             for report in result.packages {
                 item_reports.insert(report.package.clone(), report);
@@ -934,7 +987,16 @@ fn run_extract_observed(
                 })
                 .collect(),
         },
-        compiler_invocations,
+        compiler_invocations: compiler_invocations.or_else(|| {
+            compiler_observation
+                .as_ref()
+                .map(|session| match &selected_cargo {
+                    Some(selected) => {
+                        session.finish_with_operations(Some(selected.finish(session.roots())))
+                    }
+                    None => session.finish(),
+                })
+        }),
         sources,
         layers: vec![
             LayerReport::from_packages(Layer::Sources, source_reports),

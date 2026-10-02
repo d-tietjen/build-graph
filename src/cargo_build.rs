@@ -37,11 +37,13 @@ pub fn run_build(
     packages: &[String],
     extra_args: &[String],
     mut observation: Option<&mut crate::compiler_observer::Session>,
+    mut selected: Option<&mut crate::cargo_launch::CargoLaunchSession>,
 ) -> Result<Vec<CompiledTarget>> {
     let mut cmd = Command::new(
-        observation
+        selected
             .as_ref()
-            .and_then(|s| s.cargo_program())
+            .map(|selected| selected.cargo.as_path())
+            .or_else(|| observation.as_ref().and_then(|s| s.cargo_program()))
             .unwrap_or_else(|| std::path::Path::new("cargo")),
     );
     cmd.arg("build")
@@ -61,16 +63,43 @@ pub fn run_build(
         session.configure(&mut cmd)?;
     }
 
-    let mut child = cmd.spawn().context("failed to spawn `cargo build`")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("cargo build produced no stdout")?;
+    let operation = if let Some(selected) = selected.as_mut() {
+        selected.configure(&mut cmd, true);
+        selected.begin(
+            &mut cmd,
+            build_graph::compiler_invocation::CargoOperationKind::Build,
+        )?
+    } else {
+        None
+    };
+
+    let spawned = cmd.spawn();
+    if spawned.is_err() {
+        if let Some(selected) = selected.as_mut() {
+            selected.complete(operation, None);
+        }
+    }
+    let mut child = spawned.context("failed to spawn `cargo build`")?;
+    if let Some(selected) = selected.as_mut() {
+        selected.spawned(operation);
+    }
+    // Close the actual pipe and reap the same Child even on a read error. The
+    // parser error remains the result; it cannot leave this launch unrecorded.
+    let stdout = child.stdout.take().expect("piped Cargo stdout");
     let reader = BufReader::new(stdout);
 
     let mut compiled = Vec::new();
+    let mut stream_error = None;
     for message in Message::parse_stream(reader) {
-        let message = message.context("failed to read cargo message stream")?;
+        let message = match message {
+            Ok(message) => message,
+            Err(error) => {
+                if stream_error.is_none() {
+                    stream_error = Some(error);
+                }
+                break;
+            }
+        };
         if let Some(session) = observation.as_mut() {
             match &message {
                 Message::CompilerArtifact(artifact) => session.artifact(artifact),
@@ -87,7 +116,14 @@ pub fn run_build(
         }
     }
 
-    let status = child.wait().context("waiting on `cargo build` failed")?;
+    let waited = child.wait();
+    if let Some(selected) = selected.as_mut() {
+        selected.complete(operation, waited.as_ref().ok().copied());
+    }
+    let status = waited.context("waiting on `cargo build` failed")?;
+    if let Some(error) = stream_error {
+        return Err(error).context("failed to read cargo message stream");
+    }
     if !status.success() {
         bail!(
             "`cargo build` failed (exit {}); graph not updated",

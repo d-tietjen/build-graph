@@ -18,6 +18,9 @@ pub const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ARGUMENTS: usize = 512;
 pub const MAX_FILES: usize = 128;
 pub const MAX_TEXT_BYTES: usize = 4096;
+pub const MAX_CARGO_OPERATIONS: usize = 16;
+pub const MAX_CARGO_OPERATION_BYTES: usize = 32 * 1024;
+pub const MAX_CARGO_SESSION_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObservationSizeError {
@@ -300,6 +303,123 @@ pub struct CompilerInvocationsV1 {
     pub generators: Vec<GeneratorObservation>,
     pub gaps: Vec<ObservationGap>,
     pub truncations: Vec<CollectionTruncation>,
+    /// Actual selected-Cargo launches; correlation is observational, not an
+    /// authenticated parent/child lineage or custody capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cargo_operations: Option<CargoOperationsV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CargoOperationKind {
+    Metadata,
+    Build,
+    Docs,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CargoOperationObservation {
+    pub ordinal: u64,
+    pub request: String,
+    pub kind: CargoOperationKind,
+    pub command: Option<Vec<InvocationArgument>>,
+    pub cwd: Option<ObservedPath>,
+    pub environment: Vec<EnvironmentObservation>,
+    pub executable: FileObservation,
+    pub rustc: Option<ObservedPath>,
+    pub rustdoc: Option<ObservedPath>,
+    pub compiler_wrapper: Option<ObservedPath>,
+    pub workspace_wrapper: Option<ObservedPath>,
+    pub started: bool,
+    pub exit_code: Option<i32>,
+    pub success: bool,
+    pub gaps: Vec<ObservationGap>,
+    pub truncations: Vec<CollectionTruncation>,
+}
+
+/// A bounded record of actual launch sites in one outer extraction pass. The
+/// session/request labels are fresh consistency markers, never authority. A
+/// descendant can inherit the request variable; kernel lineage is still needed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CargoOperationsV1 {
+    pub schema_version: u32,
+    pub session: String,
+    pub operations: Vec<CargoOperationObservation>,
+    pub gaps: Vec<ObservationGap>,
+    pub truncations: Vec<CollectionTruncation>,
+}
+
+impl CargoOperationsV1 {
+    pub fn validate(&self) -> Result<(), String> {
+        let label = |value: &str| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        };
+        if self.schema_version != 1
+            || !label(&self.session)
+            || self.operations.len() > MAX_CARGO_OPERATIONS
+            || !self
+                .gaps
+                .contains(&ObservationGap::UnobservedExecutionInputs)
+        {
+            return Err("invalid Cargo operation session".into());
+        }
+        bounded_json_size(self, MAX_CARGO_SESSION_BYTES)
+            .map_err(|_| "oversized Cargo operation session")?;
+        validate_truncations(&self.truncations)?;
+        let mut requests = BTreeSet::new();
+        let mut previous = 0;
+        for operation in &self.operations {
+            bounded_json_size(operation, MAX_CARGO_OPERATION_BYTES)
+                .map_err(|_| "oversized Cargo operation")?;
+            if operation.ordinal <= previous
+                || !label(&operation.request)
+                || operation.request != format!("{}-{}", self.session, operation.ordinal)
+                || !requests.insert(&operation.request)
+                || operation.success && (!operation.started || operation.exit_code != Some(0))
+                || operation.exit_code == Some(0) && !operation.success
+                || !operation.started && operation.exit_code.is_some()
+                || operation.executable.role != FileRole::Compiler
+                || operation.environment.len() > MAX_FILES
+                || !operation
+                    .gaps
+                    .contains(&ObservationGap::UnobservedExecutionInputs)
+                || !operation.truncations.is_empty()
+                    && !operation.gaps.contains(&ObservationGap::BudgetExceeded)
+            {
+                return Err("conflicting Cargo operation observation".into());
+            }
+            previous = operation.ordinal;
+            if let Some(command) = &operation.command {
+                if command.len() > MAX_ARGUMENTS {
+                    return Err("oversized Cargo operation command".into());
+                }
+                validate_arguments(command)?;
+                let kind = match operation.kind {
+                    CargoOperationKind::Metadata => "metadata",
+                    CargoOperationKind::Build => "build",
+                    CargoOperationKind::Docs => "doc",
+                };
+                if command.get(1).and_then(|arg| arg.token.as_deref()) != Some(kind) {
+                    return Err("Cargo operation kind differs from command".into());
+                }
+            } else if !operation.gaps.contains(&ObservationGap::BudgetExceeded) {
+                return Err("Cargo operation command missing without a gap".into());
+            }
+            validate_environment(&operation.environment)?;
+            validate_file(&operation.executable)?;
+            validate_truncations(&operation.truncations)?;
+        }
+        if !self.truncations.is_empty() && !self.gaps.contains(&ObservationGap::BudgetExceeded) {
+            return Err("unaccounted Cargo operation loss".into());
+        }
+        validate_portable_values(
+            &serde_json::to_value(self).map_err(|_| "invalid Cargo operations")?,
+        )
+    }
 }
 
 impl CompilerInvocationsV1 {
@@ -345,6 +465,9 @@ impl CompilerInvocationsV1 {
         }
         validate_environment(&self.cargo_environment)?;
         validate_truncations(&self.truncations)?;
+        if let Some(operations) = &self.cargo_operations {
+            operations.validate()?;
+        }
         let mut keys = BTreeSet::new();
         for tool in std::iter::once(&self.cargo).chain(self.wrapper.iter()) {
             tool.validate()?;
@@ -693,7 +816,155 @@ mod tests {
             generators: vec![],
             gaps: vec![ObservationGap::UnobservedExecutionInputs],
             truncations: vec![],
+            cargo_operations: None,
         }
+    }
+
+    fn operation_fixture() -> CargoOperationsV1 {
+        CargoOperationsV1 {
+            schema_version: 1,
+            session: "fixture-1".into(),
+            gaps: vec![ObservationGap::UnobservedExecutionInputs],
+            truncations: vec![],
+            operations: vec![CargoOperationObservation {
+                ordinal: 1,
+                request: "fixture-1-1".into(),
+                kind: CargoOperationKind::Build,
+                command: Some(vec![
+                    InvocationArgument {
+                        token: None,
+                        path: None,
+                        path_prefix: None,
+                        gap: Some(ObservationGap::PathOutsideRoots),
+                    },
+                    InvocationArgument {
+                        token: Some("build".into()),
+                        path: None,
+                        path_prefix: None,
+                        gap: None,
+                    },
+                ]),
+                cwd: None,
+                environment: vec![],
+                executable: FileObservation {
+                    path: None,
+                    role: FileRole::Compiler,
+                    before: None,
+                    after: None,
+                    gaps: vec![ObservationGap::PathOutsideRoots],
+                },
+                rustc: None,
+                rustdoc: None,
+                compiler_wrapper: None,
+                workspace_wrapper: None,
+                started: true,
+                exit_code: Some(0),
+                success: true,
+                gaps: vec![ObservationGap::UnobservedExecutionInputs],
+                truncations: vec![],
+            }],
+        }
+    }
+
+    #[test]
+    fn cargo_operation_absence_and_optional_round_trip_preserve_legacy_shape() {
+        let mut facts = fixture();
+        let raw = serde_json::to_vec(&facts).unwrap();
+        assert!(
+            !String::from_utf8(raw.clone())
+                .unwrap()
+                .contains("cargo_operations")
+        );
+        assert!(
+            CompilerInvocationsV1::from_json(&raw)
+                .unwrap()
+                .cargo_operations
+                .is_none()
+        );
+        facts.cargo_operations = Some(operation_fixture());
+        let raw = serde_json::to_vec(&facts).unwrap();
+        assert_eq!(CompilerInvocationsV1::from_json(&raw).unwrap(), facts);
+        let mut unknown = serde_json::to_value(&facts).unwrap();
+        unknown["cargo_operations"]["authority"] = serde_json::json!(true);
+        assert!(CompilerInvocationsV1::from_json(&serde_json::to_vec(&unknown).unwrap()).is_err());
+    }
+
+    #[test]
+    fn cargo_operation_request_kind_order_status_and_missing_facts_reject() {
+        operation_fixture().validate().unwrap();
+        let mut wrong = operation_fixture();
+        wrong.operations[0].request = "foreign-1".into();
+        assert!(wrong.validate().is_err());
+        let mut wrong = operation_fixture();
+        wrong.operations[0].kind = CargoOperationKind::Docs;
+        assert!(wrong.validate().is_err());
+        let mut wrong = operation_fixture();
+        wrong.operations.push(wrong.operations[0].clone());
+        assert!(wrong.validate().is_err());
+        let mut wrong = operation_fixture();
+        wrong.operations[0].started = false;
+        assert!(wrong.validate().is_err());
+        let mut wrong = operation_fixture();
+        wrong.operations[0].exit_code = Some(7);
+        assert!(wrong.validate().is_err());
+        let mut wrong = operation_fixture();
+        wrong.operations[0].success = false;
+        assert!(wrong.validate().is_err());
+        let mut wrong = operation_fixture();
+        wrong.operations[0].gaps.clear();
+        assert!(wrong.validate().is_err());
+        let mut wrong = operation_fixture();
+        wrong.gaps.clear();
+        assert!(wrong.validate().is_err());
+        let mut wrong = operation_fixture();
+        wrong.operations[0].command = None;
+        assert!(wrong.validate().is_err());
+    }
+
+    #[test]
+    fn cargo_operation_bounds_and_loss_witness_are_checked_by_original_reader() {
+        let mut wrong = operation_fixture();
+        wrong.operations = vec![wrong.operations[0].clone(); MAX_CARGO_OPERATIONS + 1];
+        assert!(wrong.validate().is_err());
+        let mut wrong = operation_fixture();
+        wrong.operations[0].environment = vec![
+            EnvironmentObservation {
+                name: "PROFILE".into(),
+                present: true,
+                value: Some("release".into()),
+                path: None,
+                content_fingerprint: None,
+                gap: None
+            };
+            MAX_FILES + 1
+        ];
+        assert!(wrong.validate().is_err());
+        let mut wrong = operation_fixture();
+        wrong.operations[0]
+            .command
+            .as_mut()
+            .unwrap()
+            .extend((0..MAX_ARGUMENTS).map(|_| InvocationArgument {
+                token: Some("--locked".into()),
+                path: None,
+                path_prefix: None,
+                gap: None,
+            }));
+        assert!(wrong.validate().is_err());
+        let mut wrong = operation_fixture();
+        wrong.operations[0].gaps =
+            vec![ObservationGap::UnobservedExecutionInputs; MAX_CARGO_OPERATION_BYTES];
+        assert!(wrong.validate().is_err());
+        let mut facts = operation_fixture();
+        facts.truncations.push(CollectionTruncation {
+            collection: "cargo_operations".into(),
+            observed: 2,
+            retained: 1,
+            count_exact: true,
+        });
+        assert!(facts.validate().is_err());
+        facts.gaps.push(ObservationGap::BudgetExceeded);
+        facts.validate().unwrap();
     }
 
     #[test]

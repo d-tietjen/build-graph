@@ -28,14 +28,53 @@ matching toolchain only when the supplied driver was built against it.
 
 `--occurrence-cargo /approved/cargo` selects the **actual Cargo executable** for
 that operation, including an independently qualified configuration exporter.
-It defaults to the matching nightly Cargo. The session records this executable,
-its actual ordered normalized arguments and allowlisted delivered environment,
-and queries that same executable. The nightly rustc path is delivered explicitly
-through `RUSTC`. An executable path is an observation, not its authentication.
+It defaults to the matching nightly Cargo. The actual metadata, build and rich
+rustdoc Cargo launches use that selected executable directly. The matching
+nightly rustc and rustdoc paths are delivered explicitly through `RUSTC` and
+`RUSTDOC`; metadata/docs remove compiler observation wrappers. The build retains
+its original wrapper and callback route. An executable path is an observation,
+not its authentication.
 The source, binary and any patched Cargo must be qualified independently for the
 same operation; a stable Cargo/configuration receipt cannot be relabelled as a
 nightly execution receipt. Existing workspace wrappers are rejected for this
 explicit route. Ordinary stable capture continues to use its original Cargo.
+
+### Actual Cargo operations
+
+The optional `CompilerInvocationsV1.cargo_operations` schema-1 attachment records
+the actual launch sites in one outer extraction pass: initial metadata, build,
+post-build metadata, and docs when the rich layer needs a refresh. Each record
+contains a monotonically increasing ordinal, kind (`metadata`, `build`, `docs`),
+fresh session/request consistency marker, ordered normalized command, cwd,
+allowlisted delivered environment, selected executable endpoint facts, normalized
+tool/wrapper paths and the actual started/status outcome. Failed docs retain their
+original partial/unknown-freshness behavior. A failed build/metadata operation
+still fails the outer command and does not publish a successful export.
+
+`BUILD_GRAPH_CARGO_OPERATION` carries the request marker on the actual command.
+It has no secret values and creates no owner capability. A descendant can inherit
+or copy it. A forwarding executable is recorded as the selected program; the
+observer does not relabel its endpoint bytes as the delegated Cargo's identity.
+Every operation and session retains `unobserved_execution_inputs`. An external
+consumer needs independently qualified outer/Cargo artifacts and genuine kernel
+fork, exec and birth lineage to authenticate a nested launch. There is no first
+matching executable, nonce, environment or JSON authority rule.
+
+There are at most 16 retained launches, 32 KiB per record and 256 KiB per session;
+the session is also charged to the original 8 MiB attachment assembly cap. Ordered
+arguments and environment keep their original count/text caps, with byte/count
+loss witnesses. Executable endpoint reads share 32 MiB, at most 8 MiB per read,
+through approved roots. Outside-root or oversized tools remain unknown. Exported
+paths are portable and unsafe environment/argument bytes have no fingerprint.
+The session stays alive until extraction/export finishes; its owned wrapper files
+are removed on success and errors. Each refresh creates fresh correlations.
+
+The optional separate semantic driver `cargo check` route, driver preparation,
+tool identity queries and watch startup metadata are outside this operation
+attachment. Watch startup still uses the selected Cargo; each refresh exports its
+own actual extraction pass. Legacy capture omits `cargo_operations` and retains
+its metadata/build/rustup-doc paths. These facts do not prove a merged Cargo
+configuration, compiler consumption or complete runtime/input closure.
 
 ## Version 1 contract
 

@@ -47,6 +47,37 @@ pub fn add_item_layer(
     })
 }
 
+/// Selected occurrence route: launch the actual Cargo directly, with explicit
+/// matching rustc/rustdoc, retaining the original one-pass/freshness behavior.
+pub fn add_item_layer_routed(
+    graph: &mut Graph,
+    meta: &Metadata,
+    target_dir: &Utf8Path,
+    packages: &[String],
+    release: bool,
+    no_derives: bool,
+    selected: &mut crate::cargo_launch::CargoLaunchSession,
+) -> Result<ItemLayerResult> {
+    add_item_layer_with_doc(graph, meta, target_dir, packages, no_derives, |packages| {
+        let mut command =
+            selected_doc_command(meta, target_dir, packages, release, &selected.cargo);
+        selected.configure(&mut command, false);
+        let operation = selected.begin(
+            &mut command,
+            build_graph::compiler_invocation::CargoOperationKind::Docs,
+        )?;
+        let status = command.status();
+        selected.complete(operation, status.as_ref().ok().copied());
+        let status = status.context("failed to run selected Cargo doc")?;
+        if !status.success() {
+            eprintln!(
+                "[build-graph] rich layer: doc build reported errors; ingesting newly produced JSON"
+            );
+        }
+        Ok(status.success())
+    })
+}
+
 fn add_item_layer_with_doc(
     graph: &mut Graph,
     meta: &Metadata,
@@ -254,8 +285,32 @@ fn doc_command(
     packages: &[String],
     release: bool,
 ) -> Command {
-    let manifest = meta.workspace_root.join("Cargo.toml");
     let mut cmd = Command::new("rustup");
+    cmd.arg("run").arg(toolchain).arg("cargo");
+    configure_doc_command(&mut cmd, meta, target_dir, packages, release);
+    cmd
+}
+
+fn selected_doc_command(
+    meta: &Metadata,
+    target_dir: &Utf8Path,
+    packages: &[String],
+    release: bool,
+    cargo: &std::path::Path,
+) -> Command {
+    let mut command = Command::new(cargo);
+    configure_doc_command(&mut command, meta, target_dir, packages, release);
+    command
+}
+
+fn configure_doc_command(
+    cmd: &mut Command,
+    meta: &Metadata,
+    target_dir: &Utf8Path,
+    packages: &[String],
+    release: bool,
+) {
+    let manifest = meta.workspace_root.join("Cargo.toml");
     // `--document-private-items`: a code graph needs the *private* helpers too,
     // not just the public API — otherwise references to/from them (most of a
     // codebase) have no node to connect to and `find callers` comes up empty.
@@ -263,9 +318,6 @@ fn doc_command(
         "RUSTDOCFLAGS",
         "-Z unstable-options --output-format json --document-private-items",
     )
-    .arg("run")
-    .arg(toolchain)
-    .arg("cargo")
     .arg("doc")
     .arg("--lib")
     .arg("--no-deps")
@@ -280,8 +332,6 @@ fn doc_command(
     for p in packages {
         cmd.arg("-p").arg(p);
     }
-
-    cmd
 }
 
 struct EdgeSpec {
@@ -858,6 +908,35 @@ mod tests {
         assert!(args.contains(&"--lib"));
         assert!(args.windows(2).any(|args| args == ["-p", "demo"]));
         assert!(!args.contains(&"--workspace"));
+    }
+
+    #[test]
+    fn selected_doc_command_is_direct_and_preserves_original_flags_and_packages() {
+        let workspace = Workspace::new(&[("demo", "demo")]);
+        let selected = selected_doc_command(
+            &workspace.meta,
+            &workspace.meta.target_directory,
+            &["demo".into()],
+            true,
+            std::path::Path::new("/selected/cargo"),
+        );
+        let legacy = doc_command(
+            &workspace.meta,
+            &workspace.meta.target_directory,
+            "nightly",
+            &["demo".into()],
+            true,
+        );
+        assert_eq!(selected.get_program(), "/selected/cargo");
+        assert_eq!(legacy.get_program(), "rustup");
+        assert_eq!(
+            selected.get_args().collect::<Vec<_>>(),
+            legacy.get_args().skip(3).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            selected.get_envs().collect::<Vec<_>>(),
+            legacy.get_envs().collect::<Vec<_>>()
+        );
     }
 
     #[test]
