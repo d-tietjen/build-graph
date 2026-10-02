@@ -156,7 +156,9 @@ impl Locator {
         } else {
             (&self.loc_other, &self.loc_fn)
         };
-        let split = fileline.rsplit_once(':').and_then(|(f, l)| l.parse::<i64>().ok().map(|l| (f, l)));
+        let split = fileline
+            .rsplit_once(':')
+            .and_then(|(f, l)| l.parse::<i64>().ok().map(|l| (f, l)));
         for m in [primary, secondary] {
             if let Some(v) = m.get(fileline) {
                 return Some(v);
@@ -182,7 +184,7 @@ fn dylib_env() -> &'static str {
     }
 }
 
-fn sysroot(nightly: &str) -> Result<String> {
+pub fn sysroot(nightly: &str) -> Result<String> {
     let out = Command::new("rustc")
         .arg(format!("+{nightly}"))
         .args(["--print", "sysroot"])
@@ -192,6 +194,19 @@ fn sysroot(nightly: &str) -> Result<String> {
         bail!("could not determine sysroot for toolchain `{nightly}`");
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+pub fn tool_program(nightly: &str, tool: &str) -> Result<std::path::PathBuf> {
+    let output = Command::new("rustup")
+        .args(["which", "--toolchain", nightly, tool])
+        .output()
+        .context("locating pinned driver toolchain executable")?;
+    if !output.status.success() {
+        bail!("pinned driver toolchain executable unavailable");
+    }
+    Ok(std::path::PathBuf::from(
+        std::str::from_utf8(&output.stdout)?.trim(),
+    ))
 }
 
 /// Run the driver over the workspace and (re)build the `calls`/`uses` edges from

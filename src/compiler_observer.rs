@@ -10,6 +10,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use build_graph::compiler_invocation::*;
+use build_graph::compiler_occurrence::{
+    self, CallbackRequest, CompilerOccurrencesV1, OccurrenceRoot,
+};
 use build_graph::export::content_fingerprint;
 use cargo_metadata::{Artifact, BuildScript, Metadata};
 use serde::{Deserialize, Serialize};
@@ -83,6 +86,16 @@ impl RootBinding {
 struct Config {
     directory: PathBuf,
     roots: Vec<RootBinding>,
+    #[serde(default)]
+    occurrences: bool,
+}
+
+struct DriverExecution {
+    binary: PathBuf,
+    cargo: PathBuf,
+    rustc: PathBuf,
+    toolchain: String,
+    library: PathBuf,
 }
 
 /// Each build gets an exclusively created directory. Old observations are never
@@ -97,6 +110,7 @@ pub struct Session {
     script_count: u64,
     cargo_command: Option<Vec<InvocationArgument>>,
     cargo_truncations: Vec<CollectionTruncation>,
+    driver: Option<DriverExecution>,
 }
 
 impl Session {
@@ -149,7 +163,11 @@ impl Session {
             let _ = fs::remove_dir(&directory);
             return Err(error.into());
         }
-        let config = Config { directory, roots };
+        let config = Config {
+            directory,
+            roots,
+            occurrences: false,
+        };
         let path = config.directory.join("config.json");
         if let Err(error) = exclusive_write(&path, &serde_json::to_vec(&config)?) {
             let _ = fs::remove_dir_all(&config.directory);
@@ -169,10 +187,56 @@ impl Session {
             script_count: 0,
             cargo_command: None,
             cargo_truncations: vec![],
+            driver: None,
         })
     }
 
+    pub fn enable_driver(
+        &mut self,
+        binary: PathBuf,
+        cargo: PathBuf,
+        rustc: PathBuf,
+        toolchain: String,
+        library: PathBuf,
+    ) -> Result<()> {
+        if std::env::var_os("RUSTC_WORKSPACE_WRAPPER").is_some_and(|v| !v.is_empty()) {
+            bail!("occurrence capture cannot replace an existing workspace wrapper");
+        }
+        self.config.occurrences = true;
+        // Replace only our unconsumed local request configuration before Cargo
+        // starts. All per-invocation requests and callback outputs are exclusive.
+        fs::remove_file(&self.path)?;
+        exclusive_write(&self.path, &serde_json::to_vec(&self.config)?)?;
+        self.driver = Some(DriverExecution {
+            binary,
+            cargo,
+            rustc,
+            toolchain,
+            library,
+        });
+        Ok(())
+    }
+
+    pub fn cargo_program(&self) -> Option<&Path> {
+        self.driver.as_ref().map(|d| d.cargo.as_path())
+    }
+
     pub fn configure(&mut self, command: &mut Command) -> Result<()> {
+        if let Some(driver) = &self.driver {
+            command
+                .env("RUSTUP_TOOLCHAIN", &driver.toolchain)
+                .env("RUSTC", &driver.rustc)
+                .env_remove("RUSTDOC")
+                .env("RUSTC_WORKSPACE_WRAPPER", &driver.binary)
+                .env(
+                    if cfg!(target_os = "macos") {
+                        "DYLD_FALLBACK_LIBRARY_PATH"
+                    } else {
+                        "LD_LIBRARY_PATH"
+                    },
+                    &driver.library,
+                );
+        }
         let args: Vec<OsString> = std::iter::once(command.get_program().to_owned())
             .chain(command.get_args().map(OsString::from))
             .collect();
@@ -235,7 +299,14 @@ impl Session {
         let mut budget = UNIT_READ_BYTES;
         let mut result = CompilerInvocationsV1 {
             schema_version: COMPILER_INVOCATIONS_VERSION,
-            cargo: tool_identity("cargo", &self.config.roots, &mut budget),
+            cargo: tool_identity(
+                self.driver
+                    .as_ref()
+                    .and_then(|d| d.cargo.to_str())
+                    .unwrap_or("cargo"),
+                &self.config.roots,
+                &mut budget,
+            ),
             cargo_command: self.cargo_command.clone(),
             cargo_cwd: std::env::current_dir()
                 .ok()
@@ -265,6 +336,20 @@ impl Session {
             "cargo_environment",
             &mut result.truncations,
         );
+        if let Some(driver) = &self.driver {
+            result
+                .cargo_environment
+                .retain(|e| e.name != "RUSTUP_TOOLCHAIN");
+            result.cargo_environment.push(EnvironmentObservation {
+                name: "RUSTUP_TOOLCHAIN".into(),
+                present: true,
+                value: Some(driver.toolchain.clone()),
+                content_fingerprint: None,
+                path: None,
+                gap: None,
+            });
+            result.cargo_environment.sort_by(|a, b| a.name.cmp(&b.name));
+        }
         note_truncation(
             &mut result.truncations,
             "cargo_artifacts",
@@ -1464,7 +1549,19 @@ pub fn wrapper(args: &[OsString]) -> i32 {
             None
         }
     });
-    let status = Command::new(program).args(&args[1..]).status();
+    let request = config.as_ref().zip(capture.as_ref()).and_then(
+        |(config, (invocation, roots, files, _, slot))| {
+            callback_request(config, invocation, roots, files, *slot).ok()
+        },
+    );
+    let mut command = Command::new(program);
+    command
+        .args(&args[1..])
+        .env_remove("BG_DRIVER_OCCURRENCE_REQUEST");
+    if let Some((path, _)) = &request {
+        command.env("BG_DRIVER_OCCURRENCE_REQUEST", path);
+    }
+    let status = command.status();
     let code = status.as_ref().ok().and_then(|status| status.code());
     if let (Some(config), Some((mut invocation, roots, files, outputs, slot))) =
         (config.as_ref(), capture)
@@ -1472,6 +1569,20 @@ pub fn wrapper(args: &[OsString]) -> i32 {
         invocation.exit_code = code;
         invocation.success = status.as_ref().is_ok_and(|status| status.success());
         let mut budget = UNIT_READ_BYTES;
+        if let Some(driver) = invocation.occurrence_driver.as_mut() {
+            let after = file_observation(
+                Path::new(program),
+                FileRole::Compiler,
+                false,
+                &roots,
+                &mut budget,
+            );
+            driver.after = after.after;
+            driver.gaps.extend(after.gaps);
+            if driver.before != driver.after {
+                driver.gaps.push(ObservationGap::UnstableFile);
+            }
+        }
         for (path, role) in files {
             let after = file_observation(&path, role, false, &roots, &mut budget);
             if let Some(before) = invocation
@@ -1568,9 +1679,44 @@ pub fn wrapper(args: &[OsString]) -> i32 {
         }
         invocation.inputs.truncate(MAX_FILES);
         invocation.outputs.truncate(MAX_FILES);
+        if config.occurrences {
+            match request
+                .as_ref()
+                .and_then(|(_, request)| read_callback(request, &invocation, &roots).ok())
+            {
+                Some(value) => {
+                    eprintln!(
+                        "[build-graph] occurrences: accepted {} definitions, {} references",
+                        value.definitions.len(),
+                        value.references.len()
+                    );
+                    invocation.occurrences = Some(value);
+                }
+                None => {
+                    eprintln!("[build-graph] occurrences: callback unavailable or rejected");
+                    invocation.gaps.push(if request.is_some() {
+                        ObservationGap::OccurrenceCallbackRejected
+                    } else {
+                        ObservationGap::OccurrenceCallbackUnavailable
+                    });
+                }
+            }
+            if bounded_json_size(&invocation, MAX_INVOCATION_BYTES).is_err() {
+                invocation.occurrences = None;
+                invocation.gaps.push(ObservationGap::BudgetExceeded);
+            }
+        }
         invocation.gaps.sort();
         invocation.gaps.dedup();
         let _ = invocation.bind_unit_key();
+        if invocation.occurrences.is_some()
+            && bounded_json_size(&invocation, MAX_INVOCATION_BYTES).is_err()
+        {
+            invocation.occurrences = None;
+            invocation.gaps.push(ObservationGap::BudgetExceeded);
+            invocation.gaps.sort();
+            invocation.gaps.dedup();
+        }
         if bounded_json_size(&invocation, MAX_INVOCATION_BYTES).is_ok()
             && let Ok(bytes) = serde_json::to_vec(&invocation)
         {
@@ -1601,6 +1747,130 @@ type Prepared = (
     Vec<PathBuf>,
     usize,
 );
+
+fn callback_request(
+    config: &Config,
+    invocation: &CompilerInvocation,
+    roots: &[RootBinding],
+    files: &[(PathBuf, FileRole)],
+    slot: usize,
+) -> Result<(PathBuf, CallbackRequest)> {
+    if !config.occurrences {
+        bail!("callback not requested");
+    }
+    let source = fs::canonicalize(
+        files
+            .iter()
+            .find(|(_, role)| *role == FileRole::Source)
+            .context("callback source unavailable")?
+            .0
+            .clone(),
+    )?;
+    let source_root = roots
+        .iter()
+        .find(|r| r.kind == InputRoot::Source)
+        .context("callback source root unavailable")?
+        .path
+        .clone();
+    let target_root = roots
+        .iter()
+        .find(|r| r.kind == InputRoot::Target)
+        .context("callback target root unavailable")?
+        .path
+        .clone();
+    let nonce = format!(
+        "{}-{slot}-{}",
+        std::process::id(),
+        SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+    );
+    let request = CallbackRequest {
+        schema_version: compiler_occurrence::OCCURRENCES_VERSION,
+        nonce,
+        command_fingerprint: content_fingerprint(&serde_json::to_vec(&invocation.command)?),
+        crate_name: invocation.unit.crate_name.clone(),
+        metadata: invocation.unit.metadata.clone(),
+        source,
+        source_root,
+        target_root,
+        output: config.directory.join(format!("occurrences-{slot}.json")),
+    };
+    if request.output.exists() {
+        bail!("callback output already exists");
+    }
+    let path = config.directory.join(format!("callback-{slot}.json"));
+    bounded_json_size(&request, MAX_INVOCATION_BYTES)
+        .map_err(|_| anyhow::anyhow!("callback request exceeds budget"))?;
+    exclusive_write(&path, &serde_json::to_vec(&request)?)?;
+    Ok((path, request))
+}
+
+fn read_callback(
+    request: &CallbackRequest,
+    invocation: &CompilerInvocation,
+    roots: &[RootBinding],
+) -> Result<CompilerOccurrencesV1> {
+    if !invocation.success || invocation.exit_code != Some(0) {
+        bail!("callback compiler failed");
+    }
+    let mut output_budget = compiler_occurrence::MAX_OCCURRENCE_BYTES as u64;
+    let (_, raw, metadata) = observed_bytes(
+        &request.output,
+        roots,
+        compiler_occurrence::MAX_OCCURRENCE_BYTES as u64,
+        &mut output_budget,
+    )
+    .map_err(|_| anyhow::anyhow!("callback output unavailable"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let parent = fs::symlink_metadata(
+            request
+                .output
+                .parent()
+                .context("callback parent unavailable")?,
+        )?;
+        if metadata.mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+            || metadata.uid() != parent.uid()
+        {
+            bail!("callback output ownership changed");
+        }
+    }
+    let value = CompilerOccurrencesV1::from_json(&raw)
+        .map_err(|_| anyhow::anyhow!("malformed callback output"))?;
+    if value.nonce != request.nonce
+        || value.command_fingerprint != request.command_fingerprint
+        || value.command_fingerprint
+            != content_fingerprint(&serde_json::to_vec(&invocation.command)?)
+        || value.crate_name != invocation.unit.crate_name
+        || value.metadata != invocation.unit.metadata
+    {
+        bail!("callback invocation changed");
+    }
+    let mut checked = BTreeSet::new();
+    let mut budget = compiler_occurrence::MAX_SOURCE_TOTAL_BYTES as u64;
+    for definition in &value.definitions {
+        let input = &definition.input;
+        if !checked.insert(input) {
+            continue;
+        }
+        let (kind, base) = match input.root {
+            OccurrenceRoot::Source => (InputRoot::Source, &request.source_root),
+            OccurrenceRoot::Target => (InputRoot::Target, &request.target_root),
+        };
+        let (portable, bytes, _) =
+            observed_bytes(&base.join(&input.relative), roots, FILE_BYTES, &mut budget)
+                .map_err(|_| anyhow::anyhow!("callback source unavailable"))?;
+        if portable.root != kind
+            || portable.relative != input.relative
+            || bytes.len() as u64 != input.bytes
+            || content_fingerprint(&bytes) != input.content_fingerprint
+        {
+            bail!("callback source buffer changed");
+        }
+    }
+    Ok(value)
+}
 
 fn prepare(
     config: &Config,
@@ -1827,6 +2097,16 @@ fn prepare(
         .chain((!truncations.is_empty()).then_some(ObservationGap::BudgetExceeded))
         .collect(),
         truncations,
+        occurrences: None,
+        occurrence_driver: config.occurrences.then(|| {
+            file_observation(
+                Path::new(&command[0]),
+                FileRole::Compiler,
+                true,
+                &roots,
+                &mut budget,
+            )
+        }),
     };
     if text.iter().flatten().any(|arg| arg.starts_with('@')) {
         invocation
@@ -2201,6 +2481,7 @@ mod tests {
             config: Config {
                 directory: directory.clone(),
                 roots,
+                occurrences: false,
             },
             path: directory.join("config.json"),
             metadata: workspace.meta.clone(),
@@ -2210,7 +2491,109 @@ mod tests {
             script_count: 0,
             cargo_command: None,
             cargo_truncations: vec![],
+            driver: None,
         }
+    }
+
+    fn callback_fixture() -> (
+        Workspace,
+        Session,
+        CompilerInvocation,
+        CallbackRequest,
+        CompilerOccurrencesV1,
+    ) {
+        let workspace = Workspace::new(&[("demo", "demo")]);
+        fs::write(
+            workspace.root.join("demo/src/lib.rs"),
+            b"pub fn source() {}",
+        )
+        .expect("source bytes");
+        let mut session = session(&workspace);
+        session.config.occurrences = true;
+        let mut invocation = invocation();
+        invocation.success = true;
+        invocation.exit_code = Some(0);
+        let files = vec![(
+            workspace.root.join("demo/src/lib.rs").into_std_path_buf(),
+            FileRole::Source,
+        )];
+        let (_, request) = callback_request(
+            &session.config,
+            &invocation,
+            &session.config.roots,
+            &files,
+            0,
+        )
+        .expect("fresh callback request");
+        let mut value = compiler_occurrence::tests::fixture();
+        value.nonce = request.nonce.clone();
+        value.command_fingerprint = request.command_fingerprint.clone();
+        value.crate_name = request.crate_name.clone();
+        value.metadata = request.metadata.clone();
+        value.definitions[0].input.relative = "demo/src/lib.rs".into();
+        exclusive_write(&request.output, &serde_json::to_vec(&value).expect("JSON"))
+            .expect("callback output");
+        (workspace, session, invocation, request, value)
+    }
+
+    #[test]
+    fn fresh_callback_reader_accepts_exact_stable_source_and_success() {
+        let (_workspace, session, invocation, request, value) = callback_fixture();
+        assert_eq!(
+            read_callback(&request, &invocation, &session.config.roots).expect("original reader"),
+            value
+        );
+        assert!(
+            callback_request(
+                &session.config,
+                &invocation,
+                &session.config.roots,
+                &[(request.source.clone(), FileRole::Source)],
+                0
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn callback_reader_rejects_stale_wrong_invocation_and_failed_compiler() {
+        let (_workspace, session, mut invocation, mut request, _) = callback_fixture();
+        request.nonce.push_str("-stale");
+        assert!(read_callback(&request, &invocation, &session.config.roots).is_err());
+        request.nonce.truncate(request.nonce.len() - 6);
+        invocation.unit.crate_name.push_str("wrong");
+        assert!(read_callback(&request, &invocation, &session.config.roots).is_err());
+        invocation.unit.crate_name = request.crate_name.clone();
+        invocation.success = false;
+        assert!(read_callback(&request, &invocation, &session.config.roots).is_err());
+    }
+    #[test]
+    fn callback_reader_rejects_changed_missing_and_oversized_buffers() {
+        let (_workspace, session, invocation, request, _) = callback_fixture();
+        fs::write(&request.source, b"pub fn other_() {}").expect("changed bytes");
+        assert!(read_callback(&request, &invocation, &session.config.roots).is_err());
+        fs::remove_file(&request.source).expect("missing source");
+        assert!(read_callback(&request, &invocation, &session.config.roots).is_err());
+        fs::write(
+            &request.output,
+            vec![b' '; compiler_occurrence::MAX_OCCURRENCE_BYTES + 1],
+        )
+        .expect("oversized proof");
+        assert!(read_callback(&request, &invocation, &session.config.roots).is_err());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn callback_reader_rejects_linked_and_nonprivate_output() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_workspace, session, invocation, request, _) = callback_fixture();
+        fs::set_permissions(&request.output, fs::Permissions::from_mode(0o644)).expect("mode");
+        assert!(read_callback(&request, &invocation, &session.config.roots).is_err());
+        fs::set_permissions(&request.output, fs::Permissions::from_mode(0o600)).expect("mode");
+        let alias = request.output.with_extension("alias");
+        fs::hard_link(&request.output, &alias).expect("hardlink");
+        assert!(read_callback(&request, &invocation, &session.config.roots).is_err());
+        fs::remove_file(&request.output).expect("unlink");
+        std::os::unix::fs::symlink(&alias, &request.output).expect("symlink");
+        assert!(read_callback(&request, &invocation, &session.config.roots).is_err());
     }
 
     fn artifact(workspace: &Workspace, fresh: bool) -> Artifact {

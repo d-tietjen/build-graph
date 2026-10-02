@@ -13,6 +13,10 @@ version. Enum values and existing field meanings require a new version to change
 
 ## Definitions and identities
 
+Optional [compiler occurrence observations](compiler-occurrences.md) associate
+exact original tuples and source-map buffers with an actual driver invocation.
+They do not assign global attachment ordinals or infer unit membership.
+
 `definitions` contains one record per modeled rustdoc item, before legacy graph
 ID merging. Each record links to `graph_node_id` and retains the exact Cargo
 package name, `::`-joined definition path, and extractor kind. Case and punctuation

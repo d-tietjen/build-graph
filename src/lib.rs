@@ -39,6 +39,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub mod compiler_invocation;
+pub mod compiler_occurrence;
 pub mod export;
 pub mod fragment;
 pub mod graph;

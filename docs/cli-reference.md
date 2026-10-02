@@ -190,6 +190,12 @@ whole-workspace SCIP index. For incremental Layer 3 refreshes, use
 
 ## Observing compiler inputs
 
+With the `rustc-driver` feature, `--observe-definition-occurrences` additionally
+captures actual analysis-callback definitions/references in that original build.
+It requires `--observe-compiler-inputs`, matching nightly Cargo/rustc-dev and a
+matching `bg-driver`. `--occurrence-cargo PATH` can select the actual matching
+Cargo producer. See [the occurrence contract](compiler-occurrences.md).
+
 ```bash
 cargo build-graph build --observe-compiler-inputs
 cargo build-graph build --observe-compiler-inputs \

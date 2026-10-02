@@ -1,5 +1,56 @@
 # Compiler observation validation
 
+## Actual driver occurrences
+
+The optional occurrence producer adds the same-job gates below. Build the driver
+against its exact pinned nightly plus `rustc-dev`, and supply the **actual** binary
+through `BUILD_GRAPH_DRIVER` to the feature-enabled Linux integration suite. These
+cases fail when that binary is unavailable; skipping them is not qualification.
+The standalone lock copies the full serde/serde_json transitive closure already
+pinned by the root lock. Its resolution and compilation remain required gates.
+
+```bash
+cargo +nightly-2026-02-27 metadata --locked --manifest-path crates/bg-driver/Cargo.toml
+cargo +nightly-2026-02-27 build --locked --release --manifest-path crates/bg-driver/Cargo.toml
+cargo test --locked --lib compiler_occurrence::tests
+cargo test --locked --lib compiler_invocation::tests
+cargo test --locked --bin cargo-build-graph compiler_observer::tests
+BUILD_GRAPH_DRIVER=/approved/bg-driver cargo test --locked --features rustc-driver --test compiler_occurrence_flow
+```
+
+Run the existing default and `rustc-driver` checks, actual CLI fixtures and all
+original combined acceptance gates on the same reviewed source. When a patched
+Cargo is selected, set `BUILD_GRAPH_TEST_OCCURRENCE_CARGO` to its qualified exact
+matching-nightly executable and include the genuine configuration/occurrence/
+original-owner consumer operation. Source metadata, build receipts and actual
+selected tool identities are separate prerequisites. No prior stable Cargo
+receipt is evidence for this nightly operation. See the
+[occurrence contract](compiler-occurrences.md) for remaining authority gaps.
+
+New authored selectors include:
+
+```text
+compiler_occurrence::tests::exact_occurrences_round_trip_without_attachment_ordinals
+compiler_occurrence::tests::malformed_unknown_and_oversized_occurrences_reject
+compiler_occurrence::tests::duplicate_conflicting_identity_and_buffer_reject
+compiler_occurrence::tests::references_require_exact_both_endpoints_and_consumed_source
+compiler_occurrence::tests::generated_buffer_requires_explicit_unknown_lineage
+compiler_occurrence::tests::original_ranges_and_portable_buffers_are_validated
+compiler_occurrence::tests::cumulative_source_buffer_budget_is_finite
+compiler_invocation::tests::occurrence_absence_preserves_legacy_json_and_exact_identity_grammar
+compiler_invocation::tests::occurrences_bind_successful_exact_ordered_invocation
+compiler_observer::tests::fresh_callback_reader_accepts_exact_stable_source_and_success
+compiler_observer::tests::callback_reader_rejects_stale_wrong_invocation_and_failed_compiler
+compiler_observer::tests::callback_reader_rejects_changed_missing_and_oversized_buffers
+compiler_observer::tests::callback_reader_rejects_linked_and_nonprivate_output
+actual_driver_exact_definitions_ranges_and_reference_edges_bind_invocation
+actual_driver_conditional_membership_is_not_shared_file_or_feature_inference
+actual_driver_generated_buffers_keep_unknown_generator_and_stable_absence
+actual_driver_occurrence_budget_keeps_partial_facts_or_explicit_gap
+```
+
+## Existing stable observation gates
+
 These commands are prepared for the engineering validation owner on the
 Linux validation server. They have not been run as part of source authoring.
 Use the shared bounded job and its exact source/toolchain/input evidence.

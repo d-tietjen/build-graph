@@ -115,6 +115,16 @@ struct CommonArgs {
     /// Attach portable observations from this build's actual rustc invocations.
     #[arg(long)]
     observe_compiler_inputs: bool,
+    /// Observe definitions/references in this actual build via the pinned nightly
+    /// driver. Requires rustc-dev and a matching prebuilt or buildable bg-driver.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, requires = "observe_compiler_inputs")]
+    observe_definition_occurrences: bool,
+    /// Actual Cargo executable for the occurrence build (default: matching
+    /// nightly Cargo). Can select an independently qualified Cargo producer.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, value_name = "PATH", requires = "observe_definition_occurrences")]
+    occurrence_cargo: Option<String>,
     /// Additional approved input root: dependencies|host_tools|cargo_config=PATH.
     #[arg(long, value_name = "NAME=PATH", requires = "observe_compiler_inputs")]
     compiler_input_root: Vec<String>,
@@ -325,6 +335,15 @@ fn run_build(a: BuildArgs) -> Result<()> {
 /// from target/. Shared by `build` and the `watch` loop. Both the build and the
 /// extract are already incremental — only changed crates recompile/re-document.
 fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool) -> Result<()> {
+    #[cfg(feature = "rustc-driver")]
+    let occurrence_common = (common.observe_definition_occurrences && common.nightly.is_none())
+        .then(|| {
+            let mut selected = common.clone();
+            selected.nightly = Some(DEFAULT_DRIVER_NIGHTLY.into());
+            selected
+        });
+    #[cfg(feature = "rustc-driver")]
+    let common = occurrence_common.as_ref().unwrap_or(common);
     if common.observe_compiler_inputs && !do_build {
         bail!("compiler observation requires an actual build");
     }
@@ -342,6 +361,27 @@ fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool)
         } else {
             None
         };
+        #[cfg(feature = "rustc-driver")]
+        if common.observe_definition_occurrences {
+            let binary = driver_refs::resolve_driver(common.driver_bin.as_deref())?;
+            let nightly = common.nightly.as_deref().unwrap_or(DEFAULT_DRIVER_NIGHTLY);
+            let cargo = match &common.occurrence_cargo {
+                Some(path) => std::path::PathBuf::from(path),
+                None => driver_refs::tool_program(nightly, "cargo")?,
+            };
+            let rustc = driver_refs::tool_program(nightly, "rustc")?;
+            let library = std::path::PathBuf::from(driver_refs::sysroot(nightly)?).join("lib");
+            session
+                .as_mut()
+                .context("occurrence capture requires compiler observation")?
+                .enable_driver(
+                    binary.into_std_path_buf(),
+                    cargo,
+                    rustc,
+                    nightly.into(),
+                    library,
+                )?;
+        }
         let compiled = cargo_build::run_build(
             manifest.as_deref(),
             common.release,

@@ -38,7 +38,12 @@ pub fn run_build(
     extra_args: &[String],
     mut observation: Option<&mut crate::compiler_observer::Session>,
 ) -> Result<Vec<CompiledTarget>> {
-    let mut cmd = Command::new("cargo");
+    let mut cmd = Command::new(
+        observation
+            .as_ref()
+            .and_then(|s| s.cargo_program())
+            .unwrap_or_else(|| std::path::Path::new("cargo")),
+    );
     cmd.arg("build")
         .arg("--message-format=json-render-diagnostics");
     if let Some(mp) = manifest_path {

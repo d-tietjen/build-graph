@@ -24,6 +24,9 @@ use rustc_hir::{AmbigArg, Expr, ExprKind, HirId, Pat, PatKind, QPath, Ty, TyKind
 use rustc_interface::interface::Compiler;
 use rustc_middle::ty::{self, TyCtxt, TypeckResults};
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
+#[path = "../../../src/compiler_occurrence.rs"]
+mod compiler_occurrence;
+mod occurrences;
 
 struct BgCallbacks;
 
@@ -74,16 +77,21 @@ fn extract(tcx: TyCtxt<'_>) {
     // (kind, caller "file:line", callee "file:line"). Only collected when requested.
     let want_edges = std::env::var_os("BG_DRIVER_EDGES").is_some();
     let mut edges: Vec<(&'static str, String, String)> = Vec::new();
+    let mut occurrences = occurrences::Collector::new(tcx);
+    if let Some(collector) = occurrences.as_mut() {
+        for did in tcx.hir_crate_items(()).definitions() {
+            collector.definition(tcx, did.to_def_id());
+        }
+    }
 
     for owner in tcx.hir_body_owners() {
         let body = tcx.hir_body_owned_by(owner);
         let typeck = tcx.typeck(owner);
         let owner_path = tcx.def_path_str(owner.to_def_id());
-        let owner_loc =
-            want_edges
-                .then(|| loc_of(tcx, owner.to_def_id()))
-                .flatten()
-                .map(|(f, l)| format!("{f}:{l}"));
+        let owner_loc = want_edges
+            .then(|| loc_of(tcx, owner.to_def_id()))
+            .flatten()
+            .map(|(f, l)| format!("{f}:{l}"));
         let mut v = CallVisitor {
             tcx,
             typeck,
@@ -96,6 +104,7 @@ fn extract(tcx: TyCtxt<'_>) {
             uses_count: &mut uses_count,
             samples: &mut samples,
             edges: &mut edges,
+            occurrences: &mut occurrences,
         };
         v.visit_expr(body.value);
         // Also walk the fn signature (param/return/where types) — rust-analyzer
@@ -107,6 +116,10 @@ fn extract(tcx: TyCtxt<'_>) {
         if let Some(generics) = node.generics() {
             intravisit::walk_generics(&mut v, generics);
         }
+    }
+
+    if let Some(collector) = occurrences {
+        collector.publish();
     }
 
     // Optional def catalog: `file:line -> DefKind` for every local def, so a
@@ -161,7 +174,11 @@ fn extract(tcx: TyCtxt<'_>) {
     // file write, so this is the honest "the driver actually executed" signal.
     if let Ok(path) = std::env::var("BG_DRIVER_LOG") {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
             let _ = writeln!(f, "{krate} {} calls", calls + method_calls);
         }
     }
@@ -182,10 +199,14 @@ struct CallVisitor<'a, 'tcx> {
     uses_count: &'a mut usize,
     samples: &'a mut Vec<String>,
     edges: &'a mut Vec<(&'static str, String, String)>,
+    occurrences: &'a mut Option<occurrences::Collector>,
 }
 
 impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
-    fn record(&mut self, kind: &'static str, callee: DefId) {
+    fn record(&mut self, kind: &'static str, callee: DefId, span: rustc_span::Span) {
+        if let Some(collector) = self.occurrences.as_mut() {
+            collector.reference(self.tcx, self.owner_did, callee, kind, span);
+        }
         if callee.krate != LOCAL_CRATE {
             *self.cross_crate += 1;
         }
@@ -201,7 +222,7 @@ impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
         }
     }
 
-    fn call(&mut self, callee: DefId, method: bool) {
+    fn call(&mut self, callee: DefId, method: bool, span: rustc_span::Span) {
         if method {
             *self.method_calls += 1;
         } else {
@@ -215,12 +236,12 @@ impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
                 self.tcx.def_path_str(callee)
             ));
         }
-        self.record("call", callee);
+        self.record("call", callee, span);
     }
 
-    fn use_def(&mut self, callee: DefId) {
+    fn use_def(&mut self, callee: DefId, span: rustc_span::Span) {
         *self.uses_count += 1;
-        self.record("use", callee);
+        self.record("use", callee, span);
     }
 
     /// For a method call, resolve to the *concrete impl* method when the receiver
@@ -238,7 +259,7 @@ impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
     /// A `uses` target from a path resolution: types, consts, statics, fields,
     /// variants, etc. — but NOT fns/ctors (those are `calls`, handled separately,
     /// and re-counting their path expr would double-count).
-    fn use_from_res(&mut self, res: Res) {
+    fn use_from_res(&mut self, res: Res, span: rustc_span::Span) {
         if let Res::Def(kind, def_id) = res {
             let is_use = matches!(
                 kind,
@@ -257,7 +278,7 @@ impl<'a, 'tcx> CallVisitor<'a, 'tcx> {
                     | DefKind::Variant
             );
             if is_use {
-                self.use_def(def_id);
+                self.use_def(def_id, span);
             }
         }
     }
@@ -276,9 +297,9 @@ impl<'a, 'tcx> Visitor<'tcx> for CallVisitor<'a, 'tcx> {
                             // tuple-struct/variant construction: rustc says "call",
                             // SCIP says "use" — match SCIP.
                             if matches!(dk, DefKind::Ctor(..)) {
-                                self.use_def(def_id);
+                                self.use_def(def_id, ex.span);
                             } else {
-                                self.call(def_id, false);
+                                self.call(def_id, false, ex.span);
                             }
                         }
                     }
@@ -286,16 +307,16 @@ impl<'a, 'tcx> Visitor<'tcx> for CallVisitor<'a, 'tcx> {
                 ExprKind::MethodCall(..) => {
                     if let Some(def_id) = self.typeck.type_dependent_def_id(ex.hir_id) {
                         let target = self.method_target(def_id, ex.hir_id);
-                        self.call(target, true);
+                        self.call(target, true, ex.span);
                     }
                 }
                 // value paths to consts/statics/variants used as values → use
                 ExprKind::Path(ref qpath) => {
-                    self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id));
+                    self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id), ex.span);
                 }
                 // struct/enum-variant literal → use of the type/variant
                 ExprKind::Struct(qpath, ..) => {
-                    self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id));
+                    self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id), ex.span);
                 }
                 // field access → use of the field def
                 ExprKind::Field(recv, _) => {
@@ -304,7 +325,7 @@ impl<'a, 'tcx> Visitor<'tcx> for CallVisitor<'a, 'tcx> {
                         if adt.is_struct() || adt.is_union() {
                             let idx = self.typeck.field_index(ex.hir_id);
                             if let Some(field) = adt.non_enum_variant().fields.get(idx) {
-                                self.use_def(field.did);
+                                self.use_def(field.did, ex.span);
                             }
                         }
                     }
@@ -318,7 +339,7 @@ impl<'a, 'tcx> Visitor<'tcx> for CallVisitor<'a, 'tcx> {
     fn visit_ty(&mut self, t: &'tcx Ty<'tcx, AmbigArg>) {
         if !t.span.from_expansion() {
             if let TyKind::Path(QPath::Resolved(_, path)) = t.kind {
-                self.use_from_res(path.res);
+                self.use_from_res(path.res, t.span);
             }
         }
         intravisit::walk_ty(self, t);
@@ -328,7 +349,7 @@ impl<'a, 'tcx> Visitor<'tcx> for CallVisitor<'a, 'tcx> {
         if !p.span.from_expansion() {
             match p.kind {
                 PatKind::TupleStruct(ref qpath, ..) | PatKind::Struct(ref qpath, ..) => {
-                    self.use_from_res(self.typeck.qpath_res(qpath, p.hir_id));
+                    self.use_from_res(self.typeck.qpath_res(qpath, p.hir_id), p.span);
                 }
                 _ => {}
             }
@@ -367,7 +388,10 @@ fn main() -> std::process::ExitCode {
         sysroot = print_sysroot(&rustc);
     }
     if let Some(sr) = sysroot {
-        if !args.iter().any(|a| a == "--sysroot" || a.starts_with("--sysroot=")) {
+        if !args
+            .iter()
+            .any(|a| a == "--sysroot" || a.starts_with("--sysroot="))
+        {
             args.push("--sysroot".into());
             args.push(sr);
         }

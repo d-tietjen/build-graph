@@ -117,6 +117,8 @@ pub enum ObservationGap {
     OutputMembershipUnknown,
     OtherCompilerPhasesNotObserved,
     ConfigurationResolutionUnknown,
+    OccurrenceCallbackUnavailable,
+    OccurrenceCallbackRejected,
 }
 
 /// A precise cap witness. `observed` is a lower bound when enumeration stopped.
@@ -244,6 +246,14 @@ pub struct CompilerInvocation {
     pub success: bool,
     pub gaps: Vec<ObservationGap>,
     pub truncations: Vec<CollectionTruncation>,
+    /// Present only after this process's actual driver analysis callback and a
+    /// successful exit. Old observations retain the original serialized shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrences: Option<crate::compiler_occurrence::CompilerOccurrencesV1>,
+    /// The actual workspace-wrapper executable hosting rustc_driver. Cargo's
+    /// supplied rustc identity above is a separate tool, not this binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub occurrence_driver: Option<FileObservation>,
 }
 
 impl CompilerInvocation {
@@ -362,6 +372,29 @@ impl CompilerInvocation {
             .map_err(|_| "oversized compiler invocation")?;
         validate_portable_values(&serde_json::to_value(self).map_err(|_| "invalid invocation")?)?;
         self.compiler.validate()?;
+        if let Some(occurrences) = &self.occurrences {
+            occurrences.validate().map_err(str::to_owned)?;
+            let command =
+                serde_json::to_vec(&self.command).map_err(|_| "invalid occurrence binding")?;
+            if self.occurrence_driver.is_none()
+                || !self.success
+                || self.exit_code != Some(0)
+                || occurrences.command_fingerprint != content_fingerprint(&command)
+                || occurrences.crate_name != self.unit.crate_name
+                || occurrences.metadata != self.unit.metadata
+                || self.unit.cargo.as_ref().is_some_and(|c| {
+                    occurrences
+                        .definitions
+                        .iter()
+                        .any(|d| d.package != c.package_name)
+                })
+            {
+                return Err("conflicting occurrence invocation".into());
+            }
+        }
+        if let Some(driver) = &self.occurrence_driver {
+            validate_file(driver)?;
+        }
         validate_truncations(&self.truncations)?;
         validate_arguments(&self.command)?;
         validate_environment(&self.environment)?;
@@ -661,6 +694,58 @@ mod tests {
             gaps: vec![ObservationGap::UnobservedExecutionInputs],
             truncations: vec![],
         }
+    }
+
+    #[test]
+    fn occurrence_absence_preserves_legacy_json_and_exact_identity_grammar() {
+        let facts = fixture();
+        assert!(facts.invocations[0].occurrences.is_none());
+        let raw = serde_json::to_vec(&facts).expect("JSON");
+        assert!(
+            !String::from_utf8(raw)
+                .expect("UTF8")
+                .contains("occurrences")
+        );
+        for path in ["source", "café", "Case::Exact"] {
+            assert_eq!(
+                crate::compiler_occurrence::legacy_id("demo", path, "function"),
+                crate::item_id("demo", path, "function")
+            );
+            assert_eq!(
+                crate::compiler_occurrence::definition_key("demo", path, "function"),
+                crate::export::DefinitionIdentity {
+                    package: "demo".into(),
+                    def_path: path.into(),
+                    kind: "function".into(),
+                }
+                .key()
+            );
+        }
+    }
+    #[test]
+    fn occurrences_bind_successful_exact_ordered_invocation() {
+        let mut facts = fixture();
+        let mut occurrences = crate::compiler_occurrence::tests::fixture();
+        occurrences.command_fingerprint = content_fingerprint(
+            &serde_json::to_vec(&facts.invocations[0].command).expect("command"),
+        );
+        facts.invocations[0].occurrences = Some(occurrences);
+        facts.invocations[0].occurrence_driver = Some(FileObservation {
+            path: None,
+            role: FileRole::Compiler,
+            before: None,
+            after: None,
+            gaps: vec![ObservationGap::PathOutsideRoots],
+        });
+        facts.validate().expect("bound facts");
+        let raw = serde_json::to_vec(&facts).expect("JSON");
+        CompilerInvocationsV1::from_json(&raw).expect("reader");
+        facts.invocations[0].success = false;
+        assert!(facts.validate().is_err());
+        facts.invocations[0].success = true;
+        facts.invocations[0].command.reverse();
+        facts.invocations[0].bind_unit_key().expect("key");
+        assert!(facts.validate().is_err());
     }
 
     #[test]
