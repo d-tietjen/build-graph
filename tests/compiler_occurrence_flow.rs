@@ -3,7 +3,9 @@
 #![cfg(all(target_os = "linux", feature = "rustc-driver"))]
 
 use build_graph::compiler_invocation::{CompilerInvocationsV1, ObservationGap};
-use build_graph::compiler_occurrence::{OccurrenceGap, OccurrenceRoot, fingerprint};
+use build_graph::compiler_occurrence::{
+    OccurrenceGap, OccurrenceRange, OccurrenceRoot, fingerprint,
+};
 use build_graph::output::read_export;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,6 +13,24 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
+
+// Pinned Rust 6a979b3e32522049d0acb4a47f7ae44b7c8abfd5:
+// src/librustdoc/json/conversions.rs serializes lo.col + 1 and hi.col + 1.
+// The callback retains CharPos, not byte offsets. End stays exclusive.
+fn pinned_rustdoc_range(range: &OccurrenceRange) -> Option<(usize, usize, usize, usize)> {
+    if range.begin_line == 0
+        || (range.begin_line, range.begin_column) >= (range.end_line, range.end_column)
+    {
+        return None;
+    }
+    Some((
+        range.begin_line,
+        range.begin_column.checked_add(1)?,
+        range.end_line,
+        range.end_column.checked_add(1)?,
+    ))
+}
+
 struct Fixture(PathBuf);
 impl Fixture {
     fn new() -> Self {
@@ -126,12 +146,7 @@ fn actual_driver_exact_definitions_ranges_and_reference_edges_bind_invocation() 
             span.end.line,
             span.end.column
         ),
-        (
-            source.range.begin_line,
-            source.range.begin_column,
-            source.range.end_line,
-            source.range.end_column
-        )
+        pinned_rustdoc_range(&source.range).expect("checked pinned column conversion")
     );
     let edge = occurrences
         .references
@@ -268,4 +283,147 @@ fn actual_driver_occurrence_budget_keeps_partial_facts_or_explicit_gap() {
         }
         None => assert!(unit.gaps.contains(&ObservationGap::BudgetExceeded)),
     }
+}
+
+#[test]
+fn pinned_rustdoc_conversion_checks_zero_overflow_and_exclusive_end() {
+    let range = OccurrenceRange {
+        begin_line: 1,
+        begin_column: 0,
+        end_line: 1,
+        end_column: 8,
+    };
+    assert_eq!(pinned_rustdoc_range(&range), Some((1, 1, 1, 9)));
+    assert_eq!(range.end_column - range.begin_column, 8);
+    let next_line = OccurrenceRange {
+        end_line: 2,
+        end_column: 0,
+        ..range.clone()
+    };
+    assert_eq!(pinned_rustdoc_range(&next_line), Some((1, 1, 2, 1)));
+    let overflow = OccurrenceRange {
+        end_column: usize::MAX,
+        ..range.clone()
+    };
+    assert!(pinned_rustdoc_range(&overflow).is_none());
+    let begin_overflow = OccurrenceRange {
+        begin_column: usize::MAX,
+        end_line: 2,
+        end_column: 0,
+        ..range.clone()
+    };
+    assert!(pinned_rustdoc_range(&begin_overflow).is_none());
+    assert!(
+        pinned_rustdoc_range(&OccurrenceRange {
+            begin_line: 0,
+            ..range.clone()
+        })
+        .is_none()
+    );
+    assert!(
+        pinned_rustdoc_range(&OccurrenceRange {
+            end_column: 0,
+            ..range
+        })
+        .is_none()
+    );
+}
+
+#[test]
+fn actual_driver_unicode_columns_match_pinned_rustdoc_without_byte_rebasing() {
+    let fixture = Fixture::new();
+    let source = "pub mod unicode { pub const π: u32 = 1; pub fn after()->u32{π} }\n";
+    fs::write(fixture.0.join("src/lib.rs"), source).expect("Unicode source");
+    let export = fixture.build(true, false, true);
+    let facts = export
+        .compiler_invocations
+        .as_ref()
+        .expect("actual invocation attachment");
+    let unit = facts
+        .invocations
+        .iter()
+        .find(|u| u.unit.crate_name == "occurrence_demo")
+        .expect("actual unit");
+    let occurrences = unit.occurrences.as_ref().expect("actual analysis callback");
+    let definition = occurrences
+        .definitions
+        .iter()
+        .find(|d| d.def_path == "unicode::after")
+        .expect("actual Unicode-preceded definition");
+    let raw = export
+        .definitions
+        .iter()
+        .find(|d| d.identity.key() == definition.definition_key)
+        .expect("original rich definition");
+    let span = raw.span.as_ref().expect("actual rustdoc span");
+    assert_eq!(
+        (
+            span.begin.line,
+            span.begin.column,
+            span.end.line,
+            span.end.column
+        ),
+        pinned_rustdoc_range(&definition.range).expect("checked pinned conversion")
+    );
+    let prefix: String = source.chars().take(definition.range.begin_column).collect();
+    assert!(prefix.contains('π'));
+    assert!(
+        prefix.len() > definition.range.begin_column,
+        "CharPos is not a byte offset"
+    );
+    let body: String = source
+        .chars()
+        .skip(definition.range.begin_column)
+        .take(definition.range.end_column - definition.range.begin_column)
+        .collect();
+    assert!(
+        body.ends_with('}'),
+        "raw end excludes the following space/module brace"
+    );
+    assert_eq!(source.chars().nth(definition.range.end_column), Some(' '));
+    assert_eq!(
+        definition.input.content_fingerprint,
+        fingerprint(source.as_bytes())
+    );
+}
+
+#[test]
+fn actual_driver_near_cap_keeps_callback_and_explicit_budget_outcome() {
+    let fixture = Fixture::new();
+    let mut source = String::new();
+    for (i, length) in [950, 950, 950, 950, 950, 829].into_iter().enumerate() {
+        let prefix = format!("f_{i}_");
+        let name = format!("{prefix}{}", "a".repeat(length - prefix.len()));
+        source.push_str(&format!("pub fn {name}() {{}}\n"));
+    }
+    source.push_str("pub fn further() {}\n");
+    fs::write(fixture.0.join("src/lib.rs"), source).expect("actual near-cap source");
+    let facts = fixture
+        .build(true, false, false)
+        .compiler_invocations
+        .expect("actual facts");
+    let unit = facts
+        .invocations
+        .iter()
+        .find(|u| u.unit.crate_name == "occurrence_demo")
+        .expect("original actual unit");
+    let value = unit
+        .occurrences
+        .as_ref()
+        .expect("bounded callback retained, not CallbackRejected");
+    assert!(
+        !value.definitions.is_empty(),
+        "actual partial facts retained"
+    );
+    assert!(value.definitions.len() < 7, "genuine rejected definition");
+    assert!(value.gaps.contains(&OccurrenceGap::BudgetExceeded));
+    assert!(
+        !unit
+            .gaps
+            .contains(&ObservationGap::OccurrenceCallbackRejected)
+    );
+    let raw = serde_json::to_vec(value).expect("actual callback bytes");
+    assert!(raw.len() <= build_graph::compiler_occurrence::MAX_OCCURRENCE_BYTES);
+    build_graph::compiler_occurrence::CompilerOccurrencesV1::from_json(&raw)
+        .expect("actual bounded reader accepts partial callback");
 }

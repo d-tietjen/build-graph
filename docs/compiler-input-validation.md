@@ -12,6 +12,7 @@ pinned by the root lock. Its resolution and compilation remain required gates.
 ```bash
 cargo +nightly-2026-02-27 metadata --locked --manifest-path crates/bg-driver/Cargo.toml
 cargo +nightly-2026-02-27 build --locked --release --manifest-path crates/bg-driver/Cargo.toml
+cargo +nightly-2026-02-27 test --locked --manifest-path crates/bg-driver/Cargo.toml occurrences::tests
 cargo test --locked --lib compiler_occurrence::tests
 cargo test --locked --lib compiler_invocation::tests
 cargo test --locked --bin cargo-build-graph compiler_observer::tests
@@ -47,6 +48,11 @@ actual_driver_exact_definitions_ranges_and_reference_edges_bind_invocation
 actual_driver_conditional_membership_is_not_shared_file_or_feature_inference
 actual_driver_generated_buffers_keep_unknown_generator_and_stable_absence
 actual_driver_occurrence_budget_keeps_partial_facts_or_explicit_gap
+occurrences::tests::later_gap_cannot_overflow_an_accepted_definition_record
+occurrences::tests::rejected_reference_retains_both_endpoints_and_reserved_gaps
+pinned_rustdoc_conversion_checks_zero_overflow_and_exclusive_end
+actual_driver_unicode_columns_match_pinned_rustdoc_without_byte_rebasing
+actual_driver_near_cap_keeps_callback_and_explicit_budget_outcome
 ```
 
 ## Existing stable observation gates

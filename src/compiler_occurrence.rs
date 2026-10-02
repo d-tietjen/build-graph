@@ -55,8 +55,9 @@ pub struct OccurrenceInput {
     pub content_fingerprint: String,
 }
 
-/// Raw compiler/rustdoc coordinates: one-based lines, zero-based character
-/// columns and an exclusive end. No adapter rebasing is performed here.
+/// Raw compiler coordinates: one-based lines, zero-based character columns and
+/// an exclusive end. Rustdoc JSON columns are one-based; no rebasing is performed
+/// in this callback record.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OccurrenceRange {

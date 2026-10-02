@@ -75,6 +75,11 @@ normalized attachment, package resolver identity and qualified byte mapping.
 Same-key duplicates or ambiguous ranges remain incomplete. An adapter with a
 different coordinate convention must explicitly normalize that boundary and
 verify actual source-map/rustdoc agreement; it must not guess a shift.
+For the pinned Rust commit `6a979b3e32522049d0acb4a47f7ae44b7c8abfd5`,
+`src/librustdoc/json/conversions.rs` adds one to both compiler `CharPos`
+columns when writing rustdoc JSON. The actual rich-extraction regression uses
+that checked conversion, including a Unicode prefix; callback columns remain
+zero-based characters and the end remains exclusive.
 
 Target files can expose genuine generated definition buffers, but retain
 `generator_lineage_unknown`. Public capture cannot authenticate an arbitrary
@@ -90,6 +95,11 @@ records, malformed identities/ranges, inconsistent source buffers or packages,
 unaccounted generated inputs and stale/wrong invocation outputs are rejected.
 Overflow keeps bounded partial callback facts with `budget_exceeded`, or drops
 the optional record with the enclosing invocation's explicit budget gap.
+Before retaining each definition or reference, the driver reserves JSON space
+for all callback gap kinds. A later rejected tuple can therefore add its budget
+gap without invalidating the retained record. References keep their original
+definition endpoints; the driver does not trim accepted definitions to make room
+for gaps. The reservation may omit a tuple earlier than the raw 24 KiB limit.
 
 Cached Cargo artifacts do not run a callback and cannot manufacture an occurrence
 record. A missing, failed or unsupported callback remains an invocation gap.

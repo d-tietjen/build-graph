@@ -10,6 +10,36 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
+// A later omission can add any of these gaps after the last accepted tuple.
+// Reserve their entire serialized envelope before retaining a definition or
+// reference; trimming definitions afterward would invalidate reference endpoints.
+// Keep this list exhaustive when adding an OccurrenceGap variant.
+const GAP_ENVELOPE: [OccurrenceGap; 8] = [
+    OccurrenceGap::BudgetExceeded,
+    OccurrenceGap::UnsupportedDefinition,
+    OccurrenceGap::UnsupportedExpansion,
+    OccurrenceGap::SourceUnavailable,
+    OccurrenceGap::SourceChanged,
+    OccurrenceGap::ExternalIdentityUnknown,
+    OccurrenceGap::GeneratorLineageUnknown,
+    OccurrenceGap::AnalysisCoveragePartial,
+];
+
+fn fits_with_gap_envelope(value: &mut CompilerOccurrencesV1) -> bool {
+    if value.validate().is_err() {
+        return false;
+    }
+    let original_len = value.gaps.len();
+    for gap in GAP_ENVELOPE {
+        if !value.gaps.contains(&gap) {
+            value.gaps.push(gap);
+        }
+    }
+    let fits = value.validate().is_ok();
+    value.gaps.truncate(original_len);
+    fits
+}
+
 pub struct Collector {
     request: CallbackRequest,
     value: CompilerOccurrencesV1,
@@ -97,7 +127,7 @@ impl Collector {
         {
             return None;
         }
-        let value = CompilerOccurrencesV1 {
+        let mut value = CompilerOccurrencesV1 {
             schema_version: OCCURRENCES_VERSION,
             nonce: request.nonce.clone(),
             command_fingerprint: request.command_fingerprint.clone(),
@@ -107,6 +137,9 @@ impl Collector {
             references: Vec::new(),
             gaps: vec![OccurrenceGap::AnalysisCoveragePartial],
         };
+        if !fits_with_gap_envelope(&mut value) {
+            return None;
+        }
         Some(Self {
             request,
             value,
@@ -269,7 +302,7 @@ impl Collector {
             input,
         };
         self.value.definitions.push(value.clone());
-        if self.value.validate().is_err() {
+        if !fits_with_gap_envelope(&mut self.value) {
             self.value.definitions.pop();
             self.gap(OccurrenceGap::BudgetExceeded);
             return None;
@@ -317,7 +350,7 @@ impl Collector {
             return;
         }
         self.value.references.push(value);
-        if self.value.validate().is_err() {
+        if !fits_with_gap_envelope(&mut self.value) {
             self.value.references.pop();
             self.gap(OccurrenceGap::BudgetExceeded);
         }
@@ -362,5 +395,119 @@ impl Collector {
             ),
             Err(_) => eprintln!("[bg-driver] occurrences: publication unavailable"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Reader-valid synthetic boundary, not an authenticated compiler callback.
+    // The integration case below exercises these names through the actual driver.
+    fn near_limit_record() -> CompilerOccurrencesV1 {
+        let mut value = crate::compiler_occurrence::tests::fixture();
+        let template = value.definitions[0].clone();
+        value.definitions.clear();
+        value.nonce = "123456-0-1780422441123456789".into();
+        value.metadata = Some("0123456789abcdef".into());
+        value.gaps = vec![
+            OccurrenceGap::UnsupportedDefinition,
+            OccurrenceGap::AnalysisCoveragePartial,
+        ];
+        let mut source = String::new();
+        for (i, length) in [950, 950, 950, 950, 950, 829].into_iter().enumerate() {
+            let prefix = format!("f_{i}_");
+            let path = format!("{prefix}{}", "a".repeat(length - prefix.len()));
+            source.push_str(&format!("pub fn {path}() {{}}\n"));
+            let mut d = template.clone();
+            d.def_path = path;
+            d.definition_key = definition_key(&d.package, &d.def_path, &d.kind);
+            d.legacy_id = legacy_id(&d.package, &d.def_path, &d.kind);
+            d.range = OccurrenceRange {
+                begin_line: i + 1,
+                begin_column: 0,
+                end_line: i + 1,
+                end_column: length + 12,
+            };
+            value.definitions.push(d);
+        }
+        for definition in &mut value.definitions {
+            definition.input.bytes = source.len() as u64;
+            definition.input.content_fingerprint = fingerprint(source.as_bytes());
+        }
+        // Keep the boundary exact without depending on the real process nonce's
+        // digit width. This padding is confined to this synthetic reader fixture.
+        let target = MAX_OCCURRENCE_BYTES - 16;
+        let mut len = serde_json::to_vec(&value).expect("fixture JSON").len();
+        while len > target {
+            let d = value.definitions.last_mut().expect("last definition");
+            assert!(d.def_path.len() > 4, "retain a legal named definition");
+            d.def_path.pop();
+            d.definition_key = definition_key(&d.package, &d.def_path, &d.kind);
+            d.legacy_id = legacy_id(&d.package, &d.def_path, &d.kind);
+            d.range.end_column -= 1;
+            len = serde_json::to_vec(&value).expect("fixture JSON").len();
+        }
+        let padding = target.checked_sub(len).expect("fixture below boundary");
+        value
+            .metadata
+            .as_mut()
+            .expect("metadata")
+            .push_str(&"a".repeat(padding));
+        value.validate().expect("reader-valid near-limit fixture");
+        assert_eq!(serde_json::to_vec(&value).expect("JSON").len(), target);
+        value
+    }
+
+    #[test]
+    fn later_gap_cannot_overflow_an_accepted_definition_record() {
+        let mut value = near_limit_record();
+        let original_gaps = value.gaps.clone();
+        assert!(!fits_with_gap_envelope(&mut value));
+        assert_eq!(value.gaps, original_gaps);
+        value.gaps.push(OccurrenceGap::BudgetExceeded);
+        assert_eq!(
+            serde_json::to_vec(&value).expect("JSON").len(),
+            MAX_OCCURRENCE_BYTES + 2
+        );
+        assert!(value.validate().is_err(), "original late-gap overflow");
+        value.gaps = original_gaps;
+        value.definitions.pop();
+        assert!(fits_with_gap_envelope(&mut value));
+        for gap in GAP_ENVELOPE {
+            if !value.gaps.contains(&gap) {
+                value.gaps.push(gap);
+            }
+        }
+        value.validate().expect("every later gap still fits");
+        CompilerOccurrencesV1::from_json(&serde_json::to_vec(&value).expect("JSON"))
+            .expect("bounded partial publication");
+    }
+
+    #[test]
+    fn rejected_reference_retains_both_endpoints_and_reserved_gaps() {
+        let mut value = near_limit_record();
+        value.definitions.pop();
+        assert!(fits_with_gap_envelope(&mut value));
+        let definitions = value.definitions.clone();
+        let source = definitions[0].clone();
+        let target = definitions[1].clone();
+        value.references.push(ReferenceOccurrence {
+            input: source.input.clone(),
+            range: source.range.clone(),
+            source,
+            target,
+            relation: "calls".into(),
+            confidence: "EXTRACTED".into(),
+            confidence_score: 1,
+            weight: 1,
+        });
+        assert!(!fits_with_gap_envelope(&mut value));
+        value.references.pop();
+        value.gaps.push(OccurrenceGap::BudgetExceeded);
+        assert_eq!(value.definitions, definitions);
+        value
+            .validate()
+            .expect("endpoints and explicit budget outcome retained");
     }
 }
