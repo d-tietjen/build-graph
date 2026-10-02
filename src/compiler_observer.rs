@@ -15,6 +15,7 @@ use cargo_metadata::{Artifact, BuildScript, Metadata};
 use serde::{Deserialize, Serialize};
 
 const CONFIG_ENV: &str = "BUILD_GRAPH_COMPILER_OBSERVER";
+const WRAPPER_ENTRY: &str = "compiler-wrapper";
 const FILE_BYTES: u64 = 8 * 1024 * 1024;
 const UNIT_READ_BYTES: u64 = 32 * 1024 * 1024;
 const QUERY_BYTES: usize = 16 * 1024;
@@ -100,6 +101,10 @@ pub struct Session {
 
 impl Session {
     pub fn new(meta: Metadata, target: &Path, approved: &[String]) -> Result<Self> {
+        #[cfg(not(unix))]
+        bail!(
+            "compiler observation requires a Unix wrapper entrypoint; ordinary CLI remains available"
+        );
         if std::env::var_os("RUSTC_WRAPPER").is_some_and(|v| !v.is_empty()) {
             bail!("compiler observation cannot replace an existing RUSTC_WRAPPER");
         }
@@ -150,6 +155,10 @@ impl Session {
             let _ = fs::remove_dir_all(&config.directory);
             return Err(error.into());
         }
+        if let Err(error) = create_wrapper_entry(&config.directory.join(WRAPPER_ENTRY)) {
+            let _ = fs::remove_dir_all(&config.directory);
+            return Err(error).context("creating the private compiler wrapper entrypoint");
+        }
         Ok(Self {
             config,
             path,
@@ -193,7 +202,7 @@ impl Session {
             self.cargo_command = Some(normalize_cargo_command(&args, &self.config.roots));
         }
         command
-            .env("RUSTC_WRAPPER", std::env::current_exe()?)
+            .env("RUSTC_WRAPPER", self.config.directory.join(WRAPPER_ENTRY))
             .env(CONFIG_ENV, &self.path);
         Ok(())
     }
@@ -309,6 +318,11 @@ impl Session {
                     result.gaps.push(ObservationGap::MalformedObservation);
                 }
             }
+        }
+        if self.config.directory.join("compiler-unrecognized").exists() {
+            result
+                .gaps
+                .push(ObservationGap::CompilerIdentityUnavailable);
         }
         if self.config.directory.join("observation-failed").exists() {
             result.gaps.push(ObservationGap::ReadFailed);
@@ -1356,11 +1370,42 @@ fn tool_identity(program: &str, roots: &[RootBinding], budget: &mut u64) -> Tool
     result
 }
 
-pub fn is_wrapper(args: &[OsString]) -> bool {
-    std::env::var_os(CONFIG_ENV).is_some()
-        && args.get(1..).and_then(wrapper_compiler_index).is_some()
+fn create_wrapper_entry(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        // A symlink keeps the existing executable bytes and permissions. It is
+        // private routing state, not an approved root or a file observation.
+        std::os::unix::fs::symlink(std::env::current_exe()?, path)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "compiler wrapper entrypoint unavailable",
+        ))
+    }
 }
 
+fn is_wrapper_entry(program: &std::ffi::OsStr, config: &std::ffi::OsStr) -> bool {
+    // Cargo executes the dedicated absolute entrypoint installed for this run.
+    // Inherited env alone never changes the original CLI's dispatch. Avoid
+    // canonicalization: it would collapse this alias back to the CLI binary.
+    let Some(parent) = Path::new(config).parent() else {
+        return false;
+    };
+    Path::new(program) == parent.join(WRAPPER_ENTRY)
+}
+
+pub fn is_wrapper(args: &[OsString]) -> bool {
+    std::env::var_os(CONFIG_ENV).is_some_and(|config| {
+        args.first()
+            .is_some_and(|program| is_wrapper_entry(program, &config))
+    })
+}
+
+// Recognizing an observer-supported shape never decides whether to execute.
+// Other compiler names remain explicitly unknown while delegation stays exact.
 fn wrapper_compiler_index(command: &[OsString]) -> Option<usize> {
     if command
         .first()
@@ -1400,12 +1445,25 @@ pub fn wrapper(args: &[OsString]) -> i32 {
     let config = std::env::var_os(CONFIG_ENV)
         .and_then(|path| bounded_read(Path::new(&path), MAX_ATTACHMENT_BYTES as u64).ok())
         .and_then(|bytes| serde_json::from_slice::<Config>(&bytes).ok());
-    // Cargo can nest RUSTC_WORKSPACE_WRAPPER outside the actual rustc path.
-    let compiler_index = wrapper_compiler_index(args).unwrap_or(0);
-    let rustc_args = args.get(compiler_index + 1..).unwrap_or_default();
-    let capture = config
-        .as_ref()
-        .and_then(|config| prepare(config, args, compiler_index, rustc_args));
+    // This heuristic affects observation only. Cargo is allowed to supply any
+    // compiler executable name and an optional workspace wrapper; dispatch and
+    // delegation already selected the dedicated entrypoint independently.
+    let capture = config.as_ref().and_then(|config| {
+        if let Some(compiler_index) = wrapper_compiler_index(args) {
+            prepare(
+                config,
+                args,
+                compiler_index,
+                args.get(compiler_index + 1..).unwrap_or_default(),
+            )
+        } else {
+            let _ = exclusive_write(
+                &config.directory.join("compiler-unrecognized"),
+                b"compiler observation unavailable",
+            );
+            None
+        }
+    });
     let status = Command::new(program).args(&args[1..]).status();
     let code = status.as_ref().ok().and_then(|status| status.code());
     if let (Some(config), Some((mut invocation, roots, files, outputs, slot))) =
@@ -2573,6 +2631,49 @@ mod tests {
 
     #[test]
     fn wrapper_shape_preserves_direct_cli_and_nested_compiler_arguments() {
+        let config = std::ffi::OsStr::new("/private-run/config.json");
+        assert!(is_wrapper_entry(
+            std::ffi::OsStr::new("/private-run/compiler-wrapper"),
+            config
+        ));
+        assert!(!is_wrapper_entry(
+            std::ffi::OsStr::new("/tools/cargo-build-graph"),
+            config
+        ));
+        for compiler in ["rustc", "custom-compiler", "build", "--compiler"] {
+            // Only argv[0] and the saved entrypoint decide routing; arbitrary
+            // compiler values and nested positions cannot turn it into a CLI.
+            let args = [
+                OsString::from("/private-run/compiler-wrapper"),
+                OsString::from(compiler),
+                OsString::from("-vV"),
+            ];
+            assert!(is_wrapper_entry(&args[0], config));
+        }
+        assert_eq!(
+            wrapper_compiler_index(&["/tools/custom-compiler".into(), "-vV".into()]),
+            None
+        );
+        assert_eq!(
+            wrapper_compiler_index(&[
+                "/tools/workspace-wrapper".into(),
+                "/tools/custom-compiler".into(),
+                "-vV".into()
+            ]),
+            None
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let directory = OsString::from_vec(vec![b'/', b'r', b'u', b'n', b'/', 0xff]);
+            let config = Path::new(&directory).join("config.json");
+            let entry = Path::new(&directory).join(WRAPPER_ENTRY);
+            assert!(is_wrapper_entry(entry.as_os_str(), config.as_os_str()));
+            assert!(!is_wrapper_entry(
+                std::ffi::OsStr::new("/tools/cargo-build-graph"),
+                config.as_os_str()
+            ));
+        }
         for command in [
             "build",
             "watch",
@@ -2605,6 +2706,43 @@ mod tests {
                 "demo".into()
             ]),
             Some(1)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_wrapper_entry_is_not_an_observed_root_grant_and_cleanup_unlinks_it() {
+        let workspace = Workspace::new(&[("demo", "demo_lib")]);
+        let session = session(&workspace);
+        let directory = session.config.directory.clone();
+        let entry = directory.join(WRAPPER_ENTRY);
+        let executable = std::env::current_exe().expect("existing executable");
+        create_wrapper_entry(&entry).expect("owned private alias");
+        assert!(
+            fs::symlink_metadata(&entry)
+                .expect("alias metadata")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read_link(&entry).expect("alias target"), executable);
+        let mut budget = UNIT_READ_BYTES;
+        let observed = file_observation(
+            &entry,
+            FileRole::Compiler,
+            true,
+            &session.config.roots,
+            &mut budget,
+        );
+        assert!(
+            observed.before.is_none(),
+            "routing alias cannot bypass descriptor nofollow"
+        );
+        assert!(!observed.gaps.is_empty());
+        drop(session);
+        assert!(!directory.exists());
+        assert!(
+            executable.is_file(),
+            "owned cleanup must not follow the alias target"
         );
     }
 

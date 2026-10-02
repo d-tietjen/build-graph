@@ -47,7 +47,25 @@ tests::watch_observation_conflict_is_rejected_by_clap
 inherited_observer_environment_preserves_direct_and_cargo_cli_dispatch
 watch_no_build_observation_conflict_rejects_before_metadata_or_watch
 real_and_nested_wrapper_dispatch_preserves_original_os_arguments
+compiler_observer::tests::private_wrapper_entry_is_not_an_observed_root_grant_and_cleanup_unlinks_it
+inherited_observer_configuration_does_not_execute_non_utf8_cli_arguments
+actual_cargo_direct_custom_rustc_keeps_queries_build_and_inherited_cli
+actual_cargo_nested_custom_rustc_keeps_queries_build_and_inherited_cli
 ```
+
+The PUB-004 successor uses the same shared C4 artifacts. Its actual Cargo cases
+set `RUSTC` to a custom forwarding executable, exercise direct and nested workspace
+wrapper routes, observe genuine compiler version queries and compilations, invoke
+both normal CLI forms from the inheriting build script, check explicit unknown
+observation facts, and check owned run cleanup. The delegation fixture covers
+`rustc`, custom, CLI-colliding and non-UTF-8 executable names, non-UTF-8 arguments,
+and unchanged zero/nonzero exit codes. An inherited direct CLI non-UTF-8 argument
+must be rejected as a CLI argument rather than executed. The private alias fixture
+checks that descriptor readers refuse the symlink and cleanup retains the target.
+
+These are authored cases, not compiled counts or passing results. Retain every
+existing C1–C6 requirement and the separate C7 combined acceptance requirement;
+this routing correction does not qualify inputs or replace any of those checks.
 
 For the combined public producer → independently qualified comparison → native
 planning flow, build the CLI once in the shared job and invoke the binary on the

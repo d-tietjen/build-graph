@@ -95,8 +95,25 @@ existing graph, sidecar version, field order and compiler outcome retain their
 legacy meanings. Old sidecars remain readable. Rust callers constructing
 `ExportManifest` literals must add `compiler_invocations: None`.
 
-The CLI installs its own stable `RUSTC_WRAPPER` only for that Cargo build. It
-forwards the original argument vector unchanged, observes before/after files,
+The CLI installs its own stable `RUSTC_WRAPPER` only for that Cargo build. Each
+Unix run creates a private `compiler-wrapper` symlink to the existing CLI
+executable in its exclusively owned run directory. Cargo executes that exact
+entrypoint; dispatch matches its original `argv[0]` against the run path without
+canonicalizing the alias. The normal direct/plugin CLI remains the normal CLI,
+even when a build script inherits the observer configuration and wrapper env.
+The alias is private routing state: it adds no approved roots, input custody,
+qualification or completeness. Observation readers keep `O_NOFOLLOW`, and owned
+run cleanup unlinks the alias without following its executable target. Non-Unix
+opt-in setup reports an explicit unsupported-entrypoint error; default CLI
+behavior is unchanged.
+
+Delegation accepts any actual compiler name, including custom compiler forwarding
+executables and an optional nested workspace wrapper, and forwards every original
+`OsString` including non-UTF-8 values unchanged. The existing compiler-index
+heuristic affects observation only: an unrecognized shape gets explicit
+`compiler_identity_unavailable` facts rather than being sent to the CLI parser or
+fabricating an effective compiler identity. For recognized shapes the observer
+records before/after files,
 and joins each invocation to a non-fresh Cargo artifact by crate name, exact
 source and output path. Ambiguous joins remain unbound. An existing nonempty
 `RUSTC_WRAPPER` is rejected rather than replaced. A nested workspace wrapper is
