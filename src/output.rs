@@ -21,6 +21,7 @@ use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 
+use crate::export::{EXPORT_FILE, EXPORT_SCHEMA_VERSION, ExportManifest};
 use crate::graph::GraphJson;
 
 const VIEWER_TEMPLATE: &str = include_str!("viewer.html");
@@ -115,6 +116,26 @@ pub fn read_graph(path: &Path) -> io::Result<GraphJson> {
     } else {
         serde_json::from_slice(&bytes).map_err(io::Error::other)
     }
+}
+
+/// Read a supported export sidecar. Absence or an unsupported version is an
+/// error, rather than inferred extraction completeness.
+pub fn read_export(out_dir: &Path) -> io::Result<ExportManifest> {
+    let manifest: ExportManifest =
+        serde_json::from_slice(&fs::read(out_dir.join(EXPORT_FILE))?).map_err(io::Error::other)?;
+    if manifest.schema_version != EXPORT_SCHEMA_VERSION {
+        return Err(io::Error::other(
+            "unsupported build-graph export schema version",
+        ));
+    }
+    Ok(manifest)
+}
+
+/// Atomically replace the export sidecar. The graph is a separate atomic
+/// write; consumers should call [`ExportManifest::matches_graph`] before reuse.
+pub fn write_export(out_dir: &Path, manifest: &ExportManifest) -> io::Result<()> {
+    let bytes = serde_json::to_vec(manifest).map_err(io::Error::other)?;
+    write_atomic(&out_dir.join(EXPORT_FILE), &bytes)
 }
 
 /// Write `graph.json[.gz]` + `graph.html` into `out_dir`. When `compress`, the

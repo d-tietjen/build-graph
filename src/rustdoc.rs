@@ -1,8 +1,8 @@
 //! Layer 2 — the rich symbol/type item graph, from nightly rustdoc JSON.
 //!
-//! For each selected workspace library we invoke
-//! `rustup run <nightly> cargo rustdoc -p <pkg> --lib -- -Z unstable-options
-//! --output-format json`, parse `target/doc/<crate>.json` with `rustdoc-types`,
+//! For the selected, doc-enabled workspace libraries we invoke
+//! `rustup run <nightly> cargo doc --lib -p <pkg>` with JSON rustdoc flags,
+//! parse newly produced `target/doc/<crate>.json` with `rustdoc-types`,
 //! and fold the items + their relationships into the graph. Item nodes link up
 //! to the Layer-1 crate node, and cross-crate type references resolve to other
 //! workspace crate nodes, so the layers form one connected graph.
@@ -15,7 +15,17 @@ use camino::Utf8Path;
 use cargo_metadata::{Metadata, Package, Target};
 use rustdoc_types::{Attribute, Crate, Id, Item, ItemEnum, StructKind, Type, VariantKind};
 
+use build_graph::export::{
+    ArtifactFreshness, DefinitionIdentity, DefinitionRecord, DefinitionSpan, ExtractionStatus,
+    PackageReport, SourcePosition,
+};
 use build_graph::{Graph, Node, crate_id, item_id, norm};
+
+pub struct ItemLayerResult {
+    pub items: usize,
+    pub definitions: Vec<DefinitionRecord>,
+    pub packages: Vec<PackageReport>,
+}
 
 /// Run rustdoc JSON for the selected workspace libraries and add their items.
 pub fn add_item_layer(
@@ -26,12 +36,33 @@ pub fn add_item_layer(
     packages: &[String],
     release: bool,
     no_derives: bool,
-) -> Result<usize> {
+) -> Result<ItemLayerResult> {
     let toolchain = nightly.unwrap_or("nightly");
+    add_item_layer_with_doc(graph, meta, target_dir, packages, no_derives, |selected| {
+        eprintln!(
+            "[build-graph] rich layer: documenting {} crate(s) with {toolchain} (one pass)…",
+            selected.len()
+        );
+        run_doc_json(meta, target_dir, toolchain, selected, release)
+    })
+}
+
+fn add_item_layer_with_doc(
+    graph: &mut Graph,
+    meta: &Metadata,
+    target_dir: &Utf8Path,
+    packages: &[String],
+    no_derives: bool,
+    run_doc: impl FnOnce(&[String]) -> Result<bool>,
+) -> Result<ItemLayerResult> {
     let selected = select_lib_packages(meta, packages);
     if selected.is_empty() {
         eprintln!("[build-graph] rich layer: no library targets to document");
-        return Ok(0);
+        return Ok(ItemLayerResult {
+            items: 0,
+            definitions: Vec::new(),
+            packages: Vec::new(),
+        });
     }
 
     let workspace_crate_names: HashSet<String> = meta
@@ -44,20 +75,61 @@ pub fn add_item_layer(
     // robust to per-crate failure via `--keep-going`. This scales to a whole
     // workspace far better than one rustdoc invocation per crate.
     let n = selected.len();
-    eprintln!("[build-graph] rich layer: documenting {n} crate(s) with {toolchain} (one pass)…");
-    run_doc_json(meta, target_dir, toolchain, packages, release)?;
+    // Workspace success alone does not prove that each artifact was produced.
+    // Remove retained JSON first so an old artifact can never qualify as output
+    // from this invocation.
+    for pkg in &selected {
+        let path = json_path(target_dir, pkg);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("removing retained rustdoc JSON {path}"));
+            }
+        }
+    }
+    let selected_names: Vec<String> = selected.iter().map(|pkg| pkg.name.clone()).collect();
+    let doc_succeeded = run_doc(&selected_names)?;
 
     let mut total = 0usize;
     let mut done = 0usize;
     let mut pending: Vec<Pending> = Vec::new();
+    let mut definitions = Vec::new();
+    let mut reports = Vec::new();
     for pkg in selected {
         match ingest_pkg(graph, target_dir, pkg, &workspace_crate_names, no_derives) {
-            Ok((added, refs)) => {
+            Ok((added, refs, records)) => {
                 total += added;
                 done += 1;
                 pending.extend(refs);
+                definitions.extend(records);
+                reports.push(PackageReport {
+                    package: pkg.name.clone(),
+                    status: if doc_succeeded {
+                        ExtractionStatus::Complete
+                    } else {
+                        ExtractionStatus::Partial
+                    },
+                    freshness: if doc_succeeded {
+                        ArtifactFreshness::Current
+                    } else {
+                        ArtifactFreshness::Unknown
+                    },
+                    reason: (!doc_succeeded).then(|| {
+                        "cargo doc failed; newly produced JSON has unconfirmed completion".into()
+                    }),
+                });
             }
-            Err(e) => eprintln!("[build-graph] rich layer: skipped {} ({e:#})", pkg.name),
+            Err(e) => {
+                eprintln!("[build-graph] rich layer: skipped {} ({e:#})", pkg.name);
+                reports.push(PackageReport {
+                    package: pkg.name.clone(),
+                    status: ExtractionStatus::Partial,
+                    freshness: ArtifactFreshness::Unknown,
+                    reason: Some(format!("{e:#}")),
+                });
+            }
         }
     }
 
@@ -78,7 +150,11 @@ pub fn add_item_layer(
     eprintln!(
         "[build-graph] rich layer: +{total} item nodes from {done}/{n} crate(s), {cross} cross-crate edge(s)"
     );
-    Ok(total)
+    Ok(ItemLayerResult {
+        items: total,
+        definitions,
+        packages: reports,
+    })
 }
 
 pub fn is_lib_target(t: &Target) -> bool {
@@ -87,12 +163,16 @@ pub fn is_lib_target(t: &Target) -> bool {
         .any(|k| matches!(k.to_string().as_str(), "lib" | "rlib" | "proc-macro"))
 }
 
+pub fn is_documented_lib_target(t: &Target) -> bool {
+    is_lib_target(t) && t.doc
+}
+
 fn select_lib_packages<'a>(meta: &'a Metadata, packages: &[String]) -> Vec<&'a Package> {
     let want: HashSet<&str> = packages.iter().map(|s| s.as_str()).collect();
     meta.workspace_packages()
         .into_iter()
         .filter(|p| want.is_empty() || want.contains(p.name.as_str()))
-        .filter(|p| p.targets.iter().any(is_lib_target))
+        .filter(|p| p.targets.iter().any(is_documented_lib_target))
         .collect()
 }
 
@@ -111,10 +191,8 @@ fn ingest_pkg(
     pkg: &Package,
     workspace_crate_names: &HashSet<String>,
     no_derives: bool,
-) -> Result<(usize, Vec<Pending>)> {
-    let json_path = target_dir
-        .join("doc")
-        .join(format!("{}.json", lib_crate_name(pkg)));
+) -> Result<(usize, Vec<Pending>, Vec<DefinitionRecord>)> {
+    let json_path = json_path(target_dir, pkg);
     let data = std::fs::read_to_string(&json_path).with_context(|| {
         format!("no rustdoc JSON at {json_path} (crate may have failed to build)")
     })?;
@@ -129,10 +207,22 @@ fn ingest_pkg(
             rustdoc_types::FORMAT_VERSION
         );
     }
+    if !matches!(
+        krate.index.get(&krate.root).map(|item| &item.inner),
+        Some(ItemEnum::Module(_))
+    ) {
+        bail!("rustdoc JSON {json_path} has no root module to extract");
+    }
 
     let mut ingest = Ingest::new(&krate, &pkg.name, workspace_crate_names.clone(), no_derives);
     ingest.run(&crate_id(&pkg.name));
     Ok(ingest.apply(graph))
+}
+
+fn json_path(target_dir: &Utf8Path, pkg: &Package) -> camino::Utf8PathBuf {
+    target_dir
+        .join("doc")
+        .join(format!("{}.json", lib_crate_name(pkg)))
 }
 
 /// Produce rustdoc JSON for all selected crates in a single `cargo doc` pass.
@@ -142,7 +232,28 @@ fn run_doc_json(
     toolchain: &str,
     packages: &[String],
     release: bool,
-) -> Result<()> {
+) -> Result<bool> {
+    let status = doc_command(meta, target_dir, toolchain, packages, release)
+        .status()
+        .with_context(|| format!("failed to run `rustup run {toolchain} cargo doc`"))?;
+    // With `--keep-going`, a non-zero status just means some crates failed to
+    // build; we still ingest the JSON that was produced for the rest, with
+    // partial status and unknown freshness.
+    if !status.success() {
+        eprintln!(
+            "[build-graph] rich layer: doc build reported errors; ingesting newly produced JSON"
+        );
+    }
+    Ok(status.success())
+}
+
+fn doc_command(
+    meta: &Metadata,
+    target_dir: &Utf8Path,
+    toolchain: &str,
+    packages: &[String],
+    release: bool,
+) -> Command {
     let manifest = meta.workspace_root.join("Cargo.toml");
     let mut cmd = Command::new("rustup");
     // `--document-private-items`: a code graph needs the *private* helpers too,
@@ -156,6 +267,7 @@ fn run_doc_json(
     .arg(toolchain)
     .arg("cargo")
     .arg("doc")
+    .arg("--lib")
     .arg("--no-deps")
     .arg("--keep-going")
     .arg("--manifest-path")
@@ -165,25 +277,11 @@ fn run_doc_json(
     if release {
         cmd.arg("--release");
     }
-    if packages.is_empty() {
-        cmd.arg("--workspace");
-    } else {
-        for p in packages {
-            cmd.arg("-p").arg(p);
-        }
+    for p in packages {
+        cmd.arg("-p").arg(p);
     }
 
-    let status = cmd
-        .status()
-        .with_context(|| format!("failed to run `rustup run {toolchain} cargo doc`"))?;
-    // With `--keep-going`, a non-zero status just means some crates failed to
-    // build; we still ingest the JSON that was produced for the rest.
-    if !status.success() {
-        eprintln!(
-            "[build-graph] rich layer: doc build reported errors; ingesting crates that succeeded"
-        );
-    }
-    Ok(())
+    cmd
 }
 
 struct EdgeSpec {
@@ -219,6 +317,7 @@ struct Ingest<'a> {
     workspace_crate_names: HashSet<String>,
     map: HashMap<Id, String>,
     nodes: Vec<Node>,
+    definitions: Vec<DefinitionRecord>,
     edges: Vec<EdgeSpec>,
     /// (owner type node id, impl item id) for the type pass.
     impls: Vec<(String, Id)>,
@@ -241,6 +340,7 @@ impl<'a> Ingest<'a> {
             workspace_crate_names,
             map: HashMap::new(),
             nodes: Vec::new(),
+            definitions: Vec::new(),
             edges: Vec::new(),
             impls: Vec::new(),
             pending: Vec::new(),
@@ -283,7 +383,18 @@ impl<'a> Ingest<'a> {
         let node_id = item_id(self.pkg, &my_path, kind);
         self.map.insert(id, node_id.clone());
 
-        let (file, line) = span_of(item);
+        let span = span_of(item);
+        let file = span.as_ref().map(|s| s.file.clone());
+        let line = span.as_ref().and_then(|s| u32::try_from(s.begin.line).ok());
+        self.definitions.push(DefinitionRecord {
+            graph_node_id: node_id.clone(),
+            identity: DefinitionIdentity {
+                package: self.pkg.to_string(),
+                def_path: my_path.clone(),
+                kind: kind.to_string(),
+            },
+            span,
+        });
         self.nodes.push(
             Node::new(node_id.clone(), name, kind)
                 .with_source(file, line)
@@ -489,7 +600,7 @@ impl<'a> Ingest<'a> {
 
     /// Apply collected nodes + local edges to the graph; return the number of
     /// new nodes and the deferred cross-crate references.
-    fn apply(self, graph: &mut Graph) -> (usize, Vec<Pending>) {
+    fn apply(self, graph: &mut Graph) -> (usize, Vec<Pending>, Vec<DefinitionRecord>) {
         let before = graph.node_count();
         for node in self.nodes {
             graph.add_node(node);
@@ -499,7 +610,7 @@ impl<'a> Ingest<'a> {
                 graph.add_edge(e.src, e.tgt, e.rel, None, None);
             }
         }
-        (graph.node_count() - before, self.pending)
+        (graph.node_count() - before, self.pending, self.definitions)
     }
 }
 
@@ -562,12 +673,210 @@ fn variant_fields(v: &rustdoc_types::Variant) -> Vec<Id> {
     }
 }
 
-fn span_of(item: &Item) -> (Option<String>, Option<u32>) {
-    match &item.span {
-        Some(span) => (
-            Some(span.filename.to_string_lossy().replace('\\', "/")),
-            Some(span.begin.0 as u32),
-        ),
-        None => (None, None),
+fn span_of(item: &Item) -> Option<DefinitionSpan> {
+    item.span.as_ref().map(definition_span)
+}
+
+fn definition_span(span: &rustdoc_types::Span) -> DefinitionSpan {
+    DefinitionSpan {
+        file: span.filename.to_string_lossy().replace('\\', "/"),
+        begin: SourcePosition {
+            line: span.begin.0,
+            column: span.begin.1,
+        },
+        end: SourcePosition {
+            line: span.end.0,
+            column: span.end.1,
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::Workspace;
+
+    fn fixture_json(name: &str) -> Vec<u8> {
+        let module = |id, name: &str, is_crate, items| Item {
+            id,
+            crate_id: 0,
+            name: Some(name.into()),
+            span: None,
+            visibility: rustdoc_types::Visibility::Public,
+            docs: None,
+            links: HashMap::new(),
+            attrs: Vec::new(),
+            deprecation: None,
+            inner: ItemEnum::Module(rustdoc_types::Module {
+                is_crate,
+                items,
+                is_stripped: false,
+            }),
+        };
+        serde_json::to_vec(&Crate {
+            root: Id(0),
+            crate_version: None,
+            includes_private: true,
+            index: [
+                (Id(0), module(Id(0), "demo", true, vec![Id(1)])),
+                (Id(1), module(Id(1), name, false, Vec::new())),
+            ]
+            .into_iter()
+            .collect(),
+            paths: HashMap::new(),
+            external_crates: HashMap::new(),
+            target: rustdoc_types::Target {
+                triple: "x86_64-unknown-linux-gnu".into(),
+                target_features: Vec::new(),
+            },
+            format_version: rustdoc_types::FORMAT_VERSION,
+        })
+        .expect("fixture rustdoc JSON")
+    }
+
+    fn retained_json(workspace: &Workspace, package_index: usize) -> camino::Utf8PathBuf {
+        let path = json_path(
+            &workspace.meta.target_directory,
+            &workspace.meta.packages[package_index],
+        );
+        std::fs::create_dir_all(path.parent().expect("doc directory")).expect("doc directory");
+        std::fs::write(&path, fixture_json("OldDefinition")).expect("retained rustdoc JSON");
+        path
+    }
+
+    #[test]
+    fn doc_disabled_library_never_ingests_retained_json() {
+        let mut workspace = Workspace::new(&[("demo", "demo")]);
+        let path = retained_json(&workspace, 0);
+        workspace.disable_docs("demo");
+        workspace.change_source("demo", "NewDefinition");
+        let mut graph = Graph::new();
+        let result = add_item_layer_with_doc(
+            &mut graph,
+            &workspace.meta,
+            &workspace.meta.target_directory,
+            &[],
+            false,
+            |_| panic!("doc-disabled targets must not invoke cargo doc"),
+        )
+        .expect("skipped library documentation");
+        assert_eq!(graph.node_count(), 0);
+        assert!(result.definitions.is_empty());
+        assert!(result.packages.is_empty());
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn successful_doc_without_new_json_cannot_promote_retained_artifact() {
+        let workspace = Workspace::new(&[("demo", "demo")]);
+        let path = retained_json(&workspace, 0);
+        workspace.change_source("demo", "NewDefinition");
+        let mut graph = Graph::new();
+        let result = add_item_layer_with_doc(
+            &mut graph,
+            &workspace.meta,
+            &workspace.meta.target_directory,
+            &[],
+            false,
+            |selected| {
+                assert_eq!(selected, ["demo"]);
+                assert!(!path.exists());
+                Ok(true)
+            },
+        )
+        .expect("doc succeeded without an artifact");
+        assert_eq!(graph.node_count(), 0);
+        assert!(result.definitions.is_empty());
+        assert_eq!(result.packages[0].status, ExtractionStatus::Partial);
+        assert_eq!(result.packages[0].freshness, ArtifactFreshness::Unknown);
+    }
+
+    #[test]
+    fn successful_doc_qualifies_only_packages_with_new_json() {
+        let workspace = Workspace::new(&[("demo", "demo"), ("missing", "missing")]);
+        let produced = retained_json(&workspace, 0);
+        let missing = retained_json(&workspace, 1);
+        let mut graph = Graph::new();
+        let result = add_item_layer_with_doc(
+            &mut graph,
+            &workspace.meta,
+            &workspace.meta.target_directory,
+            &[],
+            false,
+            |_| {
+                assert!(!produced.exists());
+                assert!(!missing.exists());
+                std::fs::write(&produced, fixture_json("NewDefinition"))?;
+                Ok(true)
+            },
+        )
+        .expect("one produced JSON file");
+        assert_eq!(result.definitions.len(), 1);
+        assert_eq!(result.definitions[0].identity.def_path, "NewDefinition");
+        assert_eq!(result.packages[0].status, ExtractionStatus::Complete);
+        assert_eq!(result.packages[0].freshness, ArtifactFreshness::Current);
+        assert_eq!(result.packages[1].status, ExtractionStatus::Partial);
+        assert_eq!(result.packages[1].freshness, ArtifactFreshness::Unknown);
+        assert!(!graph.contains(&item_id("demo", "OldDefinition", "module")));
+    }
+
+    #[test]
+    fn failed_doc_keeps_new_json_partial_with_unknown_freshness() {
+        let workspace = Workspace::new(&[("demo", "demo")]);
+        let path = retained_json(&workspace, 0);
+        let result = add_item_layer_with_doc(
+            &mut Graph::new(),
+            &workspace.meta,
+            &workspace.meta.target_directory,
+            &[],
+            false,
+            |_| {
+                std::fs::write(&path, fixture_json("NewDefinition"))?;
+                Ok(false)
+            },
+        )
+        .expect("partial doc build");
+        assert_eq!(result.definitions[0].identity.def_path, "NewDefinition");
+        assert_eq!(result.packages[0].status, ExtractionStatus::Partial);
+        assert_eq!(result.packages[0].freshness, ArtifactFreshness::Unknown);
+    }
+
+    #[test]
+    fn doc_command_selects_libraries_and_exact_packages() {
+        let workspace = Workspace::new(&[("demo", "demo")]);
+        let command = doc_command(
+            &workspace.meta,
+            &workspace.meta.target_directory,
+            "nightly",
+            &["demo".into()],
+            false,
+        );
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_str().expect("UTF-8 argument"))
+            .collect();
+        assert!(args.contains(&"--lib"));
+        assert!(args.windows(2).any(|args| args == ["-p", "demo"]));
+        assert!(!args.contains(&"--workspace"));
+    }
+
+    #[test]
+    fn full_definition_span_is_retained() {
+        let span = rustdoc_types::Span {
+            filename: "src/lib.rs".into(),
+            begin: (2, 3),
+            end: (9, 17),
+        };
+        assert_eq!(
+            definition_span(&span),
+            DefinitionSpan {
+                file: "src/lib.rs".into(),
+                begin: SourcePosition { line: 2, column: 3 },
+                end: SourcePosition {
+                    line: 9,
+                    column: 17
+                },
+            }
+        );
     }
 }
