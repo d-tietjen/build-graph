@@ -12,7 +12,7 @@ pub(super) fn observe(tcx: TyCtxt<'_>, writer: &mut Writer) {
             provenance: CompilerContextProvenance::RustcSessionAfterAnalysis,
             rustc_version: row.text(tcx.sess.cfg_version, MAX_CONTEXT_TEXT, false)?,
             target_llvm: row.text(&tcx.sess.target.llvm_target, MAX_CONTEXT_TEXT, false)?,
-            target_arch: row.text(&tcx.sess.target.arch, MAX_CONTEXT_TEXT, false)?,
+            target_arch: row.text(tcx.sess.target.arch.desc(), MAX_CONTEXT_TEXT, false)?,
             cfg_entries: tcx.sess.psess.config.len() as u64,
             stable_target_feature_entries: tcx.sess.target_features.len() as u64,
             all_target_feature_entries: tcx.sess.unstable_target_features.len() as u64,
