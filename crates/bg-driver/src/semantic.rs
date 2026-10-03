@@ -1428,7 +1428,9 @@ pub(super) struct ObservedRowBudget<'a> {
 impl<'a> ObservedRowBudget<'a> {
     pub(super) fn new<T>(writer: &'a mut Writer) -> Option<Self> {
         let mut value = Self { writer, bytes: 0 };
-        value.charge(std::mem::size_of::<T>() + std::mem::size_of::<usize>() * 2)?;
+        // Include the bounded static reference role's owned string as well as
+        // the boxed payload/header before either is allocated.
+        value.charge(std::mem::size_of::<T>() + std::mem::size_of::<usize>() * 2 + 32)?;
         Some(value)
     }
     pub(super) fn charge(&mut self, bytes: usize) -> Option<()> {
