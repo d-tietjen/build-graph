@@ -171,7 +171,7 @@ fn canonical_environment_hash_is_length_delimited_and_secret_values_are_omitted(
     }
     assert_eq!(digest.sha256, sha256(&canonical));
     assert_eq!(digest.entries, 2);
-    assert_eq!(digest.bytes, 7);
+    assert_eq!(digest.bytes, 6);
     let alternate = BTreeMap::from([
         (b"A".to_vec(), b"b".to_vec()),
         (b"AB".to_vec(), b"cc".to_vec()),
