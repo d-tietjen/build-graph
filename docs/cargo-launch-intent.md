@@ -91,7 +91,7 @@ resolver, cross-target compilation and driver/CLI validation remain required.
 
 The I/O budget is charged cumulatively across exchanges; it is not restarted
 per byte or event. Cargo's run time remains under the existing operation owner.
-Overflow, stale/duplicate correlations, missing ACK, timeout, unsupported FD or
+Protocol overflow, stale/duplicate correlations, missing ACK, timeout, unsupported FD or
 callback failure prevents spawn and fences subsequent operations. A post-spawn
 observer failure synchronously cancels and waits the same actual child before
 returning error. Dropping the opted-in child guard does the same. Pipe setup,

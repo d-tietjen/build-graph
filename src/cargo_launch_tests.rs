@@ -115,12 +115,14 @@ fn dropping_owned_child_cancels_waits_and_retains_carrier_until_terminal_ack() {
         assert_eq!(exit_code, None);
         assert_eq!(signal, Some(libc::SIGKILL));
         direct_child_gone(pid);
-        let inode = carrier.metadata().expect("exact carrier").ino();
+        let identity = carrier.metadata().expect("exact carrier");
+        let (device, inode) = (identity.dev(), identity.ino());
         let references = std::fs::read_dir("/proc/self/fd")
             .expect("descriptor readback")
             .filter_map(std::result::Result::ok)
             .filter(|entry| {
-                std::fs::metadata(entry.path()).is_ok_and(|metadata| metadata.ino() == inode)
+                std::fs::metadata(entry.path())
+                    .is_ok_and(|metadata| metadata.dev() == device && metadata.ino() == inode)
             })
             .count();
         assert!(

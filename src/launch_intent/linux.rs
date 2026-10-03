@@ -686,7 +686,8 @@ mod tests {
         let raw = unsafe { libc::memfd_create(c"late-rights-fixture".as_ptr(), libc::MFD_CLOEXEC) };
         assert!(raw >= 0);
         let file = unsafe { File::from_raw_fd(raw) };
-        let inode = file.metadata().expect("unique carrier").ino();
+        let identity = file.metadata().expect("unique carrier");
+        let (device, inode) = (identity.dev(), identity.ino());
         writer.write_all(&[0]).expect("descriptor-free tag");
         let mut length = 2u32.to_be_bytes();
         let mut vector = libc::iovec {
@@ -716,7 +717,8 @@ mod tests {
             .expect("descriptor readback")
             .filter_map(std::result::Result::ok)
             .filter(|entry| {
-                std::fs::metadata(entry.path()).is_ok_and(|metadata| metadata.ino() == inode)
+                std::fs::metadata(entry.path())
+                    .is_ok_and(|metadata| metadata.dev() == device && metadata.ino() == inode)
             })
             .count();
         assert_eq!(
