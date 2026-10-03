@@ -19,6 +19,15 @@ are retained as raw byte arrays, without UTF-8 replacement or wrapper stripping.
 Library callers choose explicitly whether the first snapshot inherits or starts
 empty; the actual Session commands use their existing inheriting profile.
 
+Final preparation repeats the freeze on the owned `Command` with inheritance
+disabled before comparison, carrier creation or ACK. A late Unix `arg0` override
+is reset to the selected program; an equivalent replacement command cannot add
+ambient environment entries through its default inheritance. Explicit argument,
+cwd or environment changes still reject when their frozen description differs.
+The readonly `command_intent` helper describes an already frozen command; it
+cannot inspect hidden Unix overrides or inheritance on an arbitrary `Command`.
+This final normalization uses APIs available on the existing Rust 1.85 baseline.
+
 ## Protocol version 1
 
 Frames begin with **one sendmsg byte**: tag 0 carries no descriptor; tag 1 carries

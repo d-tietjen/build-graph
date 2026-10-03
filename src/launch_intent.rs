@@ -248,6 +248,8 @@ pub fn digest_environment(environment: &BTreeMap<Vec<u8>, Vec<u8>>) -> Result<En
 /// Session callers construct inheriting Commands; explicit overlays/removals
 /// replace that inherited snapshot. After this point ambient changes cannot
 /// alter exec delivery. A caller using a cleared base must select `inherit=false`.
+/// Final preparation repeats this freeze with `inherit=false` on the owned
+/// command, restoring selected argv[0] and disabling replacement inheritance.
 #[cfg(unix)]
 pub fn freeze_environment(command: &mut Command, inherit: bool) -> Result<()> {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -265,6 +267,9 @@ pub fn freeze_environment(command: &mut Command, inherit: bool) -> Result<()> {
     command.current_dir(cwd);
     // Standard Session callers use the selected program as argv[0]. Freeze
     // that actual delivery explicitly instead of guessing a hidden arg0 override.
+    if command.get_program().as_bytes().len() > MAX_COMMAND_BYTES {
+        bail!("launch program exceeds bound before retention");
+    }
     command.arg0(command.get_program().to_os_string());
     let mut environment = BTreeMap::new();
     let mut bytes = 0usize;
@@ -305,6 +310,10 @@ pub fn freeze_environment(command: &mut Command, inherit: bool) -> Result<()> {
     Ok(())
 }
 
+/// Describe a command after `freeze_environment` selected its argv[0] and
+/// cleared inheritance. This readonly helper cannot inspect Unix arg0 overrides
+/// or hidden environment inheritance; the Observer repeats the actual freeze
+/// immediately before checking and acknowledging its owned command.
 #[cfg(unix)]
 pub fn command_intent(command: &Command, binding: Binding) -> Result<CommandIntent> {
     use std::os::unix::ffi::OsStrExt;

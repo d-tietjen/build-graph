@@ -494,7 +494,15 @@ impl Observer {
         result
     }
 
-    fn prepare_inner(&mut self, command: Command, routed: RoutedIntent) -> Result<PreparedLaunch> {
+    fn prepare_inner(
+        &mut self,
+        mut command: Command,
+        routed: RoutedIntent,
+    ) -> Result<PreparedLaunch> {
+        // Reapply the selected argv[0] and exact explicit environment on the
+        // owned command. A hidden arg0 override or a replacement Command's
+        // default inheritance must not diverge from the carrier we acknowledge.
+        freeze_environment(&mut command, false)?;
         if self.failed
             || !Arc::ptr_eq(&self.session, &routed.session)
             || !self.pending.as_ref().is_some_and(|pending| {

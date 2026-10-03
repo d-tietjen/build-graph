@@ -814,3 +814,122 @@ fn contradictory_final_ack_and_descriptor_response_cannot_permit_spawn() {
         server.join().expect("parent");
     }
 }
+
+#[test]
+fn final_prepare_restores_selected_argv0_in_the_actual_child_and_carrier() {
+    use std::os::unix::process::CommandExt;
+
+    let (mut observer, mut parent) = pair();
+    let server = std::thread::spawn(move || {
+        let correlation = route(&mut parent, vec![], "c".repeat(64));
+        let final_description = final_intent(&mut parent, &correlation);
+        assert_eq!(final_description.intent.program, b"/bin/sh");
+        assert_eq!(
+            final_description.intent.argv,
+            vec![
+                b"/bin/sh".to_vec(),
+                b"-c".to_vec(),
+                b"printf '%s\\n' \"$0\"".to_vec(),
+            ]
+        );
+        lifecycle(&mut parent, &correlation, "spawned");
+        lifecycle(&mut parent, &correlation, "completed");
+        final_description.intent.argv[0].clone()
+    });
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "printf '%s\\n' \"$0\""])
+        .env_clear()
+        .stdout(Stdio::piped());
+    let routed = observer
+        .route(&mut command, binding(1), false)
+        .expect("actual routed command");
+    command.arg0("different-late-argv0");
+    assert_eq!(command.get_program(), std::ffi::OsStr::new("/bin/sh"));
+    let prepared = observer
+        .prepare(command, routed)
+        .expect("owned command is normalized before final ACK");
+    let (child, prepared) = prepared.spawn().unwrap_or_else(|_| panic!("actual child"));
+    observer
+        .spawned(&prepared, child.id())
+        .expect("actual PID ACK");
+    let output = child.wait_with_output().expect("same actual child wait");
+    assert!(output.status.success());
+    observer
+        .complete(prepared, output.status)
+        .expect("actual completion ACK");
+    let mut carrier_argv0 = server.join().expect("actual connected parent");
+    carrier_argv0.push(b'\n');
+    assert_eq!(
+        output.stdout, carrier_argv0,
+        "actual exec argv[0] matches sealed carrier"
+    );
+    assert_ne!(output.stdout, b"different-late-argv0\n");
+}
+
+#[test]
+fn final_prepare_clears_equal_field_replacement_inheritance_before_actual_delivery() {
+    // Do not mutate the process environment in parallel tests. This case
+    // explicitly requires a genuine ambient key outside the routed environment.
+    assert!(std::env::vars_os().any(|(name, _)| name != "VISIBLE"));
+    let (mut observer, mut parent) = pair();
+    let server = std::thread::spawn(move || {
+        let correlation = route(&mut parent, vec![], "d".repeat(64));
+        let final_description = final_intent(&mut parent, &correlation);
+        assert_eq!(
+            final_description.intent.environment,
+            digest_environment(&BTreeMap::from([(
+                b"VISIBLE".to_vec(),
+                b"checked".to_vec()
+            )]))
+            .expect("exact explicit delivered environment")
+        );
+        lifecycle(&mut parent, &correlation, "spawned");
+        lifecycle(&mut parent, &correlation, "completed");
+    });
+    let mut original = Command::new("/usr/bin/env");
+    original.env_clear().env("VISIBLE", "checked");
+    let routed = observer
+        .route(&mut original, binding(1), false)
+        .expect("genuine empty-base route");
+
+    // Fresh Command defaults to ambient inheritance although all fields
+    // available to the old readonly description match the routed command.
+    let mut replacement = Command::new(original.get_program());
+    replacement
+        .args(original.get_args())
+        .current_dir(original.get_current_dir().expect("frozen absolute cwd"))
+        .envs(
+            original
+                .get_envs()
+                .map(|(name, value)| (name, value.expect("frozen entry"))),
+        )
+        .stdout(Stdio::piped());
+    assert_eq!(replacement.get_program(), original.get_program());
+    assert_eq!(
+        replacement.get_args().collect::<Vec<_>>(),
+        original.get_args().collect::<Vec<_>>()
+    );
+    assert_eq!(replacement.get_current_dir(), original.get_current_dir());
+    assert_eq!(
+        replacement.get_envs().collect::<Vec<_>>(),
+        original.get_envs().collect::<Vec<_>>()
+    );
+    let prepared = observer
+        .prepare(replacement, routed)
+        .expect("owned replacement loses hidden inheritance before ACK");
+    let (child, prepared) = prepared.spawn().unwrap_or_else(|_| panic!("actual child"));
+    observer
+        .spawned(&prepared, child.id())
+        .expect("actual PID ACK");
+    let output = child.wait_with_output().expect("same actual child wait");
+    assert!(output.status.success());
+    assert_eq!(
+        output.stdout, b"VISIBLE=checked\n",
+        "actual environment contains no ambient entries"
+    );
+    observer
+        .complete(prepared, output.status)
+        .expect("actual completion ACK");
+    server.join().expect("actual connected parent");
+}
