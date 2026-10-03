@@ -63,6 +63,55 @@ pub fn run_build(
         session.configure(&mut cmd)?;
     }
 
+    if let Some(selected) = selected
+        .as_mut()
+        .filter(|session| session.has_launch_observer())
+    {
+        selected.configure(&mut cmd, true);
+        let mut child = selected.launch(
+            cmd,
+            build_graph::compiler_invocation::CargoOperationKind::Build,
+        )?;
+        let stdout = child
+            .child
+            .stdout
+            .take()
+            .context("selected Cargo stdout missing")?;
+        let mut compiled = Vec::new();
+        let mut stream_error = None;
+        for message in Message::parse_stream(BufReader::new(stdout)) {
+            let message = match message {
+                Ok(message) => message,
+                Err(error) => {
+                    stream_error = Some(error);
+                    break;
+                }
+            };
+            if let Some(session) = observation.as_mut() {
+                match &message {
+                    Message::CompilerArtifact(artifact) => session.artifact(artifact),
+                    Message::BuildScriptExecuted(script) => session.build_script(script),
+                    _ => {}
+                }
+            }
+            if let Message::CompilerArtifact(artifact) = message {
+                compiled.push(CompiledTarget {
+                    package_id: artifact.package_id,
+                    target_name: artifact.target.name,
+                    fresh: artifact.fresh,
+                });
+            }
+        }
+        let status = child.wait()?;
+        if let Some(error) = stream_error {
+            return Err(error).context("failed to read selected Cargo message stream");
+        }
+        if !status.success() {
+            bail!("selected Cargo build failed; graph not updated");
+        }
+        return Ok(compiled);
+    }
+
     let operation = if let Some(selected) = selected.as_mut() {
         selected.configure(&mut cmd, true);
         selected.begin(

@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +13,8 @@ use crate::compiler_observer::{
 };
 use anyhow::{Result, bail};
 use build_graph::compiler_invocation::*;
+#[cfg(target_os = "linux")]
+use build_graph::launch_intent::{Binding, Observer, PreparedLaunch, RoutedIntent};
 
 pub const REQUEST_ENV: &str = "BUILD_GRAPH_CARGO_OPERATION";
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(0);
@@ -39,6 +41,10 @@ pub struct CargoLaunchSession {
     retained: usize,
     read_budget: u64,
     lost: u64,
+    #[cfg(target_os = "linux")]
+    observer: Option<Observer>,
+    #[cfg(target_os = "linux")]
+    routed: Option<RoutedIntent>,
 }
 
 impl CargoLaunchSession {
@@ -100,6 +106,10 @@ impl CargoLaunchSession {
             retained: 0,
             read_budget: 32 * 1024 * 1024,
             lost: 0,
+            #[cfg(target_os = "linux")]
+            observer: None,
+            #[cfg(target_os = "linux")]
+            routed: None,
         })
     }
 
@@ -128,6 +138,91 @@ impl CargoLaunchSession {
         self.roots = roots.to_vec();
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn set_launch_observer(&mut self, observer: Observer) -> Result<()> {
+        if self.ordinal != 0 || self.observer.is_some() {
+            bail!("launch observer must precede every selected Cargo operation");
+        }
+        self.observer = Some(observer);
+        Ok(())
+    }
+
+    pub fn has_launch_observer(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            self.observer.is_some()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
+
+    /// Consume the configured Command so no caller can mutate it after the
+    /// final-intent ACK. The same guard retains carrier/Child through actual
+    /// wait or synchronous cancellation; this proves no descendant extinction.
+    pub fn launch(
+        &mut self,
+        mut command: Command,
+        kind: CargoOperationKind,
+    ) -> Result<CargoChild<'_>> {
+        let operation = self.begin(&mut command, kind)?;
+        #[cfg(target_os = "linux")]
+        if let Some(observer) = &mut self.observer {
+            let routed = self
+                .routed
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("launch intent routing missing"))?;
+            let prepared = observer.prepare(command, routed)?;
+            let (child, prepared) = match prepared.spawn() {
+                Ok(value) => value,
+                Err((error, prepared)) => {
+                    let result = observer.spawn_failed(prepared);
+                    self.complete(operation, None);
+                    result?;
+                    return Err(error.into());
+                }
+            };
+            let fault = observer.spawned(&prepared, child.id()).err();
+            self.spawned(operation);
+            let mut owned = CargoChild {
+                child,
+                session: self,
+                operation,
+                waited: false,
+                prepared: Some(prepared),
+                fault,
+            };
+            if owned.fault.is_some() {
+                // A child already exists: retain this same owner and carrier,
+                // cancel synchronously, and prove actual wait before error.
+                owned.cancel_owned();
+                return Err(owned
+                    .fault
+                    .take()
+                    .unwrap_or_else(|| anyhow::anyhow!("launch observer failed")));
+            }
+            return Ok(owned);
+        }
+        let child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                self.complete(operation, None);
+                return Err(error.into());
+            }
+        };
+        self.spawned(operation);
+        Ok(CargoChild {
+            child,
+            session: self,
+            operation,
+            waited: false,
+            #[cfg(target_os = "linux")]
+            prepared: None,
+            fault: None,
+        })
+    }
+
     pub fn begin(
         &mut self,
         command: &mut Command,
@@ -142,6 +237,30 @@ impl CargoLaunchSession {
             .ok_or_else(|| anyhow::anyhow!("Cargo operation ordinal exhausted"))?;
         let request = format!("{}-{}", self.label, self.ordinal);
         command.env(REQUEST_ENV, &request);
+        #[cfg(target_os = "linux")]
+        if let Some(observer) = &mut self.observer {
+            if self.operations.len() >= MAX_CARGO_OPERATIONS {
+                bail!("launch intent operation bound exhausted");
+            }
+            self.routed = Some(
+                observer.route(
+                    command,
+                    Binding {
+                        session: self.label.clone(),
+                        operation: self.ordinal,
+                        request: request.clone(),
+                        root: observer.root().to_owned(),
+                        kind: match kind {
+                            CargoOperationKind::Metadata => "metadata",
+                            CargoOperationKind::Build => "build",
+                            CargoOperationKind::Docs => "docs",
+                        }
+                        .into(),
+                    },
+                    true,
+                )?,
+            );
+        }
         if self.operations.len() >= MAX_CARGO_OPERATIONS {
             self.lost = self.lost.saturating_add(1);
             return Ok(None);
@@ -179,7 +298,11 @@ impl CargoLaunchSession {
                     .collect(),
             )
         };
-        let environment = capture_environment(command, &mut retained, &mut truncations);
+        let environment = if self.has_launch_observer() {
+            capture_explicit_environment(command, &mut retained, &mut truncations)
+        } else {
+            capture_environment(command, &mut retained, &mut truncations)
+        };
         let cwd = command
             .get_current_dir()
             .map(Path::to_path_buf)
@@ -224,6 +347,9 @@ impl CargoLaunchSession {
             + std::mem::size_of::<RawOperation>()
             + request.len();
         if retained > MAX_CARGO_SESSION_BYTES.saturating_sub(self.retained) {
+            if self.has_launch_observer() {
+                bail!("launch intent observation retention bound exhausted");
+            }
             self.lost = self.lost.saturating_add(1);
             return Ok(None);
         }
@@ -377,6 +503,261 @@ impl CargoLaunchSession {
         }
         result
     }
+}
+
+/// Actual opt-in Child owner. A post-spawn observer error is retained until
+/// the same Child is waited; it cannot permit another launch or success export.
+pub struct CargoChild<'a> {
+    pub child: Child,
+    session: &'a mut CargoLaunchSession,
+    operation: Option<usize>,
+    waited: bool,
+    #[cfg(target_os = "linux")]
+    prepared: Option<PreparedLaunch>,
+    fault: Option<anyhow::Error>,
+}
+
+impl CargoChild<'_> {
+    pub fn wait(&mut self) -> Result<ExitStatus> {
+        let status = match self.child.wait() {
+            Ok(status) => status,
+            Err(error) => {
+                self.fault = Some(error.into());
+                self.cancel_owned();
+                return Err(self
+                    .fault
+                    .take()
+                    .unwrap_or_else(|| anyhow::anyhow!("selected Cargo wait failed")));
+            }
+        };
+        self.waited = true;
+        self.session.complete(self.operation, Some(status));
+        #[cfg(target_os = "linux")]
+        if let Some(prepared) = self.prepared.take() {
+            let result = self
+                .session
+                .observer
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("launch observer lost original owner"))?
+                .complete(prepared, status);
+            if self.fault.is_none() {
+                self.fault = result.err();
+            }
+        }
+        if let Some(error) = self.fault.take() {
+            return Err(error);
+        }
+        Ok(status)
+    }
+
+    /// Wait errors never release the Child/carrier. After one cancellation
+    /// attempt this original stack remains observation-only until actual wait
+    /// succeeds or its external owner disposes the entire caller scope.
+    fn retained_wait(&mut self) -> ExitStatus {
+        loop {
+            match self.child.wait() {
+                Ok(status) => return status,
+                Err(error) => {
+                    if self.fault.is_none() {
+                        self.fault = Some(error.into());
+                    }
+                    std::thread::park_timeout(std::time::Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
+    fn cancel_owned(&mut self) {
+        if self.waited {
+            return;
+        }
+        let pid = self.child.id();
+        let _ = self.child.kill();
+        let status = self.retained_wait();
+        self.waited = true;
+        self.session.complete(self.operation, Some(status));
+        #[cfg(target_os = "linux")]
+        if let Some(prepared) = self.prepared.take() {
+            if let Some(observer) = &mut self.session.observer {
+                if let Err(error) = observer.cancel(prepared, pid, Some(status)) {
+                    if self.fault.is_none() {
+                        self.fault = Some(error);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn output(&mut self) -> Result<Output> {
+        use std::io::{self, Read};
+        use std::os::fd::AsRawFd;
+        // One synchronous owner drains both pipes. No reader thread can outlive
+        // the Child/carrier or prevent same-stack rollback on setup failure.
+        let mut stdout = self
+            .child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("selected Cargo stdout missing"))?;
+        let mut stderr = self
+            .child
+            .stderr
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("selected Cargo stderr missing"))?;
+        let mut buffers = [Vec::new(), Vec::new()];
+        let mut done = [false; 2];
+        let descriptors = [stdout.as_raw_fd(), stderr.as_raw_fd()];
+        for descriptor in descriptors {
+            let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+            if flags < 0
+                || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                self.fault = Some(io::Error::last_os_error().into());
+                self.cancel_owned();
+                return Err(self
+                    .fault
+                    .take()
+                    .unwrap_or_else(|| anyhow::anyhow!("selected Cargo pipe setup failed")));
+            }
+        }
+        let mut overflow = false;
+        while !done.into_iter().all(|value| value) {
+            let mut poll = [
+                libc::pollfd {
+                    fd: descriptors[0],
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: descriptors[1],
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            for (index, entry) in poll.iter_mut().enumerate() {
+                if done[index] {
+                    entry.fd = -1;
+                }
+            }
+            let result = unsafe { libc::poll(poll.as_mut_ptr(), 2, -1) };
+            if result < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                self.fault = Some(error.into());
+                self.cancel_owned();
+                return Err(self
+                    .fault
+                    .take()
+                    .unwrap_or_else(|| anyhow::anyhow!("selected Cargo pipe poll failed")));
+            }
+            for index in 0..2 {
+                if done[index] || poll[index].revents == 0 {
+                    continue;
+                }
+                let mut chunk = [0u8; 4096];
+                let read = if index == 0 {
+                    stdout.read(&mut chunk)
+                } else {
+                    stderr.read(&mut chunk)
+                };
+                match read {
+                    Ok(0) => done[index] = true,
+                    Ok(count) => {
+                        if count <= (8 * 1024 * 1024usize).saturating_sub(buffers[index].len())
+                            && !overflow
+                        {
+                            buffers[index].extend_from_slice(&chunk[..count]);
+                        } else {
+                            if !overflow {
+                                let _ = self.child.kill();
+                            }
+                            overflow = true;
+                        }
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+                        ) => {}
+                    Err(error) => {
+                        self.fault = Some(error.into());
+                        self.cancel_owned();
+                        return Err(self.fault.take().unwrap_or_else(|| {
+                            anyhow::anyhow!("selected Cargo pipe read failed")
+                        }));
+                    }
+                }
+            }
+        }
+        let status = self.wait()?;
+        if overflow {
+            bail!("selected Cargo output exceeds bound");
+        }
+        let [stdout, stderr] = buffers;
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+impl Drop for CargoChild<'_> {
+    fn drop(&mut self) {
+        if !self.waited && self.session.has_launch_observer() {
+            self.cancel_owned();
+        }
+    }
+}
+
+fn capture_explicit_environment(
+    command: &Command,
+    retained: &mut usize,
+    truncations: &mut Vec<CollectionTruncation>,
+) -> Vec<EnvironmentObservation> {
+    let mut environment = Vec::new();
+    let mut observed = 0u64;
+    for (name, value) in command.get_envs() {
+        let Some(name) = name.to_str().filter(|name| env_allowed(name)) else {
+            continue;
+        };
+        let Some(value) = value else {
+            continue;
+        };
+        observed += 1;
+        let value = value
+            .to_str()
+            .filter(|value| value.len() <= MAX_TEXT_BYTES && safe_env_value(name, value));
+        let bytes = name.len().saturating_add(value.map_or(0, str::len));
+        if name.len() > MAX_TEXT_BYTES
+            || environment.len() >= MAX_FILES
+            || bytes > MAX_CARGO_OPERATION_BYTES.saturating_sub(*retained)
+        {
+            continue;
+        }
+        *retained += bytes;
+        environment.push(EnvironmentObservation {
+            name: name.to_owned(),
+            present: true,
+            gap: value
+                .is_none()
+                .then_some(ObservationGap::EnvironmentWithheld),
+            value: value.map(str::to_owned),
+            path: None,
+            content_fingerprint: None,
+        });
+    }
+    if observed > environment.len() as u64 {
+        truncations.push(CollectionTruncation {
+            collection: "cargo_operation_environment".into(),
+            observed,
+            retained: environment.len() as u64,
+            count_exact: true,
+        });
+    }
+    environment
 }
 
 fn capture_environment(
@@ -689,3 +1070,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "cargo_launch_tests.rs"]
+mod launch_guard_tests;

@@ -62,6 +62,19 @@ pub fn add_item_layer_routed(
         let mut command =
             selected_doc_command(meta, target_dir, packages, release, &selected.cargo);
         selected.configure(&mut command, false);
+        if selected.has_launch_observer() {
+            let mut child = selected.launch(
+                command,
+                build_graph::compiler_invocation::CargoOperationKind::Docs,
+            )?;
+            let status = child.wait()?;
+            if !status.success() {
+                eprintln!(
+                    "[build-graph] rich layer: doc build reported errors; ingesting newly produced JSON"
+                );
+            }
+            return Ok(status.success());
+        }
         let operation = selected.begin(
             &mut command,
             build_graph::compiler_invocation::CargoOperationKind::Docs,

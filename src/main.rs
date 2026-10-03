@@ -167,6 +167,14 @@ struct BuildArgs {
     /// Extra arguments forwarded to `cargo build` (after `--`).
     #[arg(last = true)]
     cargo_args: Vec<String>,
+    /// Inherited connected Linux observer FD. Observations create no custody.
+    #[cfg(all(target_os = "linux", feature = "rustc-driver"))]
+    #[arg(long, requires_all = ["observe_definition_occurrences", "cargo_launch_root"])]
+    cargo_launch_observer_fd: Option<i32>,
+    /// Opaque correlation supplied by the original launching caller.
+    #[cfg(all(target_os = "linux", feature = "rustc-driver"))]
+    #[arg(long, requires = "cargo_launch_observer_fd")]
+    cargo_launch_root: Option<String>,
 }
 
 #[derive(Args)]
@@ -334,6 +342,15 @@ fn main() -> Result<()> {
 }
 
 fn run_build(a: BuildArgs) -> Result<()> {
+    #[cfg(all(target_os = "linux", feature = "rustc-driver"))]
+    if let Some(fd) = a.cargo_launch_observer_fd {
+        return build_and_extract_with_launch(
+            &a.common,
+            &a.cargo_args,
+            true,
+            Some((fd, a.cargo_launch_root.context("launch root missing")?)),
+        );
+    }
     build_and_extract(&a.common, &a.cargo_args, true)
 }
 
@@ -341,6 +358,15 @@ fn run_build(a: BuildArgs) -> Result<()> {
 /// from target/. Shared by `build` and the `watch` loop. Both the build and the
 /// extract are already incremental — only changed crates recompile/re-document.
 fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool) -> Result<()> {
+    build_and_extract_with_launch(common, cargo_args, do_build, None)
+}
+
+fn build_and_extract_with_launch(
+    common: &CommonArgs,
+    cargo_args: &[String],
+    do_build: bool,
+    launch: Option<(i32, String)>,
+) -> Result<()> {
     #[cfg(feature = "rustc-driver")]
     let occurrence_common = (common.observe_definition_occurrences && common.nightly.is_none())
         .then(|| {
@@ -354,6 +380,29 @@ fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool)
         bail!("compiler observation requires an actual build");
     }
     let mut selected_cargo = selected_occurrence_cargo(common)?;
+    if let Some((fd, root)) = launch {
+        #[cfg(target_os = "linux")]
+        {
+            use build_graph::launch_intent::{Channel, Observer};
+            use std::os::fd::{FromRawFd, OwnedFd};
+            if fd < 3 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                bail!("launch observer FD is invalid");
+            }
+            // This explicit build-only option adopts one caller-supplied FD.
+            // Channel duplicates CLOEXEC then closes the inherited number.
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            let channel = Channel::new(fd.into())?;
+            selected_cargo
+                .as_mut()
+                .context("launch observer requires selected Cargo")?
+                .set_launch_observer(Observer::new(channel, root)?)?;
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (fd, root);
+            bail!("launch observer is unavailable on this platform");
+        }
+    }
     let mut observations = None;
     let mut selected_observation = None;
     let compiled = if do_build {

@@ -37,6 +37,26 @@ pub fn load_routed(
     }
     let mut command = metadata.cargo_command();
     selected.configure(&mut command, false);
+    #[cfg(target_os = "linux")]
+    if selected.has_launch_observer() {
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = selected.launch(
+            command,
+            build_graph::compiler_invocation::CargoOperationKind::Metadata,
+        )?;
+        let output = child.output()?;
+        if !output.status.success() {
+            bail!("selected Cargo metadata failed");
+        }
+        let stdout = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .find(|line| line.starts_with('{'))
+            .context("Cargo metadata produced no JSON")?;
+        return MetadataCommand::parse(stdout).context("selected Cargo metadata JSON failed");
+    }
     let operation = selected.begin(
         &mut command,
         build_graph::compiler_invocation::CargoOperationKind::Metadata,

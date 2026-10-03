@@ -223,3 +223,30 @@ and are explicitly outside this attachment's coverage. The downstream adapter
 must bind the exact public commit and sidecar bytes, independently observe and
 qualify actual execution inputs, and preserve mandatory runtime/test gates.
 Public fixtures alone do not certify downstream planning reduction or authority.
+
+## Optional launch intent channel
+
+The new [generic channel](cargo-launch-intent.md) is validated in the same job,
+with all earlier default and occurrence/semantic cases retained. Source-only
+regression authoring is not execution evidence. Run the locked default and
+feature-enabled library/binary suites, then:
+
+```bash
+cargo test --locked --test launch_intent_flow
+BUILD_GRAPH_DRIVER=/approved/bg-driver cargo test --locked --features rustc-driver --test launch_intent_flow
+cargo test --locked --bin cargo-build-graph cargo_launch::launch_guard_tests
+cargo test --locked --lib launch_intent::linux::tests
+```
+
+The feature-enabled target requires the actual pinned driver. It invokes the
+real selected metadata/build/docs CLI route, verifies every final sealed intent
+and overlay, and denies the first actual metadata route before Cargo spawn or
+export. Set the existing `BUILD_GRAPH_TEST_OCCURRENCE_CARGO` when the original
+job selects a qualified patched Cargo. Library/binary cases use actual connected
+streams, transferred sealed FDs, real children and actual wait, covering raw
+non-UTF8 environment delivery, command mutation, distinct sessions, duplicate
+nonce/keys, byte/count/time caps, unsupported FD, fixed ancillary framing,
+missing ACK, real spawn failure, guard cancellation, post-spawn denial and
+bounded metadata output. Fixture observations do not qualify original-owner
+birth, custody, executable or completeness. All original combined gates remain
+required, along with genuine locked dependency resolution and license closure.

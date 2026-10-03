@@ -44,6 +44,7 @@ pub mod compiler_semantic;
 pub mod export;
 pub mod fragment;
 pub mod graph;
+pub mod launch_intent;
 pub mod merge;
 pub mod output;
 pub mod report;
