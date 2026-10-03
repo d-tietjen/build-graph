@@ -518,6 +518,10 @@ impl CompilerInvocationsV1 {
                 || invocation.occurrence_driver.is_none()
                 || binding.crate_name != invocation.unit.crate_name
                 || binding.metadata != invocation.unit.metadata
+                || invocation
+                    .occurrences
+                    .as_ref()
+                    .is_some_and(|legacy| binding.nonce != legacy.nonce)
                 || binding.command_fingerprint
                     != content_fingerprint(
                         &serde_json::to_vec(&invocation.command).map_err(|_| "semantic command")?,

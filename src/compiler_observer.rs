@@ -1982,6 +1982,38 @@ fn read_semantic_stream(
     }
     // Request/control bytes have their original independent small read cap.
     let mut control = MAX_INVOCATION_BYTES as u64;
+    // Use the original pre-execution callback request even if its legacy
+    // occurrence record was omitted at the invocation's encoded-size cap.
+    // Both control reads spend this same allowance; no fresh nonce is issued.
+    let raw = semantic_read(
+        &config.directory.join(format!("callback-{slot}.json")),
+        &config.roots,
+        MAX_INVOCATION_BYTES,
+        &mut control,
+    )?;
+    let callback: CallbackRequest = serde_json::from_slice(&raw)?;
+    if callback.schema_version != compiler_occurrence::OCCURRENCES_VERSION
+        || callback.output != config.directory.join(format!("occurrences-{slot}.json"))
+        || callback.command_fingerprint
+            != content_fingerprint(&serde_json::to_vec(&invocation.command)?)
+        || callback.crate_name != invocation.unit.crate_name
+        || callback.metadata != invocation.unit.metadata
+        || normalized(&callback.source, &config.roots) != invocation.unit.source
+        || !config
+            .roots
+            .iter()
+            .any(|root| root.kind == InputRoot::Source && root.path == callback.source_root)
+        || !config
+            .roots
+            .iter()
+            .any(|root| root.kind == InputRoot::Target && root.path == callback.target_root)
+        || invocation
+            .occurrences
+            .as_ref()
+            .is_some_and(|legacy| legacy.nonce != callback.nonce)
+    {
+        bail!("original semantic callback binding changed")
+    }
     let raw = semantic_read(
         &config
             .directory
@@ -1995,6 +2027,10 @@ fn read_semantic_stream(
         || request.budget_directory != config.directory
         || request.binding.crate_name != invocation.unit.crate_name
         || request.binding.metadata != invocation.unit.metadata
+        || request.binding.nonce != callback.nonce
+        || request.binding.command_fingerprint != callback.command_fingerprint
+        || request.binding.crate_name != callback.crate_name
+        || request.binding.metadata != callback.metadata
         || request.binding.command_fingerprint
             != content_fingerprint(&serde_json::to_vec(&invocation.command)?)
     {
@@ -3860,5 +3896,303 @@ mod tests {
                     && v.observed == 1
                     && v.retained == 0)
         );
+    }
+
+    fn original_semantic_callback(session: &Session) -> CallbackRequest {
+        let raw = bounded_read(
+            &session.config.directory.join("callback-0.json"),
+            MAX_INVOCATION_BYTES as u64,
+        )
+        .expect("actual original callback request");
+        serde_json::from_slice(&raw).expect("original typed callback")
+    }
+
+    fn rebind_semantic_fixture(
+        session: &Session,
+        index: &mut SemanticIndexV1,
+        binding: SemanticBindingV1,
+    ) -> SemanticStreamV1 {
+        let request_path = session.config.directory.join("semantic-request-0.json");
+        let mut request: SemanticRequest =
+            serde_json::from_slice(&fs::read(&request_path).unwrap()).unwrap();
+        request.binding = binding.clone();
+        fs::write(&request_path, serde_json::to_vec(&request).unwrap()).unwrap();
+        let page_path = session.config.directory.join("semantic-0/page-0.json");
+        let mut page = SemanticPageV1::from_json(&fs::read(&page_path).unwrap()).unwrap();
+        page.binding = binding.clone();
+        let raw = serde_json::to_vec(&page).unwrap();
+        fs::write(&page_path, &raw).unwrap();
+        index.binding = binding.clone();
+        index.terminal.binding = binding.clone();
+        index.pages[0].bytes = raw.len();
+        index.pages[0].content_fingerprint = page_fingerprint(&raw);
+        fs::write(
+            session.config.directory.join("semantic-0/index.json"),
+            serde_json::to_vec(index).unwrap(),
+        )
+        .unwrap();
+        let stream = SemanticStreamV1 {
+            binding,
+            pages: vec![page],
+            terminal: Some(index.terminal.clone()),
+        };
+        stream
+            .validate()
+            .expect("internally coherent replacement, not original correlation");
+        stream
+    }
+
+    #[test]
+    fn semantic_reader_rejects_coherent_nonce_replacement_of_original_callback() {
+        let (_workspace, session, mut invocation, mut index) = semantic_fixture();
+        let callback = original_semantic_callback(&session);
+        invocation.occurrences =
+            Some(read_callback(&callback, &invocation, &session.config.roots).unwrap());
+        let callback_path = session.config.directory.join("callback-0.json");
+        let original = fs::read(&callback_path).unwrap();
+        let legacy = fs::read(&callback.output).unwrap();
+        read_semantic_stream(
+            &session.config,
+            0,
+            &invocation,
+            MAX_ATTACHMENT_BYTES,
+            &mut MAX_SOURCE_WORK_BYTES,
+            &mut BTreeSet::new(),
+        )
+        .expect("original callback positive");
+        let mut replacement = index.binding.clone();
+        replacement.nonce.push_str("-replacement");
+        rebind_semantic_fixture(&session, &mut index, replacement);
+        let mut budget = MAX_SOURCE_WORK_BYTES;
+        let mut checked = BTreeSet::new();
+        let error = read_semantic_stream(
+            &session.config,
+            0,
+            &invocation,
+            MAX_ATTACHMENT_BYTES,
+            &mut budget,
+            &mut checked,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("callback binding changed"));
+        assert_eq!(budget, MAX_SOURCE_WORK_BYTES, "reject before source work");
+        assert!(checked.is_empty());
+        assert_eq!(fs::read(&callback_path).unwrap(), original);
+        assert_eq!(fs::read(&callback.output).unwrap(), legacy);
+        exclusive_write(
+            &session.config.directory.join("unit-0.json"),
+            &serde_json::to_vec(&invocation).unwrap(),
+        )
+        .unwrap();
+        let result = session.finish();
+        result
+            .validate()
+            .expect("original bounded partial assembly");
+        assert_eq!(result.invocations.len(), 1);
+        assert!(result.semantic_streams.is_empty());
+        assert!(
+            result
+                .gaps
+                .contains(&ObservationGap::OccurrenceCallbackRejected)
+        );
+        assert!(result.truncations.iter().any(|loss| loss.collection
+            == "assembled_semantic_streams"
+            && loss.observed == 1
+            && loss.retained == 0
+            && loss.count_exact));
+    }
+
+    #[test]
+    fn semantic_reader_keeps_original_nonce_after_legacy_encoded_size_omission() {
+        let (_workspace, session, mut invocation, mut index) = semantic_fixture();
+        let callback = original_semantic_callback(&session);
+        let legacy = read_callback(&callback, &invocation, &session.config.roots).unwrap();
+        invocation.environment = (0..8)
+            .map(|index| EnvironmentObservation {
+                name: format!("SEMANTIC_PADDING_{index}"),
+                present: true,
+                value: Some(String::new()),
+                content_fingerprint: None,
+                path: None,
+                gap: None,
+            })
+            .collect();
+        let base = bounded_json_size(&invocation, MAX_INVOCATION_BYTES).unwrap();
+        let mut padding = MAX_INVOCATION_BYTES - 128 - base;
+        for value in &mut invocation.environment {
+            let bytes = padding.min(MAX_TEXT_BYTES);
+            value.value = Some("x".repeat(bytes));
+            padding -= bytes;
+        }
+        assert_eq!(padding, 0);
+        invocation.occurrences = Some(legacy);
+        assert_eq!(
+            bounded_json_size(&invocation, MAX_INVOCATION_BYTES),
+            Err(ObservationSizeError::BudgetExceeded)
+        );
+        invocation.occurrences = None;
+        invocation.gaps.push(ObservationGap::BudgetExceeded);
+        invocation.bind_unit_key().unwrap();
+        invocation
+            .validate()
+            .expect("same original record after size-cap omission");
+        let stream = read_semantic_stream(
+            &session.config,
+            0,
+            &invocation,
+            MAX_ATTACHMENT_BYTES,
+            &mut MAX_SOURCE_WORK_BYTES,
+            &mut BTreeSet::new(),
+        )
+        .expect("original callback survives legacy omission");
+        assert_eq!(stream.binding.nonce, callback.nonce);
+        let mut replacement = index.binding.clone();
+        replacement.nonce.push_str("-replacement");
+        rebind_semantic_fixture(&session, &mut index, replacement);
+        assert!(
+            read_semantic_stream(
+                &session.config,
+                0,
+                &invocation,
+                MAX_ATTACHMENT_BYTES,
+                &mut MAX_SOURCE_WORK_BYTES,
+                &mut BTreeSet::new()
+            )
+            .is_err()
+        );
+        rebind_semantic_fixture(&session, &mut index, stream.binding);
+        fs::remove_file(session.config.directory.join("callback-0.json")).unwrap();
+        assert!(
+            read_semantic_stream(
+                &session.config,
+                0,
+                &invocation,
+                MAX_ATTACHMENT_BYTES,
+                &mut MAX_SOURCE_WORK_BYTES,
+                &mut BTreeSet::new()
+            )
+            .is_err(),
+            "a late semantic request cannot replace the missing original callback"
+        );
+    }
+
+    #[test]
+    fn semantic_reader_rejects_mixed_original_units_commands_and_control_budget_reset() {
+        for change in ["unit", "command", "control_budget"] {
+            let (_workspace, session, mut invocation, mut index) = semantic_fixture();
+            let original = fs::read(session.config.directory.join("callback-0.json")).unwrap();
+            if change == "control_budget" {
+                let mut padded = original.clone();
+                padded.resize(MAX_INVOCATION_BYTES - 1, b' ');
+                fs::write(session.config.directory.join("callback-0.json"), padded).unwrap();
+            } else {
+                if change == "unit" {
+                    invocation.unit.crate_name = "another_unit".into();
+                    invocation.unit.metadata = Some("other_metadata".into());
+                } else {
+                    invocation.command.reverse();
+                }
+                invocation.bind_unit_key().unwrap();
+                let mut binding = index.binding.clone();
+                binding.crate_name = invocation.unit.crate_name.clone();
+                binding.metadata = invocation.unit.metadata.clone();
+                binding.command_fingerprint =
+                    content_fingerprint(&serde_json::to_vec(&invocation.command).unwrap());
+                rebind_semantic_fixture(&session, &mut index, binding);
+                assert_eq!(
+                    fs::read(session.config.directory.join("callback-0.json")).unwrap(),
+                    original
+                );
+            }
+            let mut budget = MAX_SOURCE_WORK_BYTES;
+            let mut checked = BTreeSet::new();
+            assert!(
+                read_semantic_stream(
+                    &session.config,
+                    0,
+                    &invocation,
+                    MAX_ATTACHMENT_BYTES,
+                    &mut budget,
+                    &mut checked
+                )
+                .is_err(),
+                "original {change} correlation/control cap"
+            );
+            assert_eq!(budget, MAX_SOURCE_WORK_BYTES);
+            assert!(checked.is_empty());
+        }
+    }
+
+    #[test]
+    fn semantic_export_rejects_nonce_that_contradicts_present_legacy() {
+        use build_graph::export::{
+            CompilerReport, CompilerStatus, EXPORT_FILE, EXPORT_SCHEMA_VERSION, ExportManifest,
+            GraphArtifact,
+        };
+        let (workspace, session, mut invocation, mut index) = semantic_fixture();
+        let callback = original_semantic_callback(&session);
+        invocation.occurrences =
+            Some(read_callback(&callback, &invocation, &session.config.roots).unwrap());
+        let stream = read_semantic_stream(
+            &session.config,
+            0,
+            &invocation,
+            MAX_ATTACHMENT_BYTES,
+            &mut MAX_SOURCE_WORK_BYTES,
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
+        let mut facts = attachment();
+        facts.invocations.push(invocation);
+        facts.semantic_streams.push(InvocationSemanticStreamV1 {
+            invocation: 0,
+            stream,
+        });
+        facts.validate().expect("same original nonce positive");
+        let graph = build_graph::Graph::new().into_doc();
+        let mut manifest = ExportManifest {
+            schema_version: EXPORT_SCHEMA_VERSION,
+            graph: GraphArtifact {
+                filename: "graph.json".into(),
+                content_fingerprint: content_fingerprint(&serde_json::to_vec(&graph).unwrap()),
+            },
+            compiler: CompilerReport {
+                status: CompilerStatus::Unknown,
+                artifacts: vec![],
+            },
+            sources: BTreeMap::new(),
+            layers: vec![],
+            definitions: vec![],
+            compiler_invocations: Some(facts),
+        };
+        let output = workspace.root.join("export-correlation");
+        build_graph::output::write_export(output.as_std_path(), &manifest)
+            .expect("genuine exporter positive");
+        build_graph::output::read_export(output.as_std_path())
+            .expect("genuine export reader positive");
+        let mut replacement = index.binding.clone();
+        replacement.nonce.push_str("-replacement");
+        let changed = rebind_semantic_fixture(&session, &mut index, replacement);
+        let facts = manifest.compiler_invocations.as_mut().unwrap();
+        facts.semantic_streams[0].stream = changed;
+        assert!(
+            facts.validate().is_err(),
+            "present original occurrence contradicts the coherent stream"
+        );
+        assert!(CompilerInvocationsV1::from_json(&serde_json::to_vec(&facts).unwrap()).is_err());
+        assert!(build_graph::output::write_export(output.as_std_path(), &manifest).is_err());
+        fs::write(
+            output.join(EXPORT_FILE),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(build_graph::output::read_export(output.as_std_path()).is_err());
+        manifest.compiler_invocations.as_mut().unwrap().invocations[0].occurrences = None;
+        manifest
+            .compiler_invocations
+            .as_ref()
+            .unwrap()
+            .validate()
+            .expect("no absent-legacy authority is inferred by the portable model");
     }
 }

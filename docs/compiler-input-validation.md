@@ -23,12 +23,25 @@ actual_unsupported_resolution_and_long_definition_are_counted
 actual_source_work_limit_is_shared_across_files_and_pages
 actual_per_file_limit_reports_interruption_without_terminal_success
 actual_output_overflow_keeps_committed_pages_and_interrupted_terminal
+actual_nested_owner_signatures_keep_body_tables_scoped_and_restore_outer
+compiler_observer::tests::semantic_reader_rejects_coherent_nonce_replacement_of_original_callback
+compiler_observer::tests::semantic_reader_keeps_original_nonce_after_legacy_encoded_size_omission
+compiler_observer::tests::semantic_reader_rejects_mixed_original_units_commands_and_control_budget_reset
+compiler_observer::tests::semantic_export_rejects_nonce_that_contradicts_present_legacy
 ```
 
 Use `cargo test --locked --lib compiler_semantic::tests`, the original observer
 binary selectors, and the feature-enabled `compiler_semantic_flow` integration
 target with the same mandatory actual `BUILD_GRAPH_DRIVER`. These are execution
 instructions for the validation job, not evidence of a passing run.
+The additive owner case uses nested generic functions, type aliases, trait and
+impl signatures, a foreign declaration, nested bodies and a closure before
+continued outer-body calls. The callback cases coherently rewrite every semantic
+nonce and page fingerprint while retaining the original callback, cover actual
+legacy size-cap omission, and use the genuine assembly/export readers and
+writers. Both control reads share the existing cap; no optional stream adds an
+aggregate or source-work allowance. All prior selectors and bodies remain
+required and unchanged.
 
 ## Actual driver occurrences
 

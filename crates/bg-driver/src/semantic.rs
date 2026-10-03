@@ -555,7 +555,30 @@ fn compiler_path(tcx: TyCtxt<'_>, writer: &mut Writer, mut did: DefId) -> Option
     (!output.contains(['/', '\\', '\0', '\n', '\r']) && output.len() <= 1024).then_some(output)
 }
 
-impl Walk<'_, '_> {
+impl<'tcx> Walk<'_, 'tcx> {
+    fn typeck_for(&self, id: HirId) -> Option<&'tcx TypeckResults<'tcx>> {
+        self.typeck.filter(|results| {
+            results.hir_owner == id.owner
+                && matches!(
+                    self.tcx.hir_node(id),
+                    rustc_hir::Node::Expr(_)
+                        | rustc_hir::Node::Pat(_)
+                        | rustc_hir::Node::ExprField(_)
+                        | rustc_hir::Node::PatField(_)
+                )
+        })
+    }
+    fn without_typeck(
+        &mut self,
+        walk: impl FnOnce(&mut Self) -> ControlFlow<()>,
+    ) -> ControlFlow<()> {
+        // Item signatures are outside the enclosing body's table. Their own
+        // bodies install their original table through visit_body, then restore.
+        let old = self.typeck.take();
+        let result = walk(self);
+        self.typeck = old;
+        result
+    }
     fn target(&mut self, res: Res) -> Option<SemanticTarget> {
         match res {
             Res::Def(_, did) => {
@@ -630,6 +653,18 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, 'tcx> {
     fn visit_id(&mut self, _: HirId) -> Self::Result {
         self.writer.work()
     }
+    fn visit_item(&mut self, item: &'tcx rustc_hir::Item<'tcx>) -> Self::Result {
+        self.without_typeck(|walk| intravisit::walk_item(walk, item))
+    }
+    fn visit_trait_item(&mut self, item: &'tcx rustc_hir::TraitItem<'tcx>) -> Self::Result {
+        self.without_typeck(|walk| intravisit::walk_trait_item(walk, item))
+    }
+    fn visit_impl_item(&mut self, item: &'tcx rustc_hir::ImplItem<'tcx>) -> Self::Result {
+        self.without_typeck(|walk| intravisit::walk_impl_item(walk, item))
+    }
+    fn visit_foreign_item(&mut self, item: &'tcx rustc_hir::ForeignItem<'tcx>) -> Self::Result {
+        self.without_typeck(|walk| intravisit::walk_foreign_item(walk, item))
+    }
     fn visit_body(&mut self, body: &Body<'tcx>) -> Self::Result {
         let old = self.typeck;
         let owner = body.value.hir_id.owner.def_id;
@@ -652,13 +687,13 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, 'tcx> {
     fn visit_qpath(&mut self, path: &'tcx QPath<'tcx>, id: HirId, span: Span) -> Self::Result {
         if !matches!(path, QPath::Resolved(..)) {
             self.writer.work()?;
-            if let Some(typeck) = self.typeck {
+            if let Some(typeck) = self.typeck_for(id) {
                 self.reference(typeck.qpath_res(path, id), id, span, "path");
             } else {
                 self.unsupported_reference();
             }
         }
-        intravisit::walk_qpath(self, path, id, span)
+        intravisit::walk_qpath(self, path, id)
     }
     fn visit_path_segment(&mut self, segment: &'tcx PathSegment<'tcx>) -> Self::Result {
         self.writer.work()?;
@@ -723,11 +758,15 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, 'tcx> {
             }
         }
         if let PatKind::Struct(ref path, fields, _) = pattern.kind {
-            if let Some(typeck) = self.typeck {
+            if let Some(typeck) = self.typeck_for(pattern.hir_id) {
                 let res = typeck.qpath_res(path, pattern.hir_id);
                 if let ty::Adt(adt, _) = typeck.pat_ty(pattern).kind() {
                     for field in fields {
                         self.writer.work()?;
+                        let Some(typeck) = self.typeck_for(field.hir_id) else {
+                            self.unsupported_reference();
+                            continue;
+                        };
                         if let Some(definition) = adt
                             .variant_of_res(res)
                             .fields
@@ -784,10 +823,14 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, 'tcx> {
     }
     fn visit_expr(&mut self, expression: &'tcx Expr<'tcx>) -> Self::Result {
         self.writer.work()?;
-        if let Some(typeck) = self.typeck {
+        if let Some(typeck) = self.typeck_for(expression.hir_id) {
             match expression.kind {
                 ExprKind::Call(callee, _) => {
                     if let ExprKind::Path(ref path) = callee.kind {
+                        let Some(typeck) = self.typeck_for(callee.hir_id) else {
+                            self.unsupported_reference();
+                            return intravisit::walk_expr(self, expression);
+                        };
                         let indirect =
                             !matches!(typeck.expr_ty_adjusted(callee).kind(), ty::FnDef(..));
                         if indirect {
@@ -834,7 +877,11 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, 'tcx> {
                     }
                 }
                 ExprKind::Field(receiver, _) => {
-                    if let ty::Adt(adt, _) = typeck.expr_ty_adjusted(receiver).kind() {
+                    let Some(receiver_typeck) = self.typeck_for(receiver.hir_id) else {
+                        self.unsupported_reference();
+                        return intravisit::walk_expr(self, expression);
+                    };
+                    if let ty::Adt(adt, _) = receiver_typeck.expr_ty_adjusted(receiver).kind() {
                         if adt.is_struct() || adt.is_union() {
                             if let Some(field) = adt
                                 .non_enum_variant()
@@ -900,6 +947,10 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, 'tcx> {
                     if let ty::Adt(adt, _) = typeck.expr_ty(expression).kind() {
                         for field in fields {
                             self.writer.work()?;
+                            let Some(typeck) = self.typeck_for(field.hir_id) else {
+                                self.unsupported_reference();
+                                continue;
+                            };
                             if let Some(definition) = adt
                                 .variant_of_res(res)
                                 .fields
@@ -924,11 +975,23 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, 'tcx> {
                 }
                 _ => {}
             }
-        } else if matches!(
-            expression.kind,
-            ExprKind::Call(..) | ExprKind::MethodCall(..) | ExprKind::Field(..)
-        ) {
-            self.unsupported_reference();
+        } else {
+            match expression.kind {
+                ExprKind::Struct(_, fields, _) => {
+                    for _ in fields {
+                        self.writer.work()?;
+                        self.unsupported_reference();
+                    }
+                }
+                ExprKind::Call(..)
+                | ExprKind::MethodCall(..)
+                | ExprKind::Field(..)
+                | ExprKind::Index(..)
+                | ExprKind::Unary(..)
+                | ExprKind::Binary(..)
+                | ExprKind::AssignOp(..) => self.unsupported_reference(),
+                _ => {}
+            }
         }
         intravisit::walk_expr(self, expression)
     }

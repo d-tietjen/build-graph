@@ -27,6 +27,13 @@ and path-segment resolutions, local bindings, lifetime parameters, calls,
 methods, field access and construction/destructuring, and overloaded or builtin
 operators. Import namespace resolutions come from the compiler's `walk_use`.
 Body type checking uses the actual type-checking root, including nested closures.
+Entering an item, trait item, impl item or foreign item clears the enclosing
+body table while its signature is visited. Its body installs its own original
+table, and returning restores the enclosing table. Each lookup requires the
+actual matching HIR owner and a supported expression, pattern or field node;
+non-body associated-type signatures retain an unsupported disposition. The
+pinned `visit_qpath` span remains the observed location; its walk helper takes
+only the visitor, qualified path and HIR identity.
 Method resolution attempts the actual post-analysis instance; unresolved dynamic
 dispatch retains its observed trait target and an unsupported disposition.
 
@@ -45,6 +52,12 @@ There is no large all-occurrence collection or sorting pass. Each stream binds
 its fresh callback nonce, enclosing ordered-command marker, crate, metadata and
 `local_hir` domain. The attachment assigns the exact retained invocation ordinal
 after the existing Cargo unit join and invocation sort.
+The reader binds the semantic request to the same original pre-execution
+callback request, including its nonce, command and unit. It reads both control
+files through the existing anchored reader within one 32 KiB control allowance.
+An omitted legacy occurrence record does not replace that original callback.
+A present legacy record must agree with the stream nonce in both the reader
+and portable attachment validator. These are correlation checks, not authority.
 
 ## Pages, terminal and bounds
 

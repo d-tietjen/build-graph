@@ -253,3 +253,101 @@ fn actual_output_overflow_keeps_committed_pages_and_interrupted_terminal() {
     assert!(terminal.omitted > 0);
     assert!(serde_json::to_vec(&facts).unwrap().len() <= MAX_ATTACHMENT_BYTES);
 }
+
+#[test]
+fn actual_nested_owner_signatures_keep_body_tables_scoped_and_restore_outer() {
+    let source = r#"
+pub trait Assoc { type Value; fn wrap(value: Self::Value) -> Self::Value; }
+pub struct Payload { pub value: u32 }
+impl Assoc for Payload { type Value = u32; fn wrap(value: u32) -> u32 { value } }
+pub fn touch(value: u32) -> u32 { value }
+pub fn outer(record: Payload) -> u32 {
+    fn inner<T: Assoc>(value: T::Value) -> T::Value { T::wrap(value) }
+    type NestedAlias<T: Assoc> = T::Value;
+    trait NestedTrait<T: Assoc> {
+        fn required(value: T::Value) -> T::Value;
+        fn provided(value: T::Value) -> T::Value { T::wrap(value) }
+    }
+    struct Nested;
+    impl Nested {
+        fn associated<T: Assoc>(value: T::Value) -> T::Value { T::wrap(value) }
+    }
+    unsafe extern "C" {
+        fn foreign(value: <Payload as Assoc>::Value) -> <Payload as Assoc>::Value;
+    }
+    let first = inner::<Payload>(record.value);
+    let second = Nested::associated::<Payload>(first);
+    let closure = || touch(second);
+    touch(closure())
+}
+"#;
+    let facts = Fixture::new(source).build();
+    let observed = stream(&facts);
+    let terminal = observed
+        .terminal
+        .as_ref()
+        .expect("actual traversal terminal");
+    assert_eq!(terminal.stop, TraversalStop::EndOfDomain);
+    assert!(
+        terminal.unsupported > 0,
+        "non-body associated-type signatures retain their disposition"
+    );
+    assert!(terminal.gaps.contains(&SemanticGap::UnsupportedResolution));
+    let definitions: Vec<_> = observed
+        .pages
+        .iter()
+        .flat_map(|page| &page.definitions)
+        .collect();
+    let owner = |suffix: &str| {
+        definitions
+            .iter()
+            .find(|definition| {
+                definition.binding_owner.is_none() && definition.compiler_path.ends_with(suffix)
+            })
+            .unwrap_or_else(|| panic!("missing actual nested definition {suffix}"))
+            .local_index
+    };
+    for suffix in [
+        "inner",
+        "NestedAlias",
+        "NestedTrait",
+        "required",
+        "provided",
+        "associated",
+        "foreign",
+    ] {
+        let _ = owner(suffix);
+    }
+    let references: Vec<_> = observed
+        .pages
+        .iter()
+        .flat_map(|page| &page.references)
+        .collect();
+    for suffix in ["inner", "provided", "associated"] {
+        assert!(references.iter().any(|reference| {
+            reference.owner_index == owner(suffix)
+                && reference.role == "call"
+                && matches!(&reference.target, SemanticTarget::Definition { compiler_path, .. } if compiler_path.ends_with("wrap"))
+                && reference.location.is_some()
+        }), "nested body must use its own original table: {suffix}");
+    }
+    let outer = owner("outer");
+    for suffix in ["inner", "associated", "touch"] {
+        assert!(references.iter().any(|reference| {
+            reference.owner_index == outer
+                && reference.role == "call"
+                && matches!(&reference.target, SemanticTarget::Definition { compiler_path, .. } if compiler_path.ends_with(suffix))
+                && reference.location.is_some()
+        }), "outer body must resume after nested owner: {suffix}");
+    }
+    assert!(references.iter().any(|reference| {
+        reference.owner_index == outer && reference.role == "field"
+            && matches!(&reference.target, SemanticTarget::Definition { compiler_path, .. } if compiler_path.ends_with("value"))
+    }));
+    assert!(references.iter().filter(|reference| {
+        reference.owner_index == outer && reference.role == "call"
+            && matches!(&reference.target, SemanticTarget::Definition { compiler_path, .. } if compiler_path.ends_with("touch"))
+    }).count() >= 2, "the closure shares its actual type-checking root and the outer body continues afterward");
+    observed.validate().expect("same bounded stream validator");
+    assert!(serde_json::to_vec(&facts).unwrap().len() <= MAX_ATTACHMENT_BYTES);
+}
