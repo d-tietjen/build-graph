@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use camino::Utf8Path;
 use cargo_metadata::{Metadata, MetadataCommand, Package, PackageId};
 
@@ -19,6 +19,62 @@ pub fn load(manifest_path: Option<&Utf8Path>) -> Result<Metadata> {
         cmd.manifest_path(mp);
     }
     cmd.exec().context("`cargo metadata` failed")
+}
+
+/// Use the library's actual command/JSON parser with the selected Cargo. Legacy
+/// absence keeps MetadataCommand::exec unchanged; no shadow resolution runs.
+pub fn load_routed(
+    manifest_path: Option<&Utf8Path>,
+    selected: Option<&mut crate::cargo_launch::CargoLaunchSession>,
+) -> Result<Metadata> {
+    let Some(selected) = selected else {
+        return load(manifest_path);
+    };
+    let mut metadata = MetadataCommand::new();
+    metadata.cargo_path(&selected.cargo);
+    if let Some(manifest) = manifest_path {
+        metadata.manifest_path(manifest);
+    }
+    let mut command = metadata.cargo_command();
+    selected.configure(&mut command, false);
+    #[cfg(target_os = "linux")]
+    if selected.has_launch_observer() {
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = selected.launch(
+            command,
+            build_graph::compiler_invocation::CargoOperationKind::Metadata,
+        )?;
+        let output = child.output()?;
+        if !output.status.success() {
+            bail!("selected Cargo metadata failed");
+        }
+        let stdout = std::str::from_utf8(&output.stdout)?
+            .lines()
+            .find(|line| line.starts_with('{'))
+            .context("Cargo metadata produced no JSON")?;
+        return MetadataCommand::parse(stdout).context("selected Cargo metadata JSON failed");
+    }
+    let operation = selected.begin(
+        &mut command,
+        build_graph::compiler_invocation::CargoOperationKind::Metadata,
+    )?;
+    let output = command.output();
+    selected.complete(operation, output.as_ref().ok().map(|output| output.status));
+    let output = output.context("failed to spawn selected Cargo metadata")?;
+    if !output.status.success() {
+        bail!(
+            "selected Cargo metadata failed (exit {:?})",
+            output.status.code()
+        );
+    }
+    let stdout = std::str::from_utf8(&output.stdout)?
+        .lines()
+        .find(|line| line.starts_with('{'))
+        .context("Cargo metadata produced no JSON")?;
+    MetadataCommand::parse(stdout).context("selected Cargo metadata JSON failed")
 }
 
 /// Add crate nodes + `depends_on` edges for workspace members.

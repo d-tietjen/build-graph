@@ -36,8 +36,16 @@ pub fn run_build(
     release: bool,
     packages: &[String],
     extra_args: &[String],
+    mut observation: Option<&mut crate::compiler_observer::Session>,
+    mut selected: Option<&mut crate::cargo_launch::CargoLaunchSession>,
 ) -> Result<Vec<CompiledTarget>> {
-    let mut cmd = Command::new("cargo");
+    let mut cmd = Command::new(
+        selected
+            .as_ref()
+            .map(|selected| selected.cargo.as_path())
+            .or_else(|| observation.as_ref().and_then(|s| s.cargo_program()))
+            .unwrap_or_else(|| std::path::Path::new("cargo")),
+    );
     cmd.arg("build")
         .arg("--message-format=json-render-diagnostics");
     if let Some(mp) = manifest_path {
@@ -51,17 +59,103 @@ pub fn run_build(
     }
     cmd.args(extra_args);
     cmd.stdout(Stdio::piped());
+    if let Some(session) = observation.as_mut() {
+        session.configure(&mut cmd)?;
+    }
 
-    let mut child = cmd.spawn().context("failed to spawn `cargo build`")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("cargo build produced no stdout")?;
+    if let Some(selected) = selected
+        .as_mut()
+        .filter(|session| session.has_launch_observer())
+    {
+        selected.configure(&mut cmd, true);
+        let mut child = selected.launch(
+            cmd,
+            build_graph::compiler_invocation::CargoOperationKind::Build,
+        )?;
+        let stdout = child
+            .child
+            .stdout
+            .take()
+            .context("selected Cargo stdout missing")?;
+        let mut compiled = Vec::new();
+        let mut stream_error = None;
+        for message in Message::parse_stream(BufReader::new(stdout)) {
+            let message = match message {
+                Ok(message) => message,
+                Err(error) => {
+                    stream_error = Some(error);
+                    break;
+                }
+            };
+            if let Some(session) = observation.as_mut() {
+                match &message {
+                    Message::CompilerArtifact(artifact) => session.artifact(artifact),
+                    Message::BuildScriptExecuted(script) => session.build_script(script),
+                    _ => {}
+                }
+            }
+            if let Message::CompilerArtifact(artifact) = message {
+                compiled.push(CompiledTarget {
+                    package_id: artifact.package_id,
+                    target_name: artifact.target.name,
+                    fresh: artifact.fresh,
+                });
+            }
+        }
+        let status = child.wait()?;
+        if let Some(error) = stream_error {
+            return Err(error).context("failed to read selected Cargo message stream");
+        }
+        if !status.success() {
+            bail!("selected Cargo build failed; graph not updated");
+        }
+        return Ok(compiled);
+    }
+
+    let operation = if let Some(selected) = selected.as_mut() {
+        selected.configure(&mut cmd, true);
+        selected.begin(
+            &mut cmd,
+            build_graph::compiler_invocation::CargoOperationKind::Build,
+        )?
+    } else {
+        None
+    };
+
+    let spawned = cmd.spawn();
+    if spawned.is_err() {
+        if let Some(selected) = selected.as_mut() {
+            selected.complete(operation, None);
+        }
+    }
+    let mut child = spawned.context("failed to spawn `cargo build`")?;
+    if let Some(selected) = selected.as_mut() {
+        selected.spawned(operation);
+    }
+    // Close the actual pipe and reap the same Child even on a read error. The
+    // parser error remains the result; it cannot leave this launch unrecorded.
+    let stdout = child.stdout.take().expect("piped Cargo stdout");
     let reader = BufReader::new(stdout);
 
     let mut compiled = Vec::new();
+    let mut stream_error = None;
     for message in Message::parse_stream(reader) {
-        let message = message.context("failed to read cargo message stream")?;
+        let message = match message {
+            Ok(message) => message,
+            Err(error) => {
+                if stream_error.is_none() {
+                    stream_error = Some(error);
+                }
+                break;
+            }
+        };
+        if let Some(session) = observation.as_mut() {
+            match &message {
+                Message::CompilerArtifact(artifact) => session.artifact(artifact),
+                Message::BuildScriptExecuted(script) => session.build_script(script),
+                _ => {}
+            }
+        }
         if let Message::CompilerArtifact(artifact) = message {
             compiled.push(CompiledTarget {
                 package_id: artifact.package_id,
@@ -71,7 +165,14 @@ pub fn run_build(
         }
     }
 
-    let status = child.wait().context("waiting on `cargo build` failed")?;
+    let waited = child.wait();
+    if let Some(selected) = selected.as_mut() {
+        selected.complete(operation, waited.as_ref().ok().copied());
+    }
+    let status = waited.context("waiting on `cargo build` failed")?;
+    if let Some(error) = stream_error {
+        return Err(error).context("failed to read cargo message stream");
+    }
     if !status.success() {
         bail!(
             "`cargo build` failed (exit {}); graph not updated",

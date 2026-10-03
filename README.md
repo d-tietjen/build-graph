@@ -193,3 +193,9 @@ Artifacts are written to `target/build-graph/` by default:
 ## License
 
 MIT
+
+The feature-enabled Linux `build` route also supports an explicit inherited
+Cargo launch observer FD and opaque root correlation. See the
+[bounded generic protocol](docs/cargo-launch-intent.md) for invocation, sealed
+intent and ACK sequencing, privacy, failure ownership and remaining original
+parent qualification. It is disabled by default and does not change graph DTOs.

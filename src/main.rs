@@ -4,9 +4,13 @@
 
 mod cache;
 mod cargo_build;
+mod cargo_launch;
+mod compiler_observer;
 mod depinfo;
 #[cfg(feature = "rustc-driver")]
 mod driver_refs;
+#[cfg(feature = "rustc-driver")]
+mod explicit_toolchain;
 mod export_sources;
 mod metadata;
 mod qserve;
@@ -111,6 +115,52 @@ struct CommonArgs {
     /// Restrict extraction to these packages.
     #[arg(short = 'p', long = "package")]
     packages: Vec<String>,
+    /// Attach portable observations from this build's actual rustc invocations.
+    #[arg(long)]
+    observe_compiler_inputs: bool,
+    /// Observe definitions/references in this actual build via the pinned nightly
+    /// driver. Requires rustc-dev and a matching prebuilt or buildable bg-driver.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, requires = "observe_compiler_inputs")]
+    observe_definition_occurrences: bool,
+    /// Attach bounded pages and a traversal terminal for the whole local HIR
+    /// domain. These observations retain unsupported and interrupted outcomes.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, requires = "observe_definition_occurrences")]
+    observe_semantic_stream: bool,
+    /// Observe the effective analysed compiler cfg and backend feature sets.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, requires = "observe_semantic_stream")]
+    observe_compiler_context: bool,
+    /// Observe the actual generated standard test descriptors and runner.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, requires = "observe_semantic_stream")]
+    observe_test_harness: bool,
+    /// Deliver callback requests through immutable held Linux descriptors.
+    /// This transport supplies bytes, not execution-input custody.
+    #[cfg(all(target_os = "linux", feature = "rustc-driver"))]
+    #[arg(long, requires = "observe_definition_occurrences")]
+    held_callback_controls: bool,
+    /// Actual Cargo executable for occurrence metadata/build/docs (default:
+    /// matching nightly Cargo). A path is observational, not authentication.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, value_name = "PATH", requires = "observe_definition_occurrences")]
+    occurrence_cargo: Option<String>,
+    /// Explicit supplied rustc. Requires the complete supplied tool set and driver.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, value_name = "PATH", requires_all = ["observe_definition_occurrences", "occurrence_cargo", "occurrence_rustdoc", "occurrence_sysroot", "driver_bin"])]
+    occurrence_rustc: Option<String>,
+    /// Explicit supplied rustdoc; avoids ambient toolchain discovery.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, value_name = "PATH", requires_all = ["occurrence_rustc", "occurrence_sysroot"])]
+    occurrence_rustdoc: Option<String>,
+    /// Explicit compiler sysroot, including lib/ for the supplied driver.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, value_name = "PATH", requires_all = ["occurrence_rustc", "occurrence_rustdoc"])]
+    occurrence_sysroot: Option<String>,
+    /// Additional approved input root: dependencies|host_tools|cargo_config=PATH.
+    #[arg(long, value_name = "NAME=PATH", requires = "observe_compiler_inputs")]
+    compiler_input_root: Vec<String>,
     /// Use the release profile.
     #[arg(long)]
     release: bool,
@@ -144,6 +194,14 @@ struct BuildArgs {
     /// Extra arguments forwarded to `cargo build` (after `--`).
     #[arg(last = true)]
     cargo_args: Vec<String>,
+    /// Inherited connected Linux observer FD. Observations create no custody.
+    #[cfg(all(target_os = "linux", feature = "rustc-driver"))]
+    #[arg(long, requires_all = ["observe_definition_occurrences", "cargo_launch_root"])]
+    cargo_launch_observer_fd: Option<i32>,
+    /// Opaque correlation supplied by the original launching caller.
+    #[cfg(all(target_os = "linux", feature = "rustc-driver"))]
+    #[arg(long, requires = "cargo_launch_observer_fd")]
+    cargo_launch_root: Option<String>,
 }
 
 #[derive(Args)]
@@ -158,7 +216,7 @@ struct WatchArgs {
     /// Don't run `cargo build` each cycle — just re-extract from the current
     /// target/. Use when your editor/rust-analyzer already drives the build and
     /// you only want the graph to track what's already compiled.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "observe_compiler_inputs")]
     no_build: bool,
     /// Extra arguments forwarded to `cargo build` (after `--`).
     #[arg(last = true)]
@@ -287,13 +345,21 @@ struct ViewArgs {
 fn main() -> Result<()> {
     // When invoked as `cargo build-graph …`, cargo passes "build-graph" as argv[1].
     let mut args: Vec<OsString> = std::env::args_os().collect();
+    if compiler_observer::is_wrapper(&args) {
+        std::process::exit(compiler_observer::wrapper(&args[1..]));
+    }
     if args.get(1).map(|s| s == "build-graph").unwrap_or(false) {
         args.remove(1);
     }
     match Cli::parse_from(args).cmd {
         Cmd::Build(a) => run_build(a),
         Cmd::Watch(w) => run_watch(w),
-        Cmd::Update(c) => run_extract(&c, None),
+        Cmd::Update(c) => {
+            if c.observe_compiler_inputs {
+                bail!("compiler observation requires an actual build");
+            }
+            run_extract(&c, None)
+        }
         Cmd::View(v) => run_view(v),
         Cmd::Find(f) => run_find(f),
         Cmd::Refs(r) => run_refs(r),
@@ -303,6 +369,15 @@ fn main() -> Result<()> {
 }
 
 fn run_build(a: BuildArgs) -> Result<()> {
+    #[cfg(all(target_os = "linux", feature = "rustc-driver"))]
+    if let Some(fd) = a.cargo_launch_observer_fd {
+        return build_and_extract_with_launch(
+            &a.common,
+            &a.cargo_args,
+            true,
+            Some((fd, a.cargo_launch_root.context("launch root missing")?)),
+        );
+    }
     build_and_extract(&a.common, &a.cargo_args, true)
 }
 
@@ -310,14 +385,132 @@ fn run_build(a: BuildArgs) -> Result<()> {
 /// from target/. Shared by `build` and the `watch` loop. Both the build and the
 /// extract are already incremental — only changed crates recompile/re-document.
 fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool) -> Result<()> {
+    build_and_extract_with_launch(common, cargo_args, do_build, None)
+}
+
+fn build_and_extract_with_launch(
+    common: &CommonArgs,
+    cargo_args: &[String],
+    do_build: bool,
+    launch: Option<(i32, String)>,
+) -> Result<()> {
+    #[cfg(feature = "rustc-driver")]
+    let occurrence_common = (common.observe_definition_occurrences && common.nightly.is_none())
+        .then(|| {
+            let mut selected = common.clone();
+            selected.nightly = Some(DEFAULT_DRIVER_NIGHTLY.into());
+            selected
+        });
+    #[cfg(feature = "rustc-driver")]
+    let common = occurrence_common.as_ref().unwrap_or(common);
+    if common.observe_compiler_inputs && !do_build {
+        bail!("compiler observation requires an actual build");
+    }
+    // Discovery invokes rustup/rustc before the selected Session exists. Adopt
+    // the inherited channel first so only its private CLOEXEC duplicate remains
+    // during every helper exec, including discovery failures.
+    #[cfg(target_os = "linux")]
+    let launch_observer = launch
+        .map(|(fd, root)| {
+            use build_graph::launch_intent::{Channel, Observer};
+            use std::os::fd::{FromRawFd, OwnedFd};
+            if fd < 3 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+                bail!("launch observer FD is invalid");
+            }
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            Observer::new(Channel::new(fd.into())?, root)
+        })
+        .transpose()?;
+    #[cfg(not(target_os = "linux"))]
+    if launch.is_some() {
+        bail!("launch observer is unavailable on this platform");
+    }
+    let mut selected_cargo = selected_occurrence_cargo(common)?;
+    #[cfg(target_os = "linux")]
+    if let Some(observer) = launch_observer {
+        selected_cargo
+            .as_mut()
+            .context("launch observer requires selected Cargo")?
+            .set_launch_observer(observer)?;
+    }
+    let mut observations = None;
+    let mut selected_observation = None;
     let compiled = if do_build {
         let manifest = common.manifest_path.as_ref().map(Utf8PathBuf::from);
+        let mut session = if common.observe_compiler_inputs {
+            let meta = metadata::load_routed(manifest.as_deref(), selected_cargo.as_mut())?;
+            let target = meta.target_directory.as_std_path().to_path_buf();
+            Some(compiler_observer::Session::new(
+                meta,
+                &target,
+                &common.compiler_input_root,
+            )?)
+        } else {
+            None
+        };
+        #[cfg(feature = "rustc-driver")]
+        if common.observe_definition_occurrences {
+            let binary = driver_refs::resolve_driver(common.driver_bin.as_deref())?;
+            let nightly = common.nightly.as_deref().unwrap_or(DEFAULT_DRIVER_NIGHTLY);
+            let selected = selected_cargo
+                .as_mut()
+                .context("selected occurrence Cargo missing")?;
+            selected.set_roots(
+                session
+                    .as_ref()
+                    .context("compiler observation missing")?
+                    .roots(),
+            );
+            session
+                .as_mut()
+                .context("occurrence capture requires compiler observation")?
+                .enable_driver(
+                    binary.into_std_path_buf(),
+                    selected.cargo.clone(),
+                    selected.rustc.clone(),
+                    nightly.into(),
+                    selected.library.clone(),
+                )?;
+            #[cfg(target_os = "linux")]
+            if common.held_callback_controls {
+                session
+                    .as_mut()
+                    .context("compiler observation missing")?
+                    .enable_held_callback_controls()?;
+            }
+            if common.observe_semantic_stream {
+                session
+                    .as_mut()
+                    .context("semantic observation missing")?
+                    .enable_semantic_stream()?;
+            }
+            if common.observe_compiler_context || common.observe_test_harness {
+                session
+                    .as_mut()
+                    .context("compiler observation missing")?
+                    .enable_compiler_context_observation()?;
+            }
+            if common.observe_test_harness {
+                session
+                    .as_mut()
+                    .context("compiler observation missing")?
+                    .enable_test_harness_observation()?;
+            }
+        }
         let compiled = cargo_build::run_build(
             manifest.as_deref(),
             common.release,
             &common.packages,
             cargo_args,
+            session.as_mut(),
+            selected_cargo.as_mut(),
         )?;
+        if selected_cargo.is_some() {
+            selected_observation = session;
+        } else {
+            // Preserve ordinary capture's original post-build finish/cleanup.
+            observations = session.as_ref().map(compiler_observer::Session::finish);
+        }
         let changed = compiled.iter().filter(|t| t.changed()).count();
         eprintln!(
             "[build-graph] build ok: {} artifact(s), {} recompiled",
@@ -328,7 +521,53 @@ fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool)
     } else {
         None
     };
-    run_extract(common, compiled.as_deref())
+    let manifest = common.manifest_path.as_ref().map(Utf8PathBuf::from);
+    let meta = metadata::load_routed(manifest.as_deref(), selected_cargo.as_mut())?;
+    run_extract_observed(
+        common,
+        compiled.as_deref(),
+        meta,
+        rustdoc::add_item_layer,
+        observations,
+        selected_observation,
+        selected_cargo,
+    )
+}
+
+fn selected_occurrence_cargo(
+    common: &CommonArgs,
+) -> Result<Option<cargo_launch::CargoLaunchSession>> {
+    #[cfg(feature = "rustc-driver")]
+    if common.observe_definition_occurrences {
+        let nightly = common.nightly.as_deref().unwrap_or(DEFAULT_DRIVER_NIGHTLY);
+        if let Some(tools) = explicit_toolchain::ExplicitToolchain::selected(common)? {
+            let mut selected = cargo_launch::CargoLaunchSession::new(
+                tools.cargo,
+                tools.rustc,
+                tools.rustdoc,
+                nightly.into(),
+                tools.sysroot.join("lib"),
+                &common.compiler_input_root,
+            )?;
+            selected.set_explicit_sysroot(tools.sysroot)?;
+            return Ok(Some(selected));
+        }
+        let cargo = match &common.occurrence_cargo {
+            Some(path) => std::path::PathBuf::from(path),
+            None => driver_refs::tool_program(nightly, "cargo")?,
+        };
+        return Ok(Some(cargo_launch::CargoLaunchSession::new(
+            cargo,
+            driver_refs::tool_program(nightly, "rustc")?,
+            driver_refs::tool_program(nightly, "rustdoc")?,
+            nightly.into(),
+            std::path::PathBuf::from(driver_refs::sysroot(nightly)?).join("lib"),
+            &common.compiler_input_root,
+        )?));
+    }
+    #[cfg(not(feature = "rustc-driver"))]
+    let _ = common;
+    Ok(None)
 }
 
 /// Watch the workspace and re-run the incremental refresh whenever a `.rs` or
@@ -336,8 +575,12 @@ fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool)
 /// unchanged crates, so a save only re-does the crate(s) you touched. The graph
 /// (and anything serving it) updates in place.
 fn run_watch(a: WatchArgs) -> Result<()> {
+    if a.no_build && a.common.observe_compiler_inputs {
+        bail!("compiler observation requires an actual build");
+    }
     let manifest = a.common.manifest_path.as_ref().map(Utf8PathBuf::from);
-    let meta = metadata::load(manifest.as_deref())?;
+    let mut initial_cargo = selected_occurrence_cargo(&a.common)?;
+    let meta = metadata::load_routed(manifest.as_deref(), initial_cargo.as_mut())?;
     let root = meta.workspace_root.clone();
     let target_dir = a
         .common
@@ -456,6 +699,18 @@ fn run_extract_with_item_layer(
     compiled: Option<&[cargo_build::CompiledTarget]>,
     meta: cargo_metadata::Metadata,
     extract_items: ItemLayerExtractor,
+) -> Result<()> {
+    run_extract_observed(c, compiled, meta, extract_items, None, None, None)
+}
+
+fn run_extract_observed(
+    c: &CommonArgs,
+    compiled: Option<&[cargo_build::CompiledTarget]>,
+    meta: cargo_metadata::Metadata,
+    extract_items: ItemLayerExtractor,
+    compiler_invocations: Option<build_graph::compiler_invocation::CompilerInvocationsV1>,
+    compiler_observation: Option<compiler_observer::Session>,
+    mut selected_cargo: Option<cargo_launch::CargoLaunchSession>,
 ) -> Result<()> {
     let target_dir = c
         .target_dir
@@ -688,15 +943,27 @@ fn run_extract_with_item_layer(
             eprintln!("[build-graph] layer 2: no changed crates to re-document");
         } else {
             let t2 = std::time::Instant::now();
-            let result = extract_items(
-                &mut graph,
-                &meta,
-                &target_dir,
-                c.nightly.as_deref(),
-                &rich_dirty,
-                c.release,
-                c.no_derives,
-            )?;
+            let result = if let Some(selected) = selected_cargo.as_mut() {
+                rustdoc::add_item_layer_routed(
+                    &mut graph,
+                    &meta,
+                    &target_dir,
+                    &rich_dirty,
+                    c.release,
+                    c.no_derives,
+                    selected,
+                )
+            } else {
+                extract_items(
+                    &mut graph,
+                    &meta,
+                    &target_dir,
+                    c.nightly.as_deref(),
+                    &rich_dirty,
+                    c.release,
+                    c.no_derives,
+                )
+            }?;
             definitions.extend(result.definitions);
             for report in result.packages {
                 item_reports.insert(report.package.clone(), report);
@@ -720,6 +987,18 @@ fn run_extract_with_item_layer(
             if c.driver_requested() {
                 let nightly = c.nightly.as_deref().unwrap_or(DEFAULT_DRIVER_NIGHTLY);
                 result = driver_refs::resolve_driver(c.driver_bin.as_deref()).and_then(|bin| {
+                    if let Some(selected) = selected_cargo
+                        .as_mut()
+                        .filter(|selected| selected.has_explicit_tools())
+                    {
+                        return driver_refs::add_references_layer_selected(
+                            &mut graph,
+                            &meta.workspace_root,
+                            &out,
+                            &bin,
+                            selected,
+                        );
+                    }
                     driver_refs::add_references_layer(
                         &mut graph,
                         &meta.workspace_root,
@@ -841,6 +1120,16 @@ fn run_extract_with_item_layer(
                 })
                 .collect(),
         },
+        compiler_invocations: compiler_invocations.or_else(|| {
+            compiler_observation
+                .as_ref()
+                .map(|session| match &selected_cargo {
+                    Some(selected) => {
+                        session.finish_with_operations(Some(selected.finish(session.roots())))
+                    }
+                    None => session.finish(),
+                })
+        }),
         sources,
         layers: vec![
             LayerReport::from_packages(Layer::Sources, source_reports),
@@ -1101,6 +1390,32 @@ mod tests {
 
     use super::*;
     use crate::test_support::Workspace;
+
+    #[test]
+    fn watch_observation_conflict_is_rejected_by_clap() {
+        for args in [
+            [
+                "cargo-build-graph",
+                "watch",
+                "--no-build",
+                "--observe-compiler-inputs",
+            ],
+            [
+                "cargo-build-graph",
+                "watch",
+                "--observe-compiler-inputs",
+                "--no-build",
+            ],
+        ] {
+            let error = Cli::try_parse_from(args).err().expect("static conflict");
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
+        assert!(Cli::try_parse_from(["cargo-build-graph", "watch", "--no-build"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["cargo-build-graph", "watch", "--observe-compiler-inputs"])
+                .is_ok()
+        );
+    }
 
     fn fixture_items(
         graph: &mut Graph,

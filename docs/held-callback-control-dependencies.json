@@ -1,0 +1,30 @@
+{
+  "component": "optional Linux held callback control transport",
+  "driver_lock": "crates/bg-driver/Cargo.lock, same exact libc version/checksum",
+  "driver_toolchain": "nightly-2026-02-27 unchanged",
+  "locked_resolution_execution": null,
+  "packages": [
+    {
+      "declared_license": "MIT OR Apache-2.0",
+      "license_files": [
+        {
+          "bytes": 9723,
+          "path": "licenses/launch-intent/libc-0.2.186/LICENSE-APACHE",
+          "sha256": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a"
+        },
+        {
+          "bytes": 1066,
+          "path": "licenses/launch-intent/libc-0.2.186/LICENSE-MIT",
+          "sha256": "123a331b5dbf04c30097fa43b8f858bc85df671fe776de498d01f3d6b7c1f69e"
+        }
+      ],
+      "package": "libc-0.2.186",
+      "registry_archive_sha256": "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+    }
+  ],
+  "repository_license": "MIT; LICENSE unchanged",
+  "root_lock": "Cargo.lock, existing exact libc entry unchanged",
+  "root_rust_version": "1.85 unchanged",
+  "schema_version": 1,
+  "source_package_qualification": null
+}
