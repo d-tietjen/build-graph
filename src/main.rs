@@ -121,6 +121,11 @@ struct CommonArgs {
     #[cfg(feature = "rustc-driver")]
     #[arg(long, requires = "observe_compiler_inputs")]
     observe_definition_occurrences: bool,
+    /// Attach bounded pages and a traversal terminal for the whole local HIR
+    /// domain. These observations retain unsupported and interrupted outcomes.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, requires = "observe_definition_occurrences")]
+    observe_semantic_stream: bool,
     /// Actual Cargo executable for occurrence metadata/build/docs (default:
     /// matching nightly Cargo). A path is observational, not authentication.
     #[cfg(feature = "rustc-driver")]
@@ -387,6 +392,12 @@ fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool)
                     nightly.into(),
                     selected.library.clone(),
                 )?;
+            if common.observe_semantic_stream {
+                session
+                    .as_mut()
+                    .context("semantic observation missing")?
+                    .enable_semantic_stream()?;
+            }
         }
         let compiled = cargo_build::run_build(
             manifest.as_deref(),

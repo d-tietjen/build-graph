@@ -1,5 +1,9 @@
 # Compiler occurrence observations
 
+The distinct optional [semantic stream](compiler-semantic-stream.md) observes
+the full local HIR domain with bounded pages and traversal terminals. The
+legacy occurrence contract below remains unchanged.
+
 The optional `CompilerInvocation.occurrences` field records definitions and
 references visited by **that invocation's** `bg-driver` analysis callback. It
 does not infer active definitions from source-file membership, Cargo features,

@@ -307,6 +307,14 @@ pub struct CompilerInvocationsV1 {
     /// authenticated parent/child lineage or custody capability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cargo_operations: Option<CargoOperationsV1>,
+    /// Distinct optional whole-local-HIR observations, outside each 32 KiB
+    /// invocation record and inside this attachment's original total budget.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "crate::compiler_semantic::bounded_list::<_, _, 128>"
+    )]
+    pub semantic_streams: Vec<crate::compiler_semantic::InvocationSemanticStreamV1>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,8 +459,20 @@ impl CompilerInvocationsV1 {
             }
         })?;
         validate_portable_values(
-            &serde_json::to_value(self)
-                .map_err(|_| "compiler observations could not be serialized".to_string())?,
+            &serde_json::to_value((
+                &self.schema_version,
+                &self.cargo,
+                &self.cargo_command,
+                &self.cargo_cwd,
+                &self.cargo_environment,
+                &self.wrapper,
+                &self.invocations,
+                &self.generators,
+                &self.gaps,
+                &self.truncations,
+                &self.cargo_operations,
+            ))
+            .map_err(|_| "compiler observations could not be serialized".to_string())?,
         )?;
         if let Some(args) = &self.cargo_command {
             if args.len() > MAX_ARGUMENTS {
@@ -480,6 +500,31 @@ impl CompilerInvocationsV1 {
         }
         for generator in &self.generators {
             generator.validate()?;
+        }
+        if self.semantic_streams.len() > MAX_INVOCATIONS {
+            return Err("semantic invocation limit".into());
+        }
+        let mut semantic_invocations = BTreeSet::new();
+        for observed in &self.semantic_streams {
+            observed.stream.validate().map_err(str::to_owned)?;
+            let invocation = self
+                .invocations
+                .get(observed.invocation)
+                .ok_or("semantic invocation missing")?;
+            let binding = &observed.stream.binding;
+            if !semantic_invocations.insert(observed.invocation)
+                || !invocation.success
+                || invocation.exit_code != Some(0)
+                || invocation.occurrence_driver.is_none()
+                || binding.crate_name != invocation.unit.crate_name
+                || binding.metadata != invocation.unit.metadata
+                || binding.command_fingerprint
+                    != content_fingerprint(
+                        &serde_json::to_vec(&invocation.command).map_err(|_| "semantic command")?,
+                    )
+            {
+                return Err("semantic invocation changed".into());
+            }
         }
         if !self.truncations.is_empty() && !self.gaps.contains(&ObservationGap::BudgetExceeded) {
             return Err("unaccounted observation truncation".into());
@@ -817,6 +862,7 @@ mod tests {
             gaps: vec![ObservationGap::UnobservedExecutionInputs],
             truncations: vec![],
             cargo_operations: None,
+            semantic_streams: vec![],
         }
     }
 

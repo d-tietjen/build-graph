@@ -26,7 +26,10 @@ use rustc_middle::ty::{self, TyCtxt, TypeckResults};
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
 #[path = "../../../src/compiler_occurrence.rs"]
 mod compiler_occurrence;
+#[path = "../../../src/compiler_semantic.rs"]
+mod compiler_semantic;
 mod occurrences;
+mod semantic;
 
 struct BgCallbacks;
 
@@ -118,7 +121,8 @@ fn extract(tcx: TyCtxt<'_>) {
         }
     }
 
-    if let Some(collector) = occurrences {
+    if let Some(mut collector) = occurrences {
+        semantic::observe(tcx, &mut collector);
         collector.publish();
     }
 

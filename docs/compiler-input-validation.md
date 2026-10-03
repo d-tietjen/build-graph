@@ -1,5 +1,35 @@
 # Compiler observation validation
 
+## Semantic stream
+
+The distinct [semantic stream](compiler-semantic-stream.md) adds the following
+source selectors to the same driver/CLI artifact job. No selector has been run
+while authoring. Preserve all existing default, driver, legacy occurrence and
+selected-Cargo cases.
+
+```text
+compiler_semantic::tests::empty_observed_domain_and_interruption_counts_are_distinct
+compiler_semantic::tests::page_binding_order_and_terminal_totals_reject_substitution
+compiler_semantic::tests::page_limits_and_unknown_fields_preserve_distinct_legacy_shape
+compiler_semantic::tests::terminal_overflow_and_false_emitted_totals_reject
+compiler_semantic::tests::bounded_deserialization_and_encoded_page_limit_are_independent
+compiler_semantic::tests::source_versions_retain_each_association_and_reject_conflicting_version
+compiler_observer::tests::semantic_page_reader_binds_actual_request_and_shares_source_work
+compiler_observer::tests::semantic_page_reader_rejects_inventory_before_page_allocation
+compiler_observer::tests::semantic_page_reader_rejects_changed_page_and_missing_terminal
+compiler_observer::tests::semantic_streams_cannot_reset_attachment_assembly_allowance
+actual_full_hir_domain_spans_pages_and_preserves_legacy_partial_record
+actual_unsupported_resolution_and_long_definition_are_counted
+actual_source_work_limit_is_shared_across_files_and_pages
+actual_per_file_limit_reports_interruption_without_terminal_success
+actual_output_overflow_keeps_committed_pages_and_interrupted_terminal
+```
+
+Use `cargo test --locked --lib compiler_semantic::tests`, the original observer
+binary selectors, and the feature-enabled `compiler_semantic_flow` integration
+target with the same mandatory actual `BUILD_GRAPH_DRIVER`. These are execution
+instructions for the validation job, not evidence of a passing run.
+
 ## Actual driver occurrences
 
 The optional occurrence producer adds the same-job gates below. Build the driver

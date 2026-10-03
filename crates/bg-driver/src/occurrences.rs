@@ -46,9 +46,57 @@ pub struct Collector {
     definitions: HashMap<DefId, DefinitionOccurrence>,
     sources: BTreeMap<PathBuf, (u32, OccurrenceInput)>,
     budget: usize,
+    source_budget_exhausted: bool,
 }
 
 impl Collector {
+    pub fn semantic_binding(&self) -> crate::compiler_semantic::SemanticBindingV1 {
+        crate::compiler_semantic::SemanticBindingV1 {
+            schema_version: 1,
+            nonce: self.request.nonce.clone(),
+            command_fingerprint: self.request.command_fingerprint.clone(),
+            crate_name: self.request.crate_name.clone(),
+            metadata: self.request.metadata.clone(),
+            domain: crate::compiler_semantic::SemanticDomain::LocalHir,
+        }
+    }
+
+    pub fn semantic_parent(&self) -> Option<&std::path::Path> {
+        self.request.output.parent()
+    }
+
+    pub fn source_work_bytes(&self) -> u64 {
+        (MAX_SOURCE_TOTAL_BYTES - self.budget) as u64
+    }
+    pub fn source_work_exhausted(&self) -> bool {
+        self.source_budget_exhausted
+    }
+    pub fn source_version_changed(&self) -> bool {
+        self.value.gaps.contains(&OccurrenceGap::SourceChanged)
+    }
+
+    pub fn semantic_location(
+        &mut self,
+        tcx: TyCtxt<'_>,
+        span: Span,
+    ) -> Option<crate::compiler_semantic::SemanticLocation> {
+        let (input, range) = self.location(tcx, span)?;
+        if (range.begin_line, range.begin_column) >= (range.end_line, range.end_column) {
+            return None;
+        }
+        Some(crate::compiler_semantic::SemanticLocation {
+            input,
+            range,
+            source_version: tcx
+                .sess
+                .source_map()
+                .lookup_char_pos(span.lo())
+                .file
+                .start_pos
+                .0,
+        })
+    }
+
     pub fn new(tcx: TyCtxt<'_>) -> Option<Self> {
         let path = PathBuf::from(std::env::var_os("BG_DRIVER_OCCURRENCE_REQUEST")?);
         let meta = std::fs::symlink_metadata(&path).ok()?;
@@ -146,6 +194,7 @@ impl Collector {
             definitions: HashMap::new(),
             sources: BTreeMap::new(),
             budget: MAX_SOURCE_TOTAL_BYTES,
+            source_budget_exhausted: false,
         })
     }
 
@@ -186,11 +235,17 @@ impl Collector {
             self.gap(OccurrenceGap::UnsupportedExpansion);
             return None;
         }
-        let input = if let Some((_, input)) = self
-            .sources
-            .get(&path)
-            .filter(|(start, _)| *start == lo.file.start_pos.0)
-        {
+        let input = if let Some((_, input)) = self.sources.get(&path).filter(|(start, _)| {
+            *start == lo.file.start_pos.0 || {
+                // Only the same actual immutable compiler buffer deduplicates
+                // work. Its distinct source-map position remains on every row.
+                let old = sm.lookup_char_pos(rustc_span::BytePos(*start)).file;
+                old.src
+                    .as_ref()
+                    .zip(lo.file.src.as_ref())
+                    .is_some_and(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+            }
+        }) {
             input.clone()
         } else {
             let Some(src) = lo.file.src.as_ref() else {
@@ -199,6 +254,7 @@ impl Collector {
             };
             let bytes = src.as_bytes();
             if bytes.len() > MAX_SOURCE_BYTES || bytes.len() > self.budget {
+                self.source_budget_exhausted = true;
                 self.gap(OccurrenceGap::BudgetExceeded);
                 return None;
             }

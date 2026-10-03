@@ -200,6 +200,12 @@ the actual per-pass launch requests and outcomes; paths/requests are observation
 and cannot authenticate nested process lineage. See
 [the occurrence contract](compiler-occurrences.md).
 
+`--observe-semantic-stream` additionally traverses the whole local HIR domain
+into bounded pages and an observational terminal. It requires both observation
+options above. Legacy occurrence records remain partial, and all optional streams
+share the original attachment allowance. See the
+[semantic stream contract](compiler-semantic-stream.md).
+
 ```bash
 cargo build-graph build --observe-compiler-inputs
 cargo build-graph build --observe-compiler-inputs \

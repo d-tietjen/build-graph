@@ -13,6 +13,7 @@ use build_graph::compiler_invocation::*;
 use build_graph::compiler_occurrence::{
     self, CallbackRequest, CompilerOccurrencesV1, OccurrenceRoot,
 };
+use build_graph::compiler_semantic::*;
 use build_graph::export::content_fingerprint;
 use cargo_metadata::{Artifact, BuildScript, Metadata};
 use serde::{Deserialize, Serialize};
@@ -88,6 +89,8 @@ struct Config {
     roots: Vec<RootBinding>,
     #[serde(default)]
     occurrences: bool,
+    #[serde(default)]
+    semantic_stream: bool,
 }
 
 struct DriverExecution {
@@ -167,6 +170,7 @@ impl Session {
             directory,
             roots,
             occurrences: false,
+            semantic_stream: false,
         };
         let path = config.directory.join("config.json");
         if let Err(error) = exclusive_write(&path, &serde_json::to_vec(&config)?) {
@@ -214,6 +218,16 @@ impl Session {
             toolchain,
             library,
         });
+        Ok(())
+    }
+
+    pub fn enable_semantic_stream(&mut self) -> Result<()> {
+        if !self.config.occurrences {
+            bail!("semantic stream requires the occurrence driver")
+        }
+        self.config.semantic_stream = true;
+        fs::remove_file(&self.path)?;
+        exclusive_write(&self.path, &serde_json::to_vec(&self.config)?)?;
         Ok(())
     }
 
@@ -342,6 +356,7 @@ impl Session {
             ],
             truncations: self.cargo_truncations.clone(),
             cargo_operations,
+            semantic_streams: vec![],
         };
         result.cargo_environment = environment(
             &self.config.roots,
@@ -439,6 +454,7 @@ impl Session {
             result.gaps.push(ObservationGap::MalformedObservation);
         }
         let mut keys = BTreeSet::new();
+        let mut semantic_slots = BTreeMap::new();
         let mut assembly = AssemblyBudget::new(&result);
         for path in paths.into_iter().take(MAX_INVOCATIONS) {
             let raw = match bounded_read(&path, MAX_INVOCATION_BYTES as u64) {
@@ -506,6 +522,17 @@ impl Session {
                 continue;
             }
             assembly.bytes += bytes;
+            if self.config.semantic_stream {
+                if let Some(slot) = path
+                    .file_stem()
+                    .and_then(|v| v.to_str())
+                    .and_then(|v| v.strip_prefix("unit-"))
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .filter(|v| *v < MAX_INVOCATIONS)
+                {
+                    semantic_slots.insert(invocation.unit_key.clone(), slot);
+                }
+            }
             result.invocations.push(invocation);
         }
         if self.artifacts.iter().any(|a| a.fresh) {
@@ -649,6 +676,50 @@ impl Session {
         result
             .invocations
             .sort_by(|a, b| a.unit_key.cmp(&b.unit_key));
+        if self.config.semantic_stream {
+            // Existing observations and Cargo operations consume the same
+            // aggregate first. Never load a page whose encoded bytes cannot fit.
+            assembly.bytes =
+                bounded_json_size(&result, MAX_ATTACHMENT_BYTES).unwrap_or(MAX_ATTACHMENT_BYTES);
+            let mut source_budget = MAX_SOURCE_WORK_BYTES;
+            let mut checked = BTreeSet::new();
+            for (ordinal, invocation) in result.invocations.iter().enumerate() {
+                let remaining = MAX_ATTACHMENT_BYTES.saturating_sub(assembly.bytes + 4096);
+                let value = semantic_slots.get(&invocation.unit_key).and_then(|slot| {
+                    read_semantic_stream(
+                        &self.config,
+                        *slot,
+                        invocation,
+                        remaining,
+                        &mut source_budget,
+                        &mut checked,
+                    )
+                    .ok()
+                });
+                let Some(stream) = value else {
+                    assembly.dropped_semantic += 1;
+                    result.gaps.push(ObservationGap::OccurrenceCallbackRejected);
+                    continue;
+                };
+                let observed = InvocationSemanticStreamV1 {
+                    invocation: ordinal,
+                    stream,
+                };
+                let Some(bytes) = assembly
+                    .admissible_size(&observed, remaining, true)
+                    .and_then(|n| n.checked_add(32))
+                else {
+                    assembly.dropped_semantic += 1;
+                    continue;
+                };
+                if bytes > MAX_ATTACHMENT_BYTES.saturating_sub(assembly.bytes) {
+                    assembly.dropped_semantic += 1;
+                    continue;
+                }
+                assembly.bytes += bytes;
+                result.semantic_streams.push(observed);
+            }
+        }
         result
             .generators
             .sort_by_cached_key(|v| serde_json::to_vec(v).unwrap_or_default());
@@ -726,6 +797,7 @@ struct AssemblyBudget {
     bytes: usize,
     dropped_invocations: u64,
     dropped_generators: u64,
+    dropped_semantic: u64,
 }
 
 impl AssemblyBudget {
@@ -734,6 +806,7 @@ impl AssemblyBudget {
             bytes: bounded_json_size(header, MAX_ATTACHMENT_BYTES).unwrap_or(MAX_ATTACHMENT_BYTES),
             dropped_invocations: 0,
             dropped_generators: 0,
+            dropped_semantic: 0,
         }
     }
 
@@ -753,7 +826,7 @@ impl AssemblyBudget {
         result.truncations.retain(|v| {
             !matches!(
                 v.collection.as_str(),
-                "assembled_invocations" | "assembled_generators"
+                "assembled_invocations" | "assembled_generators" | "assembled_semantic_streams"
             )
         });
         note_truncation(
@@ -761,6 +834,13 @@ impl AssemblyBudget {
             "assembled_invocations",
             result.invocations.len() as u64 + self.dropped_invocations,
             result.invocations.len(),
+            true,
+        );
+        note_truncation(
+            &mut result.truncations,
+            "assembled_semantic_streams",
+            result.semantic_streams.len() as u64 + self.dropped_semantic,
+            result.semantic_streams.len(),
             true,
         );
         note_truncation(
@@ -785,7 +865,9 @@ impl AssemblyBudget {
             if bounded_json_size(&result, MAX_ATTACHMENT_BYTES).is_ok() {
                 break;
             }
-            if result.generators.pop().is_some() {
+            if result.semantic_streams.pop().is_some() {
+                self.dropped_semantic += 1;
+            } else if result.generators.pop().is_some() {
                 self.dropped_generators += 1;
             } else if result.invocations.pop().is_some() {
                 self.dropped_invocations += 1;
@@ -853,6 +935,7 @@ fn gap_attachment(mut result: CompilerInvocationsV1) -> CompilerInvocationsV1 {
     result.cargo_cwd = None;
     result.cargo_environment.clear();
     result.cargo_operations = None;
+    result.semantic_streams.clear();
     result.wrapper = None;
     result.invocations.clear();
     result.generators.clear();
@@ -1567,12 +1650,23 @@ pub fn wrapper(args: &[OsString]) -> i32 {
             callback_request(config, invocation, roots, files, *slot).ok()
         },
     );
+    let semantic_request = config
+        .as_ref()
+        .zip(request.as_ref())
+        .zip(capture.as_ref())
+        .and_then(|((config, (_, request)), (_, _, _, _, slot))| {
+            semantic_callback_request(config, request, *slot).ok()
+        });
     let mut command = Command::new(program);
     command
         .args(&args[1..])
-        .env_remove("BG_DRIVER_OCCURRENCE_REQUEST");
+        .env_remove("BG_DRIVER_OCCURRENCE_REQUEST")
+        .env_remove("BG_DRIVER_SEMANTIC_REQUEST");
     if let Some((path, _)) = &request {
         command.env("BG_DRIVER_OCCURRENCE_REQUEST", path);
+    }
+    if let Some(path) = &semantic_request {
+        command.env("BG_DRIVER_SEMANTIC_REQUEST", path);
     }
     let status = command.status();
     let code = status.as_ref().ok().and_then(|status| status.code());
@@ -1815,6 +1909,196 @@ fn callback_request(
         .map_err(|_| anyhow::anyhow!("callback request exceeds budget"))?;
     exclusive_write(&path, &serde_json::to_vec(&request)?)?;
     Ok((path, request))
+}
+
+fn semantic_callback_request(
+    config: &Config,
+    callback: &CallbackRequest,
+    slot: usize,
+) -> Result<PathBuf> {
+    if !config.semantic_stream || !config.occurrences || slot >= MAX_INVOCATIONS {
+        bail!("semantic callback not requested")
+    }
+    let request = SemanticRequest {
+        binding: SemanticBindingV1 {
+            schema_version: 1,
+            nonce: callback.nonce.clone(),
+            command_fingerprint: callback.command_fingerprint.clone(),
+            crate_name: callback.crate_name.clone(),
+            metadata: callback.metadata.clone(),
+            domain: SemanticDomain::LocalHir,
+        },
+        output_directory: config.directory.join(format!("semantic-{slot}")),
+        budget_directory: config.directory.clone(),
+    };
+    request.binding.validate().map_err(anyhow::Error::msg)?;
+    if request.output_directory.exists() {
+        bail!("semantic output exists")
+    }
+    encoded_size(&request, MAX_INVOCATION_BYTES).map_err(anyhow::Error::msg)?;
+    let path = config
+        .directory
+        .join(format!("semantic-request-{slot}.json"));
+    exclusive_write(&path, &serde_json::to_vec(&request)?)?;
+    Ok(path)
+}
+
+fn semantic_read(
+    path: &Path,
+    roots: &[RootBinding],
+    maximum: usize,
+    budget: &mut u64,
+) -> Result<Vec<u8>> {
+    let (_, raw, metadata) = observed_bytes(path, roots, maximum as u64, budget)
+        .map_err(|_| anyhow::anyhow!("semantic observation unavailable"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let parent = fs::symlink_metadata(path.parent().context("semantic parent")?)?;
+        if metadata.mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+            || metadata.uid() != parent.uid()
+        {
+            bail!("semantic observation changed")
+        }
+    }
+    Ok(raw)
+}
+
+fn read_semantic_stream(
+    config: &Config,
+    slot: usize,
+    invocation: &CompilerInvocation,
+    remaining: usize,
+    source_budget: &mut u64,
+    checked: &mut BTreeSet<compiler_occurrence::OccurrenceInput>,
+) -> Result<SemanticStreamV1> {
+    if remaining < 4096
+        || !invocation.success
+        || invocation.exit_code != Some(0)
+        || invocation.occurrence_driver.is_none()
+    {
+        bail!("semantic callback unavailable")
+    }
+    // Request/control bytes have their original independent small read cap.
+    let mut control = MAX_INVOCATION_BYTES as u64;
+    let raw = semantic_read(
+        &config
+            .directory
+            .join(format!("semantic-request-{slot}.json")),
+        &config.roots,
+        MAX_INVOCATION_BYTES,
+        &mut control,
+    )?;
+    let request: SemanticRequest = serde_json::from_slice(&raw)?;
+    if request.output_directory != config.directory.join(format!("semantic-{slot}"))
+        || request.budget_directory != config.directory
+        || request.binding.crate_name != invocation.unit.crate_name
+        || request.binding.metadata != invocation.unit.metadata
+        || request.binding.command_fingerprint
+            != content_fingerprint(&serde_json::to_vec(&invocation.command)?)
+    {
+        bail!("semantic callback binding changed")
+    }
+    request.binding.validate().map_err(anyhow::Error::msg)?;
+    // Include index/terminal AND all pages in one remaining attachment read
+    // allowance. No per-page or per-invocation output allowance is reset.
+    let mut output_budget = remaining as u64;
+    let raw = semantic_read(
+        &request.output_directory.join("index.json"),
+        &config.roots,
+        remaining,
+        &mut output_budget,
+    )?;
+    let index: SemanticIndexV1 = serde_json::from_slice(&raw)?;
+    if index.binding != request.binding
+        || index.terminal.binding != request.binding
+        || index.pages.len() > remaining / MIN_PAGE_BYTES
+    {
+        bail!("semantic inventory changed")
+    }
+    let total = index
+        .pages
+        .iter()
+        .enumerate()
+        .try_fold(0usize, |n, (ordinal, entry)| {
+            if entry.ordinal != ordinal as u64
+                || entry.bytes < MIN_PAGE_BYTES
+                || entry.bytes > MAX_PAGE_BYTES
+            {
+                return None;
+            }
+            n.checked_add(entry.bytes)
+        })
+        .context("semantic page inventory limit")?;
+    if total as u64 > output_budget {
+        bail!("semantic attachment limit")
+    }
+    let mut pages = Vec::new();
+    // Inventory count and every encoded size have been admitted before this
+    // allocation. The count is derived from the remaining encoded budget.
+    pages.try_reserve_exact(index.pages.len())?;
+    for entry in &index.pages {
+        let raw = semantic_read(
+            &request
+                .output_directory
+                .join(format!("page-{}.json", entry.ordinal)),
+            &config.roots,
+            entry.bytes,
+            &mut output_budget,
+        )?;
+        if raw.len() != entry.bytes || page_fingerprint(&raw) != entry.content_fingerprint {
+            bail!("semantic page changed")
+        }
+        let page = SemanticPageV1::from_json(&raw).map_err(anyhow::Error::msg)?;
+        if page.ordinal != entry.ordinal || page.binding != request.binding {
+            bail!("semantic page binding changed")
+        }
+        for location in page
+            .definitions
+            .iter()
+            .filter_map(|r| r.location.as_ref())
+            .chain(page.references.iter().filter_map(|r| r.location.as_ref()))
+        {
+            let input = &location.input;
+            if checked.contains(input) {
+                continue;
+            }
+            let kind = match input.root {
+                OccurrenceRoot::Source => InputRoot::Source,
+                OccurrenceRoot::Target => InputRoot::Target,
+            };
+            let root = config
+                .roots
+                .iter()
+                .find(|r| r.kind == kind)
+                .context("semantic source root")?;
+            let (portable, bytes, _) = observed_bytes(
+                &root.path.join(&input.relative),
+                &config.roots,
+                FILE_BYTES,
+                source_budget,
+            )
+            .map_err(|_| anyhow::anyhow!("semantic source unavailable"))?;
+            if portable.root != kind
+                || portable.relative != input.relative
+                || bytes.len() as u64 != input.bytes
+                || content_fingerprint(&bytes) != input.content_fingerprint
+            {
+                bail!("semantic source changed")
+            }
+            checked.insert(input.clone());
+        }
+        pages.push(page);
+    }
+    let stream = SemanticStreamV1 {
+        binding: index.binding,
+        pages,
+        terminal: Some(index.terminal),
+    };
+    stream.validate().map_err(anyhow::Error::msg)?;
+    encoded_size(&stream, remaining).map_err(anyhow::Error::msg)?;
+    Ok(stream)
 }
 
 fn read_callback(
@@ -2504,6 +2788,7 @@ mod tests {
                 directory: directory.clone(),
                 roots,
                 occurrences: false,
+                semantic_stream: false,
             },
             path: directory.join("config.json"),
             metadata: workspace.meta.clone(),
@@ -2958,6 +3243,7 @@ mod tests {
             gaps: vec![ObservationGap::UnobservedExecutionInputs],
             truncations: vec![],
             cargo_operations: None,
+            semantic_streams: vec![],
         }
     }
 
@@ -3356,5 +3642,223 @@ mod tests {
         assert_eq!(result.invocations.len(), 1);
         assert!(result.gaps.contains(&ObservationGap::MalformedObservation));
         assert!(!result.gaps.contains(&ObservationGap::BudgetExceeded));
+    }
+    fn semantic_fixture() -> (Workspace, Session, CompilerInvocation, SemanticIndexV1) {
+        let (workspace, mut session, mut invocation, request, legacy) = callback_fixture();
+        session.config.semantic_stream = true;
+        private_mode(&session.config.directory, 0o700).expect("private parent");
+        invocation.occurrence_driver = Some(FileObservation {
+            path: None,
+            role: FileRole::Compiler,
+            before: None,
+            after: None,
+            gaps: vec![ObservationGap::ReadFailed],
+        });
+        semantic_callback_request(&session.config, &request, 0).expect("actual handoff producer");
+        let directory = session.config.directory.join("semantic-0");
+        fs::create_dir(&directory).expect("page directory");
+        private_mode(&directory, 0o700).unwrap();
+        let binding = SemanticBindingV1 {
+            schema_version: 1,
+            nonce: request.nonce,
+            command_fingerprint: request.command_fingerprint,
+            crate_name: request.crate_name,
+            metadata: request.metadata,
+            domain: SemanticDomain::LocalHir,
+        };
+        let definition = &legacy.definitions[0];
+        let page = SemanticPageV1 {
+            binding: binding.clone(),
+            ordinal: 0,
+            definitions: vec![SemanticDefinition {
+                ordinal: 0,
+                local_index: 1,
+                binding_owner: None,
+                compiler_path: "demo_lib::source".into(),
+                kind: "Fn".into(),
+                location: Some(SemanticLocation {
+                    input: definition.input.clone(),
+                    source_version: 100,
+                    range: definition.range.clone(),
+                }),
+            }],
+            references: vec![],
+            gaps: vec![],
+        };
+        let raw = serde_json::to_vec(&page).unwrap();
+        exclusive_write(&directory.join("page-0.json"), &raw).unwrap();
+        let index = SemanticIndexV1 {
+            binding: binding.clone(),
+            pages: vec![SemanticPageEntry {
+                ordinal: 0,
+                bytes: raw.len(),
+                content_fingerprint: page_fingerprint(&raw),
+            }],
+            terminal: SemanticTerminalV1 {
+                binding,
+                stop: TraversalStop::EndOfDomain,
+                traversal_events: 2,
+                visited_definitions: 1,
+                visited_references: 0,
+                unsupported: 0,
+                omitted: 0,
+                emitted_definitions: 1,
+                emitted_references: 0,
+                emitted_pages: 1,
+                source_work_bytes: definition.input.bytes,
+                gaps: vec![],
+            },
+        };
+        exclusive_write(
+            &directory.join("index.json"),
+            &serde_json::to_vec(&index).unwrap(),
+        )
+        .unwrap();
+        (workspace, session, invocation, index)
+    }
+
+    #[test]
+    fn semantic_page_reader_binds_actual_request_and_shares_source_work() {
+        let (_workspace, session, invocation, _) = semantic_fixture();
+        let mut budget = MAX_SOURCE_WORK_BYTES;
+        let mut checked = BTreeSet::new();
+        let first = read_semantic_stream(
+            &session.config,
+            0,
+            &invocation,
+            MAX_ATTACHMENT_BYTES,
+            &mut budget,
+            &mut checked,
+        )
+        .expect("actual bounded reader");
+        let bytes = first.pages[0].definitions[0]
+            .location
+            .as_ref()
+            .unwrap()
+            .input
+            .bytes;
+        assert_eq!(budget, MAX_SOURCE_WORK_BYTES - bytes);
+        let second = read_semantic_stream(
+            &session.config,
+            0,
+            &invocation,
+            MAX_ATTACHMENT_BYTES,
+            &mut budget,
+            &mut checked,
+        )
+        .expect("same exact input work deduplicates");
+        assert_eq!(first, second);
+        assert_eq!(budget, MAX_SOURCE_WORK_BYTES - bytes);
+        let mut changed = invocation;
+        changed.command.reverse();
+        assert!(
+            read_semantic_stream(
+                &session.config,
+                0,
+                &changed,
+                MAX_ATTACHMENT_BYTES,
+                &mut budget,
+                &mut checked
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn semantic_page_reader_rejects_inventory_before_page_allocation() {
+        let (_workspace, session, invocation, mut index) = semantic_fixture();
+        let path = session.config.directory.join("semantic-0/index.json");
+        index.pages[0].bytes = MAX_PAGE_BYTES + 1;
+        fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
+        fs::remove_file(session.config.directory.join("semantic-0/page-0.json")).unwrap();
+        let error = read_semantic_stream(
+            &session.config,
+            0,
+            &invocation,
+            MAX_ATTACHMENT_BYTES,
+            &mut MAX_SOURCE_WORK_BYTES,
+            &mut BTreeSet::new(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("inventory limit"));
+        assert!(
+            read_semantic_stream(
+                &session.config,
+                0,
+                &invocation,
+                4095,
+                &mut MAX_SOURCE_WORK_BYTES,
+                &mut BTreeSet::new()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn semantic_page_reader_rejects_changed_page_and_missing_terminal() {
+        let (_workspace, session, invocation, _) = semantic_fixture();
+        let path = session.config.directory.join("semantic-0/page-0.json");
+        fs::write(&path, b"{}").unwrap();
+        assert!(
+            read_semantic_stream(
+                &session.config,
+                0,
+                &invocation,
+                MAX_ATTACHMENT_BYTES,
+                &mut MAX_SOURCE_WORK_BYTES,
+                &mut BTreeSet::new()
+            )
+            .is_err()
+        );
+        fs::remove_file(session.config.directory.join("semantic-0/index.json")).unwrap();
+        assert!(
+            read_semantic_stream(
+                &session.config,
+                0,
+                &invocation,
+                MAX_ATTACHMENT_BYTES,
+                &mut MAX_SOURCE_WORK_BYTES,
+                &mut BTreeSet::new()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn semantic_streams_cannot_reset_attachment_assembly_allowance() {
+        let (_workspace, session, invocation, _) = semantic_fixture();
+        let stream = read_semantic_stream(
+            &session.config,
+            0,
+            &invocation,
+            MAX_ATTACHMENT_BYTES,
+            &mut MAX_SOURCE_WORK_BYTES,
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
+        let mut result = attachment();
+        result.invocations.push(invocation);
+        let mut budget = AssemblyBudget::new(&result);
+        budget.bytes = MAX_ATTACHMENT_BYTES - 1;
+        let row = InvocationSemanticStreamV1 {
+            invocation: 0,
+            stream,
+        };
+        assert!(
+            budget
+                .admissible_size(&row, MAX_ATTACHMENT_BYTES, false)
+                .is_none()
+        );
+        budget.dropped_semantic = 1;
+        let result = budget.finish(result);
+        assert!(result.semantic_streams.is_empty());
+        assert!(
+            result
+                .truncations
+                .iter()
+                .any(|v| v.collection == "assembled_semantic_streams"
+                    && v.observed == 1
+                    && v.retained == 0)
+        );
     }
 }
