@@ -173,6 +173,18 @@ fn actual_unsupported_resolution_and_long_definition_are_counted() {
     assert!(terminal.unsupported > 0 && terminal.omitted > 0);
     assert!(terminal.gaps.contains(&SemanticGap::UnsupportedDefinition));
     assert!(terminal.gaps.contains(&SemanticGap::UnsupportedResolution));
+    assert!(
+        observed
+            .pages
+            .iter()
+            .any(|p| p.gaps.contains(&SemanticGap::UnsupportedDefinition))
+    );
+    assert!(
+        observed
+            .pages
+            .iter()
+            .any(|p| p.gaps.contains(&SemanticGap::UnsupportedResolution))
+    );
     assert_eq!(
         terminal.omitted,
         terminal.visited_definitions + terminal.visited_references

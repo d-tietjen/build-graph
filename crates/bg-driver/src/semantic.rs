@@ -50,7 +50,7 @@ fn reserve(directory: &std::path::Path, bytes: usize) -> std::io::Result<usize> 
     let path = directory.join("semantic-budget-bytes");
     let used = match fs::symlink_metadata(&path) {
         Ok(info) => {
-            if !info.is_file() || info.len() > 32 {
+            if !info.is_file() || info.len() > 32 || !private_file(&info, directory)? {
                 return Err(std::io::Error::other("semantic accounting unavailable"));
             }
             let mut raw = String::new();
