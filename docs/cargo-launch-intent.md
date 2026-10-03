@@ -5,6 +5,10 @@ On Linux with `rustc-driver`, the `build` command accepts
 `--observe-definition-occurrences`. The caller supplies one already connected
 Unix stream FD, numbered at least 3. There is no pathname connection or socket
 listener. The CLI consumes that descriptor and owns a private CLOEXEC duplicate.
+It adopts and validates the stream and root before tool-discovery subprocesses
+such as `rustup which` or `rustc --print sysroot`. The selected Cargo Session
+receives that same observer before operation ordinal 1. Discovery or admission
+failure disposes the channel; helpers never inherit the connected socket.
 Absent these options, existing launch paths and exported DTOs remain unchanged.
 `watch` and `update` do not adopt this finite, single-pass channel.
 

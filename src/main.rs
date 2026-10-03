@@ -379,29 +379,32 @@ fn build_and_extract_with_launch(
     if common.observe_compiler_inputs && !do_build {
         bail!("compiler observation requires an actual build");
     }
-    let mut selected_cargo = selected_occurrence_cargo(common)?;
-    if let Some((fd, root)) = launch {
-        #[cfg(target_os = "linux")]
-        {
+    // Discovery invokes rustup/rustc before the selected Session exists. Adopt
+    // the inherited channel first so only its private CLOEXEC duplicate remains
+    // during every helper exec, including discovery failures.
+    #[cfg(target_os = "linux")]
+    let launch_observer = launch
+        .map(|(fd, root)| {
             use build_graph::launch_intent::{Channel, Observer};
             use std::os::fd::{FromRawFd, OwnedFd};
             if fd < 3 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
                 bail!("launch observer FD is invalid");
             }
-            // This explicit build-only option adopts one caller-supplied FD.
-            // Channel duplicates CLOEXEC then closes the inherited number.
             let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-            let channel = Channel::new(fd.into())?;
-            selected_cargo
-                .as_mut()
-                .context("launch observer requires selected Cargo")?
-                .set_launch_observer(Observer::new(channel, root)?)?;
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            let _ = (fd, root);
-            bail!("launch observer is unavailable on this platform");
-        }
+            Observer::new(Channel::new(fd.into())?, root)
+        })
+        .transpose()?;
+    #[cfg(not(target_os = "linux"))]
+    if launch.is_some() {
+        bail!("launch observer is unavailable on this platform");
+    }
+    let mut selected_cargo = selected_occurrence_cargo(common)?;
+    #[cfg(target_os = "linux")]
+    if let Some(observer) = launch_observer {
+        selected_cargo
+            .as_mut()
+            .context("launch observer requires selected Cargo")?
+            .set_launch_observer(observer)?;
     }
     let mut observations = None;
     let mut selected_observation = None;
