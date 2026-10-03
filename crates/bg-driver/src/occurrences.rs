@@ -97,6 +97,73 @@ impl Collector {
         })
     }
 
+    #[cfg(target_os = "linux")]
+    pub fn new_with_controls(
+        tcx: TyCtxt<'_>,
+        controls: &crate::held_callback_control::InheritedControls,
+    ) -> Option<Self> {
+        use crate::held_callback_control::InheritedControls;
+        use std::os::unix::fs::MetadataExt;
+        let raw = match controls {
+            InheritedControls::LegacyPath => return Self::new(tcx),
+            InheritedControls::Unavailable(_) => return None,
+            InheritedControls::Sealed(value) => value.occurrence_bytes(),
+        };
+        // The original path is output-parent correlation only in FD mode;
+        // the body comes exclusively from the immutable held descriptor.
+        let path = PathBuf::from(std::env::var_os("BG_DRIVER_OCCURRENCE_REQUEST")?);
+        let parent_path = path.parent()?;
+        let parent = std::fs::symlink_metadata(parent_path).ok()?;
+        // SAFETY: geteuid takes no pointer arguments.
+        let uid = unsafe { libc::geteuid() };
+        if !path.is_absolute()
+            || !parent.is_dir()
+            || parent.uid() != uid
+            || parent.mode() & 0o777 != 0o700
+            || std::fs::canonicalize(parent_path).ok()? != parent_path
+        {
+            return None;
+        }
+        let request: CallbackRequest = serde_json::from_slice(raw).ok()?;
+        let actual_source = std::env::args()
+            .skip(1)
+            .find(|v| !v.starts_with('-') && v.ends_with(".rs"))?;
+        if request.schema_version != OCCURRENCES_VERSION
+            || request.nonce.len() > 128
+            || request.nonce.is_empty()
+            || request.crate_name != tcx.crate_name(LOCAL_CRATE).to_string()
+            || request.metadata
+                != (!tcx.sess.opts.cg.metadata.is_empty())
+                    .then(|| tcx.sess.opts.cg.metadata.join(""))
+            || std::fs::canonicalize(actual_source).ok()? != request.source
+            || request.output.parent() != path.parent()
+            || request.output.exists()
+        {
+            return None;
+        }
+        let mut value = CompilerOccurrencesV1 {
+            schema_version: OCCURRENCES_VERSION,
+            nonce: request.nonce.clone(),
+            command_fingerprint: request.command_fingerprint.clone(),
+            crate_name: request.crate_name.clone(),
+            metadata: request.metadata.clone(),
+            definitions: Vec::new(),
+            references: Vec::new(),
+            gaps: vec![OccurrenceGap::AnalysisCoveragePartial],
+        };
+        if !fits_with_gap_envelope(&mut value) {
+            return None;
+        }
+        Some(Self {
+            request,
+            value,
+            definitions: HashMap::new(),
+            sources: BTreeMap::new(),
+            budget: MAX_SOURCE_TOTAL_BYTES,
+            source_budget_exhausted: false,
+        })
+    }
+
     pub fn new(tcx: TyCtxt<'_>) -> Option<Self> {
         let path = PathBuf::from(std::env::var_os("BG_DRIVER_OCCURRENCE_REQUEST")?);
         let meta = std::fs::symlink_metadata(&path).ok()?;

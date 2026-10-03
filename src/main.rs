@@ -128,6 +128,11 @@ struct CommonArgs {
     #[cfg(feature = "rustc-driver")]
     #[arg(long, requires = "observe_definition_occurrences")]
     observe_semantic_stream: bool,
+    /// Deliver callback requests through immutable held Linux descriptors.
+    /// This transport supplies bytes, not execution-input custody.
+    #[cfg(all(target_os = "linux", feature = "rustc-driver"))]
+    #[arg(long, requires = "observe_definition_occurrences")]
+    held_callback_controls: bool,
     /// Actual Cargo executable for occurrence metadata/build/docs (default:
     /// matching nightly Cargo). A path is observational, not authentication.
     #[cfg(feature = "rustc-driver")]
@@ -458,6 +463,13 @@ fn build_and_extract_with_launch(
                     nightly.into(),
                     selected.library.clone(),
                 )?;
+            #[cfg(target_os = "linux")]
+            if common.held_callback_controls {
+                session
+                    .as_mut()
+                    .context("compiler observation missing")?
+                    .enable_held_callback_controls()?;
+            }
             if common.observe_semantic_stream {
                 session
                     .as_mut()

@@ -91,6 +91,12 @@ struct Config {
     occurrences: bool,
     #[serde(default)]
     semantic_stream: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    held_callback_controls: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 struct DriverExecution {
@@ -171,6 +177,7 @@ impl Session {
             roots,
             occurrences: false,
             semantic_stream: false,
+            held_callback_controls: false,
         };
         let path = config.directory.join("config.json");
         if let Err(error) = exclusive_write(&path, &serde_json::to_vec(&config)?) {
@@ -226,6 +233,17 @@ impl Session {
             bail!("semantic stream requires the occurrence driver")
         }
         self.config.semantic_stream = true;
+        fs::remove_file(&self.path)?;
+        exclusive_write(&self.path, &serde_json::to_vec(&self.config)?)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn enable_held_callback_controls(&mut self) -> Result<()> {
+        if !self.config.occurrences {
+            bail!("held callback controls require the occurrence driver")
+        }
+        self.config.held_callback_controls = true;
         fs::remove_file(&self.path)?;
         exclusive_write(&self.path, &serde_json::to_vec(&self.config)?)?;
         Ok(())
@@ -1645,6 +1663,9 @@ pub fn wrapper(args: &[OsString]) -> i32 {
             None
         }
     });
+    // Retain originals through the actual child wait and result processing.
+    #[cfg(target_os = "linux")]
+    let mut _control_retention = None;
     let request = config.as_ref().zip(capture.as_ref()).and_then(
         |(config, (invocation, roots, files, _, slot))| {
             callback_request(config, invocation, roots, files, *slot).ok()
@@ -1661,18 +1682,70 @@ pub fn wrapper(args: &[OsString]) -> i32 {
     command
         .args(&args[1..])
         .env_remove("BG_DRIVER_OCCURRENCE_REQUEST")
-        .env_remove("BG_DRIVER_SEMANTIC_REQUEST");
-    if let Some((path, _)) = &request {
-        command.env("BG_DRIVER_OCCURRENCE_REQUEST", path);
-    }
-    if let Some(path) = &semantic_request {
-        command.env("BG_DRIVER_SEMANTIC_REQUEST", path);
+        .env_remove("BG_DRIVER_SEMANTIC_REQUEST")
+        .env_remove("BG_DRIVER_OCCURRENCE_REQUEST_FD")
+        .env_remove("BG_DRIVER_SEMANTIC_REQUEST_FD");
+    let mut control_gap = None;
+    if config.as_ref().is_some_and(|v| v.held_callback_controls) {
+        #[cfg(target_os = "linux")]
+        {
+            let prepared = (|| {
+                let (path, _) = request
+                    .as_ref()
+                    .ok_or_else(|| std::io::Error::other("held callback request unavailable"))?;
+                if config.as_ref().is_some_and(|v| v.semantic_stream) && semantic_request.is_none()
+                {
+                    return Err(std::io::Error::other("held semantic request unavailable"));
+                }
+                let controls =
+                    build_graph::held_callback_control::OwnedSealedControls::from_private_files(
+                        path,
+                        semantic_request.as_deref(),
+                    )?;
+                controls.configure_child(&mut command)
+            })();
+            match prepared {
+                Ok(retention) => {
+                    _control_retention = Some(retention);
+                    if let Some((path, _)) = &request {
+                        command.env("BG_DRIVER_OCCURRENCE_REQUEST", path);
+                    }
+                    if let Some(path) = &semantic_request {
+                        command.env("BG_DRIVER_SEMANTIC_REQUEST", path);
+                    }
+                }
+                Err(error) => {
+                    control_gap = Some(
+                        if build_graph::held_callback_control::is_byte_limit(&error) {
+                            ObservationGap::BudgetExceeded
+                        } else {
+                            ObservationGap::ReadFailed
+                        },
+                    );
+                    eprintln!("[build-graph] held callback controls unavailable");
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            control_gap = Some(ObservationGap::ReadFailed);
+        }
+    } else {
+        if let Some((path, _)) = &request {
+            command.env("BG_DRIVER_OCCURRENCE_REQUEST", path);
+        }
+        if let Some(path) = &semantic_request {
+            command.env("BG_DRIVER_SEMANTIC_REQUEST", path);
+        }
     }
     let status = command.status();
     let code = status.as_ref().ok().and_then(|status| status.code());
     if let (Some(config), Some((mut invocation, roots, files, outputs, slot))) =
         (config.as_ref(), capture)
     {
+        if let Some(gap) = control_gap {
+            invocation.gaps.push(gap);
+        }
         invocation.exit_code = code;
         invocation.success = status.as_ref().is_ok_and(|status| status.success());
         let mut budget = UNIT_READ_BYTES;
@@ -2825,6 +2898,7 @@ mod tests {
                 roots,
                 occurrences: false,
                 semantic_stream: false,
+                held_callback_controls: false,
             },
             path: directory.join("config.json"),
             metadata: workspace.meta.clone(),
@@ -4196,3 +4270,7 @@ mod tests {
             .expect("no absent-legacy authority is inferred by the portable model");
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "held_callback_wrapper_tests.rs"]
+mod held_callback_wrapper_tests;

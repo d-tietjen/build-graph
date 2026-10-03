@@ -161,6 +161,83 @@ struct Writer {
 }
 
 impl Writer {
+    #[cfg(target_os = "linux")]
+    fn new_with_controls(
+        collector: &Collector,
+        controls: &crate::held_callback_control::InheritedControls,
+    ) -> Option<Self> {
+        use crate::held_callback_control::InheritedControls;
+        use std::os::unix::fs::MetadataExt;
+        let raw = match controls {
+            InheritedControls::LegacyPath => return Self::new(collector),
+            InheritedControls::Unavailable(_) => return None,
+            InheritedControls::Sealed(value) => value.semantic_bytes()?,
+        };
+        let path = PathBuf::from(std::env::var_os("BG_DRIVER_SEMANTIC_REQUEST")?);
+        let parent = collector.semantic_parent()?;
+        let parent_info = fs::symlink_metadata(parent).ok()?;
+        // SAFETY: geteuid takes no pointer arguments.
+        if !path.is_absolute()
+            || path.parent()? != parent
+            || !parent_info.is_dir()
+            || parent_info.mode() & 0o777 != 0o700
+            || parent_info.uid() != unsafe { libc::geteuid() }
+        {
+            return None;
+        }
+        let request: SemanticRequest = serde_json::from_slice(raw).ok()?;
+        if request.binding != collector.semantic_binding()
+            || request.binding.validate().is_err()
+            || request.budget_directory != parent
+            || request.output_directory.parent()? != parent
+            || fs::canonicalize(parent).ok()? != parent
+            || request.output_directory.exists()
+        {
+            return None;
+        }
+        // Reserve terminal and initial index metadata before their allocations.
+        let remaining = reserve(
+            parent,
+            4096 + 4 * MAX_PAGE_BYTES + encoded_size(&request.binding, 8192).ok()?,
+        )
+        .ok()?;
+        fs::create_dir(&request.output_directory).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&request.output_directory, fs::Permissions::from_mode(0o700))
+                .ok()?;
+        }
+        let binding = request.binding.clone();
+        Some(Self {
+            page: SemanticPageV1 {
+                binding: binding.clone(),
+                ordinal: 0,
+                definitions: Vec::with_capacity(MAX_PAGE_DEFINITIONS),
+                references: Vec::with_capacity(MAX_PAGE_REFERENCES),
+                gaps: Vec::with_capacity(16),
+            },
+            terminal: SemanticTerminalV1 {
+                binding,
+                stop: TraversalStop::EndOfDomain,
+                traversal_events: 0,
+                visited_definitions: 0,
+                visited_references: 0,
+                unsupported: 0,
+                omitted: 0,
+                emitted_definitions: 0,
+                emitted_references: 0,
+                emitted_pages: 0,
+                source_work_bytes: 0,
+                gaps: Vec::new(),
+            },
+            request,
+            entries: Vec::new(),
+            source_versions: BTreeSet::new(),
+            stopped: false,
+            max_pages: remaining / MIN_PAGE_BYTES,
+        })
+    }
     fn new(collector: &Collector) -> Option<Self> {
         let path = PathBuf::from(std::env::var_os("BG_DRIVER_SEMANTIC_REQUEST")?);
         let parent = collector.semantic_parent()?;
@@ -997,8 +1074,16 @@ impl<'tcx> Visitor<'tcx> for Walk<'_, 'tcx> {
     }
 }
 
-pub fn observe(tcx: TyCtxt<'_>, collector: &mut Collector) {
-    let Some(mut writer) = Writer::new(collector) else {
+pub fn observe(
+    tcx: TyCtxt<'_>,
+    collector: &mut Collector,
+    #[cfg(target_os = "linux")] controls: &crate::held_callback_control::InheritedControls,
+) {
+    #[cfg(target_os = "linux")]
+    let writer = Writer::new_with_controls(collector, controls);
+    #[cfg(not(target_os = "linux"))]
+    let writer = Writer::new(collector);
+    let Some(mut writer) = writer else {
         return;
     };
     // The analysis query's entire local definition domain includes structural,

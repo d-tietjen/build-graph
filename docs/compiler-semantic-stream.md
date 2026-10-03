@@ -118,3 +118,7 @@ missing. Actual compiler/API compatibility, generated ordering, external identit
 mapping and downstream graph association remain measurement/consumer gates.
 
 See [validation](compiler-input-validation.md) for the source selector inventory.
+
+The optional Linux [held callback controls](held-callback-controls.md) deliver the
+same request schemas through immutable descriptors before the actual driver child.
+Omission retains the ordinary path handoff; the transport grants no custody.

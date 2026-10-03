@@ -28,14 +28,26 @@ use rustc_span::def_id::{DefId, LOCAL_CRATE};
 mod compiler_occurrence;
 #[path = "../../../src/compiler_semantic.rs"]
 mod compiler_semantic;
+// The shared transport also contains its sender API, used by the CLI.
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[path = "../../../src/held_callback_control.rs"]
+mod held_callback_control;
 mod occurrences;
 mod semantic;
 
-struct BgCallbacks;
+struct BgCallbacks {
+    #[cfg(target_os = "linux")]
+    controls: held_callback_control::InheritedControls,
+}
 
 impl Callbacks for BgCallbacks {
     fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        extract(tcx);
+        extract(
+            tcx,
+            #[cfg(target_os = "linux")]
+            &self.controls,
+        );
         Compilation::Continue
     }
 }
@@ -69,7 +81,10 @@ fn loc_of(tcx: TyCtxt<'_>, def_id: rustc_span::def_id::DefId) -> Option<(String,
     Some((file, lo.line))
 }
 
-fn extract(tcx: TyCtxt<'_>) {
+fn extract(
+    tcx: TyCtxt<'_>,
+    #[cfg(target_os = "linux")] controls: &held_callback_control::InheritedControls,
+) {
     let krate = tcx.crate_name(LOCAL_CRATE);
     let mut calls: usize = 0;
     let mut method_calls: usize = 0;
@@ -80,6 +95,9 @@ fn extract(tcx: TyCtxt<'_>) {
     // (kind, caller "file:line", callee "file:line"). Only collected when requested.
     let want_edges = std::env::var_os("BG_DRIVER_EDGES").is_some();
     let mut edges: Vec<(&'static str, String, String)> = Vec::new();
+    #[cfg(target_os = "linux")]
+    let mut occurrences = occurrences::Collector::new_with_controls(tcx, controls);
+    #[cfg(not(target_os = "linux"))]
     let mut occurrences = occurrences::Collector::new(tcx);
     if let Some(collector) = occurrences.as_mut() {
         for did in tcx.hir_crate_items(()).definitions() {
@@ -122,7 +140,12 @@ fn extract(tcx: TyCtxt<'_>) {
     }
 
     if let Some(mut collector) = occurrences {
-        semantic::observe(tcx, &mut collector);
+        semantic::observe(
+            tcx,
+            &mut collector,
+            #[cfg(target_os = "linux")]
+            controls,
+        );
         collector.publish();
     }
 
@@ -381,6 +404,18 @@ fn print_sysroot(rustc: &str) -> Option<String> {
 }
 
 fn main() -> std::process::ExitCode {
+    // Adopt only the explicit exec-time transfer, before any sysroot helper,
+    // compiler thread or child. Restoration of CLOEXEC prevents propagation.
+    let mut callbacks = BgCallbacks {
+        #[cfg(target_os = "linux")]
+        // SAFETY: process entry receives each declared non-stdio FD by unique
+        // ownership transfer from the wrapper's actual delegated Command.
+        controls: unsafe { held_callback_control::adopt_inherited_controls() },
+    };
+    #[cfg(target_os = "linux")]
+    if let held_callback_control::InheritedControls::Unavailable(_) = &callbacks.controls {
+        eprintln!("[bg-driver] sealed callback control unavailable");
+    }
     let mut args: Vec<String> = std::env::args().collect();
 
     // As RUSTC_WORKSPACE_WRAPPER, cargo calls us `bg-driver <rustc> <args…>`.
@@ -402,7 +437,7 @@ fn main() -> std::process::ExitCode {
     }
 
     rustc_driver::catch_with_exit_code(|| {
-        rustc_driver::run_compiler(&args, &mut BgCallbacks);
+        rustc_driver::run_compiler(&args, &mut callbacks);
         Ok::<(), rustc_span::ErrorGuaranteed>(())
     })
 }

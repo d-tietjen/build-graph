@@ -158,3 +158,7 @@ counts and sanitized acceptance/publication failure categories.
 
 See [validation selectors](compiler-input-validation.md) for the actual-driver
 and reader regressions. No authored selector is passing evidence.
+
+The optional Linux [held callback controls](held-callback-controls.md) deliver the
+same request schemas through immutable descriptors before the actual driver child.
+Omission retains the ordinary path handoff; the transport grants no custody.
