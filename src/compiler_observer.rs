@@ -93,6 +93,10 @@ struct Config {
     semantic_stream: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     held_callback_controls: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    compiler_context: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    test_harness: bool,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -178,6 +182,8 @@ impl Session {
             occurrences: false,
             semantic_stream: false,
             held_callback_controls: false,
+            compiler_context: false,
+            test_harness: false,
         };
         let path = config.directory.join("config.json");
         if let Err(error) = exclusive_write(&path, &serde_json::to_vec(&config)?) {
@@ -244,6 +250,26 @@ impl Session {
             bail!("held callback controls require the occurrence driver")
         }
         self.config.held_callback_controls = true;
+        fs::remove_file(&self.path)?;
+        exclusive_write(&self.path, &serde_json::to_vec(&self.config)?)?;
+        Ok(())
+    }
+
+    /// Observe effective cfg and backend features from the analysed compiler.
+    pub fn enable_compiler_context_observation(&mut self) -> Result<()> {
+        if !self.config.occurrences || !self.config.semantic_stream {
+            bail!("compiler context requires the semantic occurrence stream")
+        }
+        self.config.compiler_context = true;
+        fs::remove_file(&self.path)?;
+        exclusive_write(&self.path, &serde_json::to_vec(&self.config)?)?;
+        Ok(())
+    }
+
+    /// Observe the actual generated harness; ordinary units retain a typed gap.
+    pub fn enable_test_harness_observation(&mut self) -> Result<()> {
+        self.enable_compiler_context_observation()?;
+        self.config.test_harness = true;
         fs::remove_file(&self.path)?;
         exclusive_write(&self.path, &serde_json::to_vec(&self.config)?)?;
         Ok(())
@@ -1676,7 +1702,11 @@ pub fn wrapper(args: &[OsString]) -> i32 {
         .zip(request.as_ref())
         .zip(capture.as_ref())
         .and_then(|((config, (_, request)), (_, _, _, _, slot))| {
-            semantic_callback_request(config, request, *slot).ok()
+            if config.compiler_context || config.test_harness {
+                observed_semantic_callback_request(config, request, *slot).ok()
+            } else {
+                semantic_callback_request(config, request, *slot).ok()
+            }
         });
     let mut command = Command::new(program);
     command
@@ -1684,7 +1714,15 @@ pub fn wrapper(args: &[OsString]) -> i32 {
         .env_remove("BG_DRIVER_OCCURRENCE_REQUEST")
         .env_remove("BG_DRIVER_SEMANTIC_REQUEST")
         .env_remove("BG_DRIVER_OCCURRENCE_REQUEST_FD")
-        .env_remove("BG_DRIVER_SEMANTIC_REQUEST_FD");
+        .env_remove("BG_DRIVER_SEMANTIC_REQUEST_FD")
+        .env_remove("BG_DRIVER_COMPILER_CONTEXT_OBSERVATION")
+        .env_remove("BG_DRIVER_TEST_HARNESS_OBSERVATION");
+    if config.as_ref().is_some_and(|value| value.compiler_context) {
+        command.env("BG_DRIVER_COMPILER_CONTEXT_OBSERVATION", "1");
+        if config.as_ref().is_some_and(|value| value.test_harness) {
+            command.env("BG_DRIVER_TEST_HARNESS_OBSERVATION", "1");
+        }
+    }
     let mut control_gap = None;
     if config.as_ref().is_some_and(|v| v.held_callback_controls) {
         #[cfg(target_os = "linux")]
@@ -2016,6 +2054,47 @@ fn semantic_callback_request(
     Ok(path)
 }
 
+fn observed_semantic_domain(config: &Config) -> Result<SemanticDomain> {
+    match (config.compiler_context, config.test_harness) {
+        (false, false) => Ok(SemanticDomain::LocalHir),
+        (true, false) => Ok(SemanticDomain::LocalHirWithCompilerContext),
+        (true, true) => Ok(SemanticDomain::LocalHirWithTestHarness),
+        (false, true) => bail!("test harness context not requested"),
+    }
+}
+
+fn observed_semantic_callback_request(
+    config: &Config,
+    callback: &CallbackRequest,
+    slot: usize,
+) -> Result<PathBuf> {
+    if !config.semantic_stream || !config.occurrences || slot >= MAX_INVOCATIONS {
+        bail!("semantic callback not requested")
+    }
+    let request = SemanticRequest {
+        binding: SemanticBindingV1 {
+            schema_version: 1,
+            nonce: callback.nonce.clone(),
+            command_fingerprint: callback.command_fingerprint.clone(),
+            crate_name: callback.crate_name.clone(),
+            metadata: callback.metadata.clone(),
+            domain: observed_semantic_domain(config)?,
+        },
+        output_directory: config.directory.join(format!("semantic-{slot}")),
+        budget_directory: config.directory.clone(),
+    };
+    request.binding.validate().map_err(anyhow::Error::msg)?;
+    if request.output_directory.exists() {
+        bail!("semantic output exists")
+    }
+    encoded_size(&request, MAX_INVOCATION_BYTES).map_err(anyhow::Error::msg)?;
+    let path = config
+        .directory
+        .join(format!("semantic-request-{slot}.json"));
+    exclusive_write(&path, &serde_json::to_vec(&request)?)?;
+    Ok(path)
+}
+
 fn semantic_read(
     path: &Path,
     roots: &[RootBinding],
@@ -2096,7 +2175,8 @@ fn read_semantic_stream(
         &mut control,
     )?;
     let request: SemanticRequest = serde_json::from_slice(&raw)?;
-    if request.output_directory != config.directory.join(format!("semantic-{slot}"))
+    if request.binding.domain != observed_semantic_domain(config)?
+        || request.output_directory != config.directory.join(format!("semantic-{slot}"))
         || request.budget_directory != config.directory
         || request.binding.crate_name != invocation.unit.crate_name
         || request.binding.metadata != invocation.unit.metadata
@@ -2899,6 +2979,8 @@ mod tests {
                 occurrences: false,
                 semantic_stream: false,
                 held_callback_controls: false,
+                compiler_context: false,
+                test_harness: false,
             },
             path: directory.join("config.json"),
             metadata: workspace.meta.clone(),
@@ -4274,3 +4356,7 @@ mod tests {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "held_callback_wrapper_tests.rs"]
 mod held_callback_wrapper_tests;
+
+#[cfg(test)]
+#[path = "observed_compiler_wrapper_tests.rs"]
+mod observed_compiler_wrapper_tests;

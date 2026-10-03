@@ -150,7 +150,7 @@ fn exclusive(path: &std::path::Path, raw: &[u8]) -> std::io::Result<()> {
     file.sync_all()
 }
 
-struct Writer {
+pub(super) struct Writer {
     request: SemanticRequest,
     page: SemanticPageV1,
     entries: Vec<SemanticPageEntry>,
@@ -161,6 +161,177 @@ struct Writer {
 }
 
 impl Writer {
+    fn new_for_domain(collector: &Collector, domain: SemanticDomain) -> Option<Self> {
+        let path = PathBuf::from(std::env::var_os("BG_DRIVER_SEMANTIC_REQUEST")?);
+        let parent = collector.semantic_parent()?;
+        let before = fs::symlink_metadata(&path).ok()?;
+        if !before.is_file()
+            || before.len() > 32 * 1024
+            || path.parent()? != parent
+            || !private_file(&before, parent).ok()?
+        {
+            return None;
+        }
+        let mut file = File::open(&path).ok()?;
+        let mut raw = Vec::new();
+        Read::by_ref(&mut file)
+            .take(32 * 1024 + 1)
+            .read_to_end(&mut raw)
+            .ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let same = |info: &fs::Metadata| {
+                info.dev() == before.dev()
+                    && info.ino() == before.ino()
+                    && info.len() == before.len()
+                    && info.mtime() == before.mtime()
+                    && info.mtime_nsec() == before.mtime_nsec()
+                    && info.ctime() == before.ctime()
+                    && info.ctime_nsec() == before.ctime_nsec()
+                    && info.mode() & 0o777 == 0o600
+                    && info.nlink() == 1
+                    && info.uid() == before.uid()
+            };
+            if !same(&file.metadata().ok()?)
+                || !same(&fs::symlink_metadata(&path).ok()?)
+                || raw.len() as u64 != before.len()
+            {
+                return None;
+            }
+        }
+        let request: SemanticRequest = serde_json::from_slice(&raw).ok()?;
+        if request.binding != binding_for_domain(collector, domain)
+            || request.binding.validate().is_err()
+            || request.budget_directory != parent
+            || request.output_directory.parent()? != parent
+            || fs::canonicalize(parent).ok()? != parent
+            || request.output_directory.exists()
+        {
+            return None;
+        }
+        // Reserve terminal and initial index metadata before their allocations.
+        let remaining = reserve(
+            parent,
+            4096 + 4 * MAX_PAGE_BYTES + encoded_size(&request.binding, 8192).ok()?,
+        )
+        .ok()?;
+        fs::create_dir(&request.output_directory).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&request.output_directory, fs::Permissions::from_mode(0o700))
+                .ok()?;
+        }
+        let binding = request.binding.clone();
+        Some(Self {
+            page: SemanticPageV1 {
+                binding: binding.clone(),
+                ordinal: 0,
+                definitions: Vec::with_capacity(MAX_PAGE_DEFINITIONS),
+                references: Vec::with_capacity(MAX_PAGE_REFERENCES),
+                gaps: Vec::with_capacity(16),
+            },
+            terminal: SemanticTerminalV1 {
+                binding,
+                stop: TraversalStop::EndOfDomain,
+                traversal_events: 0,
+                visited_definitions: 0,
+                visited_references: 0,
+                unsupported: 0,
+                omitted: 0,
+                emitted_definitions: 0,
+                emitted_references: 0,
+                emitted_pages: 0,
+                source_work_bytes: 0,
+                gaps: Vec::new(),
+            },
+            request,
+            entries: Vec::new(),
+            source_versions: BTreeSet::new(),
+            stopped: false,
+            max_pages: remaining / MIN_PAGE_BYTES,
+        })
+    }
+    #[cfg(target_os = "linux")]
+    fn new_for_domain_with_controls(
+        collector: &Collector,
+        domain: SemanticDomain,
+        controls: &crate::held_callback_control::InheritedControls,
+    ) -> Option<Self> {
+        use crate::held_callback_control::InheritedControls;
+        use std::os::unix::fs::MetadataExt;
+        let raw = match controls {
+            InheritedControls::LegacyPath => return Self::new_for_domain(collector, domain),
+            InheritedControls::Unavailable(_) => return None,
+            InheritedControls::Sealed(value) => value.semantic_bytes()?,
+        };
+        let path = PathBuf::from(std::env::var_os("BG_DRIVER_SEMANTIC_REQUEST")?);
+        let parent = collector.semantic_parent()?;
+        let parent_info = fs::symlink_metadata(parent).ok()?;
+        // SAFETY: geteuid takes no pointer arguments.
+        if !path.is_absolute()
+            || path.parent()? != parent
+            || !parent_info.is_dir()
+            || parent_info.mode() & 0o777 != 0o700
+            || parent_info.uid() != unsafe { libc::geteuid() }
+        {
+            return None;
+        }
+        let request: SemanticRequest = serde_json::from_slice(raw).ok()?;
+        if request.binding != binding_for_domain(collector, domain)
+            || request.binding.validate().is_err()
+            || request.budget_directory != parent
+            || request.output_directory.parent()? != parent
+            || fs::canonicalize(parent).ok()? != parent
+            || request.output_directory.exists()
+        {
+            return None;
+        }
+        // Reserve terminal and initial index metadata before their allocations.
+        let remaining = reserve(
+            parent,
+            4096 + 4 * MAX_PAGE_BYTES + encoded_size(&request.binding, 8192).ok()?,
+        )
+        .ok()?;
+        fs::create_dir(&request.output_directory).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&request.output_directory, fs::Permissions::from_mode(0o700))
+                .ok()?;
+        }
+        let binding = request.binding.clone();
+        Some(Self {
+            page: SemanticPageV1 {
+                binding: binding.clone(),
+                ordinal: 0,
+                definitions: Vec::with_capacity(MAX_PAGE_DEFINITIONS),
+                references: Vec::with_capacity(MAX_PAGE_REFERENCES),
+                gaps: Vec::with_capacity(16),
+            },
+            terminal: SemanticTerminalV1 {
+                binding,
+                stop: TraversalStop::EndOfDomain,
+                traversal_events: 0,
+                visited_definitions: 0,
+                visited_references: 0,
+                unsupported: 0,
+                omitted: 0,
+                emitted_definitions: 0,
+                emitted_references: 0,
+                emitted_pages: 0,
+                source_work_bytes: 0,
+                gaps: Vec::new(),
+            },
+            request,
+            entries: Vec::new(),
+            source_versions: BTreeSet::new(),
+            stopped: false,
+            max_pages: remaining / MIN_PAGE_BYTES,
+        })
+    }
+
     #[cfg(target_os = "linux")]
     fn new_with_controls(
         collector: &Collector,
@@ -330,7 +501,29 @@ impl Writer {
             max_pages: remaining / MIN_PAGE_BYTES,
         })
     }
-    fn gap(&mut self, gap: SemanticGap) {
+    pub(super) fn gap(&mut self, gap: SemanticGap) {
+        if self.request.binding.domain != SemanticDomain::LocalHir
+            && !self.terminal.gaps.contains(&gap)
+            && self.terminal.gaps.len() >= 15
+        {
+            self.stopped = true;
+            self.terminal.stop = TraversalStop::PublicationInterrupted;
+            if !self
+                .terminal
+                .gaps
+                .contains(&SemanticGap::PublicationInterrupted)
+            {
+                self.terminal.gaps.push(SemanticGap::PublicationInterrupted);
+            }
+            if !self
+                .page
+                .gaps
+                .contains(&SemanticGap::PublicationInterrupted)
+            {
+                self.page.gaps.push(SemanticGap::PublicationInterrupted);
+            }
+            return;
+        }
         if !self.terminal.gaps.contains(&gap) {
             self.terminal.gaps.push(gap);
         }
@@ -341,6 +534,19 @@ impl Writer {
         }
     }
     fn fits(&mut self) -> bool {
+        if self.request.binding.domain != SemanticDomain::LocalHir {
+            let length = self.page.gaps.len();
+            // Reserve the maximum original sixteen gap slots at the longest
+            // successor label before admitting another row. No extra slots.
+            while self.page.gaps.len() < 16 {
+                self.page
+                    .gaps
+                    .push(SemanticGap::TestHarnessCrateSourceUnavailable);
+            }
+            let fits = encoded_size(&self.page, MAX_PAGE_BYTES).is_ok();
+            self.page.gaps.truncate(length);
+            return fits;
+        }
         let length = self.page.gaps.len();
         for gap in [
             SemanticGap::UnsupportedDefinition,
@@ -368,7 +574,7 @@ impl Writer {
         self.terminal.stop = stop;
         self.gap(gap);
     }
-    fn work(&mut self) -> ControlFlow<()> {
+    pub(super) fn work(&mut self) -> ControlFlow<()> {
         if self.stopped {
             return ControlFlow::Break(());
         }
@@ -575,7 +781,11 @@ struct Walk<'a, 'tcx> {
 
 // Traverse actual compiler DefKeys with a fixed stack and bounded output.
 // Avoid allocating a potentially unbounded def_path_str before checking size.
-fn compiler_path(tcx: TyCtxt<'_>, writer: &mut Writer, mut did: DefId) -> Option<String> {
+pub(super) fn compiler_path(
+    tcx: TyCtxt<'_>,
+    writer: &mut Writer,
+    mut did: DefId,
+) -> Option<String> {
     use rustc_hir::definitions::{DefPathData, DefPathDataName};
     use std::fmt::Write;
     let crate_name = tcx.crate_name(did.krate);
@@ -1080,12 +1290,26 @@ pub fn observe(
     #[cfg(target_os = "linux")] controls: &crate::held_callback_control::InheritedControls,
 ) {
     #[cfg(target_os = "linux")]
-    let writer = Writer::new_with_controls(collector, controls);
+    let writer = match requested_domain() {
+        Some(SemanticDomain::LocalHir) => Writer::new_with_controls(collector, controls),
+        Some(domain) => Writer::new_for_domain_with_controls(collector, domain, controls),
+        None => None,
+    };
     #[cfg(not(target_os = "linux"))]
-    let writer = Writer::new(collector);
+    let writer = match requested_domain() {
+        Some(SemanticDomain::LocalHir) => Writer::new(collector),
+        Some(domain) => Writer::new_for_domain(collector, domain),
+        None => None,
+    };
     let Some(mut writer) = writer else {
         return;
     };
+    if writer.request.binding.domain != SemanticDomain::LocalHir {
+        crate::observed_context::observe(tcx, &mut writer);
+    }
+    if writer.request.binding.domain == SemanticDomain::LocalHirWithTestHarness {
+        crate::test_harness::observe(tcx, collector, &mut writer);
+    }
     // The analysis query's entire local definition domain includes structural,
     // anonymous, impl, generic, variant and foreign definitions, not only fns.
     for did in tcx.iter_local_def_id() {
@@ -1130,4 +1354,147 @@ pub fn observe(
         }
     }
     writer.publish(collector);
+}
+
+fn binding_for_domain(collector: &Collector, domain: SemanticDomain) -> SemanticBindingV1 {
+    let mut binding = collector.semantic_binding();
+    binding.domain = domain;
+    binding
+}
+fn requested_domain() -> Option<SemanticDomain> {
+    let context = std::env::var_os("BG_DRIVER_COMPILER_CONTEXT_OBSERVATION");
+    let harness = std::env::var_os("BG_DRIVER_TEST_HARNESS_OBSERVATION");
+    match (context.as_deref(), harness.as_deref()) {
+        (None, None) => Some(SemanticDomain::LocalHir),
+        (Some(value), None) if value == "1" => Some(SemanticDomain::LocalHirWithCompilerContext),
+        (Some(value), Some(test)) if value == "1" && test == "1" => {
+            Some(SemanticDomain::LocalHirWithTestHarness)
+        }
+        _ => None,
+    }
+}
+
+impl Writer {
+    pub(super) fn observed_reference(
+        &mut self,
+        id: HirId,
+        role: &str,
+        target: SemanticTarget,
+        location: Option<SemanticLocation>,
+    ) {
+        self.terminal.visited_references += 1;
+        let ordinal = self.terminal.emitted_references + self.page.references.len() as u64;
+        self.reference(SemanticReference {
+            ordinal,
+            owner_index: id.owner.def_id.local_def_index.as_u32(),
+            hir_local_index: id.local_id.as_u32(),
+            role: role.into(),
+            target,
+            location,
+        });
+    }
+    pub(super) fn unsupported_observation(&mut self, gap: SemanticGap) {
+        self.terminal.visited_references += 1;
+        self.terminal.unsupported += 1;
+        self.gap(gap);
+    }
+    pub(super) fn observed_location(
+        &mut self,
+        collector: &mut Collector,
+        tcx: TyCtxt<'_>,
+        span: Span,
+    ) -> Option<SemanticLocation> {
+        self.location(collector, tcx, span)
+    }
+    // This is the SAME monotonic run counter, not another allocator or quota.
+    // A row's individual owned capacity is admitted before strings/boxes grow;
+    // serialized pages/index entries retain their existing independent charges.
+    pub(super) fn observation_capacity(&mut self, bytes: usize) -> Option<()> {
+        if self.work().is_break() {
+            return None;
+        }
+        if bytes > MAX_PAGE_BYTES || reserve(&self.request.budget_directory, bytes).is_err() {
+            self.interrupted(TraversalStop::OutputLimit, SemanticGap::OutputLimit);
+            return None;
+        }
+        Some(())
+    }
+}
+
+pub(super) struct ObservedRowBudget<'a> {
+    pub(super) writer: &'a mut Writer,
+    bytes: usize,
+}
+impl<'a> ObservedRowBudget<'a> {
+    pub(super) fn new<T>(writer: &'a mut Writer) -> Option<Self> {
+        let mut value = Self { writer, bytes: 0 };
+        value.charge(std::mem::size_of::<T>() + std::mem::size_of::<usize>() * 2)?;
+        Some(value)
+    }
+    pub(super) fn charge(&mut self, bytes: usize) -> Option<()> {
+        let total = self.bytes.checked_add(bytes)?;
+        if total > MAX_PAGE_BYTES {
+            return None;
+        }
+        self.writer.observation_capacity(bytes)?;
+        self.bytes = total;
+        Some(())
+    }
+    pub(super) fn text(&mut self, value: &str, maximum: usize, empty: bool) -> Option<String> {
+        if (!empty && value.is_empty()) || value.len() > maximum || value.contains('\0') {
+            return None;
+        }
+        self.charge(value.len())?;
+        let mut owned = String::new();
+        owned.try_reserve_exact(value.len()).ok()?;
+        if owned.capacity() > value.len() {
+            return None;
+        }
+        owned.push_str(value);
+        Some(owned)
+    }
+    pub(super) fn hex_bytes(&mut self, bytes: &[u8]) -> Option<String> {
+        if bytes.len() > 16 {
+            return None;
+        }
+        let length = bytes.len().checked_mul(2)?;
+        self.charge(length)?;
+        let mut result = String::new();
+        result.try_reserve_exact(length).ok()?;
+        if result.capacity() > length {
+            return None;
+        }
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in bytes {
+            result.push(HEX[(byte >> 4) as usize] as char);
+            result.push(HEX[(byte & 15) as usize] as char);
+        }
+        Some(result)
+    }
+    pub(super) fn definition(
+        &mut self,
+        tcx: TyCtxt<'_>,
+        did: DefId,
+    ) -> Option<crate::compiler_test_harness::CompilerDefinitionObservation> {
+        use crate::compiler_test_harness::CompilerDefinitionObservation;
+        // The existing path writer's fixed 64-key stack and 1024-byte ceiling
+        // are admitted before it allocates a path. Actual capacity is bounded.
+        self.charge(1024)?;
+        let compiler_path = compiler_path(tcx, self.writer, did)?;
+        if compiler_path.capacity() > 1024 {
+            return None;
+        }
+        let crate_name = self.text(tcx.crate_name(did.krate).as_str(), 1024, false)?;
+        let value = CompilerDefinitionObservation {
+            crate_name,
+            stable_crate_id: self
+                .hex_bytes(&tcx.stable_crate_id(did.krate).as_u64().to_be_bytes())?,
+            crate_hash: self.hex_bytes(&tcx.crate_hash(did.krate).as_u128().to_be_bytes())?,
+            def_path_hash: self.hex_bytes(&tcx.def_path_hash(did).0.to_le_bytes())?,
+            definition_index: did.index.as_u32(),
+            compiler_path,
+        };
+        value.validate().ok()?;
+        Some(value)
+    }
 }

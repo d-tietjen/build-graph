@@ -128,6 +128,14 @@ struct CommonArgs {
     #[cfg(feature = "rustc-driver")]
     #[arg(long, requires = "observe_definition_occurrences")]
     observe_semantic_stream: bool,
+    /// Observe the effective analysed compiler cfg and backend feature sets.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, requires = "observe_semantic_stream")]
+    observe_compiler_context: bool,
+    /// Observe the actual generated standard test descriptors and runner.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, requires = "observe_semantic_stream")]
+    observe_test_harness: bool,
     /// Deliver callback requests through immutable held Linux descriptors.
     /// This transport supplies bytes, not execution-input custody.
     #[cfg(all(target_os = "linux", feature = "rustc-driver"))]
@@ -475,6 +483,18 @@ fn build_and_extract_with_launch(
                     .as_mut()
                     .context("semantic observation missing")?
                     .enable_semantic_stream()?;
+            }
+            if common.observe_compiler_context || common.observe_test_harness {
+                session
+                    .as_mut()
+                    .context("compiler observation missing")?
+                    .enable_compiler_context_observation()?;
+            }
+            if common.observe_test_harness {
+                session
+                    .as_mut()
+                    .context("compiler observation missing")?
+                    .enable_test_harness_observation()?;
             }
         }
         let compiled = cargo_build::run_build(

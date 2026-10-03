@@ -67,6 +67,8 @@ pub struct SemanticBindingV1 {
 #[serde(rename_all = "snake_case")]
 pub enum SemanticDomain {
     LocalHir,
+    LocalHirWithCompilerContext,
+    LocalHirWithTestHarness,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -83,6 +85,14 @@ pub enum SemanticGap {
     SourceWorkLimit,
     TraversalWorkLimit,
     PublicationInterrupted,
+    CompilerContextUnavailable,
+    CompilerContextUnsupportedValue,
+    TestHarnessUnavailable,
+    TestHarnessCustomRunner,
+    TestHarnessUnsupportedDescriptor,
+    TestHarnessOwnerMismatch,
+    TestHarnessCrateSourceUnavailable,
+    TestHarnessOrderingUnknown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -120,6 +130,23 @@ pub enum SemanticTarget {
     },
     Builtin {
         name: String,
+    },
+    // Boxing keeps the ordinary page Vec's element layout unchanged. Bodies
+    // are allocated only by the explicit observation domains, under their cap.
+    CompilerContext {
+        context: Box<crate::compiler_context::CompilerContextObservation>,
+    },
+    EffectiveCfg {
+        cfg: Box<crate::compiler_context::EffectiveCfgObservation>,
+    },
+    TargetFeature {
+        feature: Box<crate::compiler_context::TargetFeatureObservation>,
+    },
+    TestHarnessEntry {
+        entry: Box<crate::compiler_test_harness::TestHarnessEntryObservation>,
+    },
+    TestHarnessDescriptor {
+        descriptor: Box<crate::compiler_test_harness::TestDescriptorObservation>,
     },
 }
 
@@ -292,17 +319,20 @@ impl SemanticPageV1 {
             location(&row.location)?;
         }
         for row in &self.references {
-            if !matches!(
-                row.role.as_str(),
-                "path"
-                    | "call"
-                    | "method"
-                    | "field"
-                    | "binding"
-                    | "segment"
-                    | "lifetime"
-                    | "operator"
-            ) {
+            let observational = validate_observed_target(self.binding.domain, row)?;
+            if !observational
+                && !matches!(
+                    row.role.as_str(),
+                    "path"
+                        | "call"
+                        | "method"
+                        | "field"
+                        | "binding"
+                        | "segment"
+                        | "lifetime"
+                        | "operator"
+                )
+            {
                 return Err("invalid semantic reference");
             }
             match &row.target {
@@ -340,6 +370,7 @@ impl SemanticStreamV1 {
             return Err("semantic page inventory limit");
         }
         let (mut definitions, mut references) = (0u64, 0u64);
+        let mut observed = ObservedStreamState::default();
         let mut sources = std::collections::BTreeMap::new();
         for (ordinal, page) in self.pages.iter().enumerate() {
             page.validate()?;
@@ -353,6 +384,7 @@ impl SemanticStreamV1 {
                 definitions += 1;
             }
             for row in &page.references {
+                observed.push(row)?;
                 if row.ordinal != references {
                     return Err("noncontiguous semantic references");
                 }
@@ -402,6 +434,7 @@ impl SemanticStreamV1 {
             {
                 return Err("conflicting semantic terminal");
             }
+            observed.finish(self.binding.domain, t)?;
         }
         Ok(())
     }
@@ -627,5 +660,180 @@ mod tests {
             .input
             .content_fingerprint = fingerprint(b"changed");
         assert!(value.validate().is_err());
+    }
+}
+
+fn validate_observed_target(
+    domain: SemanticDomain,
+    row: &SemanticReference,
+) -> Result<bool, &'static str> {
+    let (role, harness) = match &row.target {
+        SemanticTarget::CompilerContext { context } => {
+            context.validate()?;
+            ("compiler_context", false)
+        }
+        SemanticTarget::EffectiveCfg { cfg } => {
+            cfg.validate()?;
+            ("effective_cfg", false)
+        }
+        SemanticTarget::TargetFeature { feature } => {
+            feature.validate()?;
+            ("target_feature", false)
+        }
+        SemanticTarget::TestHarnessEntry { entry } => {
+            entry.validate()?;
+            ("test_harness_entry", true)
+        }
+        SemanticTarget::TestHarnessDescriptor { descriptor } => {
+            descriptor.validate()?;
+            ("test_harness_descriptor", true)
+        }
+        _ => return Ok(false),
+    };
+    if domain == SemanticDomain::LocalHir
+        || harness && domain != SemanticDomain::LocalHirWithTestHarness
+        || row.role != role
+    {
+        return Err("observation target outside requested semantic domain");
+    }
+    if !harness && row.location.is_some() {
+        return Err("Session metadata is not a HIR source occurrence");
+    }
+    Ok(true)
+}
+
+#[derive(Default)]
+struct ObservedStreamState<'a> {
+    context: Option<&'a crate::compiler_context::CompilerContextObservation>,
+    harness: Option<&'a crate::compiler_test_harness::TestHarnessEntryObservation>,
+    cfg: u64,
+    stable: u64,
+    all: u64,
+    descriptors: u64,
+    last_name: Option<&'a str>,
+    cfg_keys: std::collections::BTreeSet<(&'a str, Option<&'a str>)>,
+    stable_keys: std::collections::BTreeSet<&'a str>,
+    all_keys: std::collections::BTreeSet<&'a str>,
+    constants: std::collections::BTreeSet<&'a str>,
+}
+impl<'a> ObservedStreamState<'a> {
+    fn push(&mut self, row: &'a SemanticReference) -> Result<(), &'static str> {
+        match &row.target {
+            SemanticTarget::CompilerContext { context } => {
+                if self.context.replace(context).is_some() {
+                    return Err("duplicate Session observation");
+                }
+            }
+            SemanticTarget::EffectiveCfg { cfg } => {
+                let header = self.context.ok_or("missing Session observation header")?;
+                if cfg.ordinal != self.cfg || self.cfg >= header.cfg_entries {
+                    return Err("noncontiguous effective cfg rows");
+                }
+                if !self.cfg_keys.insert((&cfg.name, cfg.value.as_deref())) {
+                    return Err("duplicate effective cfg row");
+                }
+                self.cfg += 1;
+            }
+            SemanticTarget::TargetFeature { feature } => {
+                let header = self.context.ok_or("missing Session observation header")?;
+                let (count, limit) = match feature.inventory {
+                    crate::compiler_context::TargetFeatureInventory::Stable => {
+                        (&mut self.stable, header.stable_target_feature_entries)
+                    }
+                    crate::compiler_context::TargetFeatureInventory::IncludingUnstable => {
+                        (&mut self.all, header.all_target_feature_entries)
+                    }
+                };
+                if feature.ordinal != *count || *count >= limit {
+                    return Err("noncontiguous target feature rows");
+                }
+                let keys = match feature.inventory {
+                    crate::compiler_context::TargetFeatureInventory::Stable => {
+                        &mut self.stable_keys
+                    }
+                    crate::compiler_context::TargetFeatureInventory::IncludingUnstable => {
+                        &mut self.all_keys
+                    }
+                };
+                if !keys.insert(&feature.name) {
+                    return Err("duplicate target feature row");
+                }
+                *count += 1;
+            }
+            SemanticTarget::TestHarnessEntry { entry } => {
+                if self.harness.replace(entry).is_some() {
+                    return Err("duplicate generated harness entry");
+                }
+            }
+            SemanticTarget::TestHarnessDescriptor { descriptor } => {
+                let header = self.harness.ok_or("missing generated harness entry")?;
+                if descriptor.table_ordinal != self.descriptors
+                    || self.descriptors >= header.table_entries
+                    || self
+                        .last_name
+                        .is_some_and(|name| name >= descriptor.name.as_str())
+                    || descriptor.descriptor_type != header.descriptor_type
+                    || !descriptor.constant.same_crate(&header.entry)
+                {
+                    return Err("inconsistent generated descriptor table");
+                }
+                if !self.constants.insert(&descriptor.constant.def_path_hash) {
+                    return Err("duplicate generated descriptor constant");
+                }
+                self.last_name = Some(&descriptor.name);
+                self.descriptors += 1;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    fn finish(
+        &self,
+        domain: SemanticDomain,
+        terminal: &SemanticTerminalV1,
+    ) -> Result<(), &'static str> {
+        if domain == SemanticDomain::LocalHir {
+            return Ok(());
+        }
+        let interrupted = terminal.stop != TraversalStop::EndOfDomain;
+        let context_gap = interrupted
+            || terminal.gaps.iter().any(|gap| {
+                matches!(
+                    gap,
+                    SemanticGap::CompilerContextUnavailable
+                        | SemanticGap::CompilerContextUnsupportedValue
+                )
+            });
+        let complete_context = self.context.is_some_and(|header| {
+            self.cfg == header.cfg_entries
+                && self.stable == header.stable_target_feature_entries
+                && self.all == header.all_target_feature_entries
+                && self.stable_keys.is_subset(&self.all_keys)
+        });
+        if !complete_context && !context_gap {
+            return Err("incomplete compiler Session rows without gap");
+        }
+        if domain == SemanticDomain::LocalHirWithTestHarness {
+            let harness_gap = interrupted
+                || terminal.gaps.iter().any(|gap| {
+                    matches!(
+                        gap,
+                        SemanticGap::TestHarnessUnavailable
+                            | SemanticGap::TestHarnessCustomRunner
+                            | SemanticGap::TestHarnessUnsupportedDescriptor
+                            | SemanticGap::TestHarnessOwnerMismatch
+                            | SemanticGap::TestHarnessCrateSourceUnavailable
+                            | SemanticGap::TestHarnessOrderingUnknown
+                    )
+                });
+            if !self
+                .harness
+                .is_some_and(|header| self.descriptors == header.table_entries)
+                && !harness_gap
+            {
+                return Err("incomplete generated harness rows without gap");
+            }
+        }
+        Ok(())
     }
 }

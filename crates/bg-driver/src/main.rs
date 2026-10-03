@@ -10,6 +10,7 @@
 
 #![feature(rustc_private)]
 
+extern crate rustc_ast;
 extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_interface;
@@ -29,12 +30,18 @@ mod compiler_occurrence;
 #[path = "../../../src/compiler_semantic.rs"]
 mod compiler_semantic;
 // The shared transport also contains its sender API, used by the CLI.
+#[path = "../../../src/compiler_context.rs"]
+mod compiler_context;
+#[path = "../../../src/compiler_test_harness.rs"]
+mod compiler_test_harness;
 #[cfg(target_os = "linux")]
 #[allow(dead_code)]
 #[path = "../../../src/held_callback_control.rs"]
 mod held_callback_control;
+mod observed_context;
 mod occurrences;
 mod semantic;
+mod test_harness;
 
 struct BgCallbacks {
     #[cfg(target_os = "linux")]
