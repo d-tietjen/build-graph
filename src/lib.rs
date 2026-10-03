@@ -39,11 +39,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub mod compiler_context;
-pub mod compiler_context;
 pub mod compiler_invocation;
 pub mod compiler_occurrence;
 pub mod compiler_semantic;
-pub mod compiler_test_harness;
 pub mod compiler_test_harness;
 pub mod export;
 pub mod fragment;
