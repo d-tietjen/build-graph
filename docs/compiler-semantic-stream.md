@@ -50,7 +50,9 @@ after the existing Cargo unit join and invocation sort.
 
 Pages have contiguous ordinals, matching bindings, independently contiguous
 definition/reference ordinals, at most 64 definitions and 64 references, and
-at most 24 KiB **total encoded page bytes**. A row cannot acquire a new byte
+at most 24 KiB **total encoded page bytes**. Page gaps describe dispositions
+observed in that traversal prefix, including omitted candidates. Space for every
+possible later gap is reserved before accepting a row. A row cannot acquire a new byte
 allowance by crossing a page boundary. A small local page inventory records
 actual committed byte sizes and markers before the observer reads pages.
 It is not exported as an authentication record.

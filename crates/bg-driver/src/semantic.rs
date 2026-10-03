@@ -257,6 +257,34 @@ impl Writer {
         if !self.terminal.gaps.contains(&gap) {
             self.terminal.gaps.push(gap);
         }
+        // Each page records gaps observed in the traversal prefix. Keep the
+        // prefix across page boundaries, including an omitted candidate.
+        if !self.page.gaps.contains(&gap) {
+            self.page.gaps.push(gap);
+        }
+    }
+    fn fits(&mut self) -> bool {
+        let length = self.page.gaps.len();
+        for gap in [
+            SemanticGap::UnsupportedDefinition,
+            SemanticGap::UnsupportedResolution,
+            SemanticGap::ExpandedCoordinates,
+            SemanticGap::SourceUnavailable,
+            SemanticGap::SourceVersionChanged,
+            SemanticGap::ExternalTarget,
+            SemanticGap::GeneratedOrderingUnknown,
+            SemanticGap::OutputLimit,
+            SemanticGap::SourceWorkLimit,
+            SemanticGap::TraversalWorkLimit,
+            SemanticGap::PublicationInterrupted,
+        ] {
+            if !self.page.gaps.contains(&gap) {
+                self.page.gaps.push(gap);
+            }
+        }
+        let fits = encoded_size(&self.page, MAX_PAGE_BYTES).is_ok();
+        self.page.gaps.truncate(length);
+        fits
     }
     fn interrupted(&mut self, stop: TraversalStop, gap: SemanticGap) {
         self.stopped = true;
@@ -399,7 +427,7 @@ impl Writer {
             return;
         }
         self.page.definitions.push(row);
-        if encoded_size(&self.page, MAX_PAGE_BYTES).is_err() {
+        if !self.fits() {
             let row = self.page.definitions.pop();
             if !self.flush() {
                 return;
@@ -407,7 +435,7 @@ impl Writer {
             if let Some(row) = row {
                 self.page.definitions.push(row);
             }
-            if encoded_size(&self.page, MAX_PAGE_BYTES).is_err() {
+            if !self.fits() {
                 self.page.definitions.clear();
                 self.interrupted(TraversalStop::OutputLimit, SemanticGap::OutputLimit);
             }
@@ -418,7 +446,7 @@ impl Writer {
             return;
         }
         self.page.references.push(row);
-        if encoded_size(&self.page, MAX_PAGE_BYTES).is_err() {
+        if !self.fits() {
             let row = self.page.references.pop();
             if !self.flush() {
                 return;
@@ -426,7 +454,7 @@ impl Writer {
             if let Some(row) = row {
                 self.page.references.push(row);
             }
-            if encoded_size(&self.page, MAX_PAGE_BYTES).is_err() {
+            if !self.fits() {
                 self.page.references.clear();
                 self.interrupted(TraversalStop::OutputLimit, SemanticGap::OutputLimit);
             }
