@@ -9,6 +9,8 @@ mod compiler_observer;
 mod depinfo;
 #[cfg(feature = "rustc-driver")]
 mod driver_refs;
+#[cfg(feature = "rustc-driver")]
+mod explicit_toolchain;
 mod export_sources;
 mod metadata;
 mod qserve;
@@ -131,6 +133,18 @@ struct CommonArgs {
     #[cfg(feature = "rustc-driver")]
     #[arg(long, value_name = "PATH", requires = "observe_definition_occurrences")]
     occurrence_cargo: Option<String>,
+    /// Explicit supplied rustc. Requires the complete supplied tool set and driver.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, value_name = "PATH", requires_all = ["observe_definition_occurrences", "occurrence_cargo", "occurrence_rustdoc", "occurrence_sysroot", "driver_bin"])]
+    occurrence_rustc: Option<String>,
+    /// Explicit supplied rustdoc; avoids ambient toolchain discovery.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, value_name = "PATH", requires_all = ["occurrence_rustc", "occurrence_sysroot"])]
+    occurrence_rustdoc: Option<String>,
+    /// Explicit compiler sysroot, including lib/ for the supplied driver.
+    #[cfg(feature = "rustc-driver")]
+    #[arg(long, value_name = "PATH", requires_all = ["occurrence_rustc", "occurrence_rustdoc"])]
+    occurrence_sysroot: Option<String>,
     /// Additional approved input root: dependencies|host_tools|cargo_config=PATH.
     #[arg(long, value_name = "NAME=PATH", requires = "observe_compiler_inputs")]
     compiler_input_root: Vec<String>,
@@ -494,6 +508,18 @@ fn selected_occurrence_cargo(
     #[cfg(feature = "rustc-driver")]
     if common.observe_definition_occurrences {
         let nightly = common.nightly.as_deref().unwrap_or(DEFAULT_DRIVER_NIGHTLY);
+        if let Some(tools) = explicit_toolchain::ExplicitToolchain::selected(common)? {
+            let mut selected = cargo_launch::CargoLaunchSession::new(
+                tools.cargo,
+                tools.rustc,
+                tools.rustdoc,
+                nightly.into(),
+                tools.sysroot.join("lib"),
+                &common.compiler_input_root,
+            )?;
+            selected.set_explicit_sysroot(tools.sysroot)?;
+            return Ok(Some(selected));
+        }
         let cargo = match &common.occurrence_cargo {
             Some(path) => std::path::PathBuf::from(path),
             None => driver_refs::tool_program(nightly, "cargo")?,
@@ -929,6 +955,18 @@ fn run_extract_observed(
             if c.driver_requested() {
                 let nightly = c.nightly.as_deref().unwrap_or(DEFAULT_DRIVER_NIGHTLY);
                 result = driver_refs::resolve_driver(c.driver_bin.as_deref()).and_then(|bin| {
+                    if let Some(selected) = selected_cargo
+                        .as_mut()
+                        .filter(|selected| selected.has_explicit_tools())
+                    {
+                        return driver_refs::add_references_layer_selected(
+                            &mut graph,
+                            &meta.workspace_root,
+                            &out,
+                            &bin,
+                            selected,
+                        );
+                    }
                     driver_refs::add_references_layer(
                         &mut graph,
                         &meta.workspace_root,

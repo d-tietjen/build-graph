@@ -249,6 +249,60 @@ pub fn add_references_layer(
         bail!("`cargo check` (driver) failed (exit {status})");
     }
 
+    read_reference_edges(graph, &edges_dir)
+}
+
+/// Supplied-tools variant of the existing separate driver pass. No discovery
+/// or driver build occurs; the original edge reader and partial outcomes apply.
+pub fn add_references_layer_selected(
+    graph: &mut Graph,
+    ws_root: &Utf8Path,
+    out: &Utf8Path,
+    driver_bin: &Utf8Path,
+    selected: &mut crate::cargo_launch::CargoLaunchSession,
+) -> Result<ReferenceCounts> {
+    if !selected.has_explicit_tools() || !driver_bin.as_std_path().is_file() {
+        bail!("explicit driver pass requires the supplied tools and prebuilt driver");
+    }
+    let edges_dir = out.join("driver-refs");
+    let target_dir = out.join("driver-check");
+    std::fs::create_dir_all(edges_dir.as_std_path()).ok();
+    let command =
+        selected_reference_command(ws_root, &edges_dir, &target_dir, driver_bin, selected)?;
+    eprintln!(
+        "[build-graph] references(driver): selected Cargo check --all-targets via the supplied driver…"
+    );
+    let mut child = selected.launch_reference_check(command)?;
+    let status = child
+        .wait()
+        .context("waiting for selected Cargo check with the rustc driver")?;
+    drop(child);
+    if !status.success() {
+        bail!("selected Cargo check (driver) failed (exit {status})");
+    }
+    read_reference_edges(graph, &edges_dir)
+}
+
+pub(crate) fn selected_reference_command(
+    ws_root: &Utf8Path,
+    edges_dir: &Utf8Path,
+    target_dir: &Utf8Path,
+    driver_bin: &Utf8Path,
+    selected: &crate::cargo_launch::CargoLaunchSession,
+) -> Result<Command> {
+    let mut command = Command::new(&selected.cargo);
+    command
+        .args(["check", "--all-targets", "--target-dir"])
+        .arg(target_dir.as_str())
+        .current_dir(ws_root.as_std_path())
+        .env("RUSTC_WORKSPACE_WRAPPER", driver_bin.as_str())
+        .env("BG_DRIVER_EDGES", edges_dir.as_str());
+    selected.configure(&mut command, true);
+    selected.configure_explicit_flags(&mut command)?;
+    Ok(command)
+}
+
+fn read_reference_edges(graph: &mut Graph, edges_dir: &Utf8Path) -> Result<ReferenceCounts> {
     // This layer is a full recompute from the persisted per-unit edge files.
     graph.remove_edges_with_relation("calls");
     graph.remove_edges_with_relation("uses");

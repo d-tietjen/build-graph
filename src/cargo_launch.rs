@@ -34,6 +34,8 @@ pub struct CargoLaunchSession {
     pub rustdoc: PathBuf,
     pub toolchain: String,
     pub library: PathBuf,
+    explicit_sysroot: Option<PathBuf>,
+    explicit_flags: Option<[OsString; 2]>,
     label: String,
     ordinal: u64,
     roots: Vec<RootBinding>,
@@ -99,6 +101,8 @@ impl CargoLaunchSession {
             rustdoc,
             toolchain,
             library,
+            explicit_sysroot: None,
+            explicit_flags: None,
             label,
             ordinal: 0,
             roots,
@@ -111,6 +115,31 @@ impl CargoLaunchSession {
             #[cfg(target_os = "linux")]
             routed: None,
         })
+    }
+
+    /// Supply a sysroot before operation one. Paths remain observations only.
+    #[cfg(feature = "rustc-driver")]
+    pub fn set_explicit_sysroot(&mut self, sysroot: PathBuf) -> Result<()> {
+        if self.ordinal != 0 || self.explicit_sysroot.is_some() {
+            bail!("explicit sysroot must precede every selected Cargo operation");
+        }
+        crate::explicit_toolchain::validate_path(&sysroot)?;
+        if !sysroot.is_dir() || self.library != sysroot.join("lib") {
+            bail!("explicit sysroot differs from the selected driver library directory");
+        }
+        // Check the actual inherited flags before even metadata can spawn.
+        // Each final Command is checked again after its own configuration.
+        let mut command = Command::new(&self.cargo);
+        require_explicit_flag_baseline(&command)?;
+        apply_sysroot(&mut command, &sysroot)?;
+        self.explicit_flags = Some([
+            command_value(&command, "CARGO_ENCODED_RUSTFLAGS")
+                .ok_or_else(|| anyhow::anyhow!("explicit compiler flag baseline unavailable"))?,
+            command_value(&command, "CARGO_ENCODED_RUSTDOCFLAGS")
+                .ok_or_else(|| anyhow::anyhow!("explicit doc flag baseline unavailable"))?,
+        ]);
+        self.explicit_sysroot = Some(sysroot);
+        Ok(())
     }
 
     pub fn configure(&self, command: &mut Command, compiler_wrappers: bool) {
@@ -132,6 +161,25 @@ impl CargoLaunchSession {
                 .env_remove("RUSTC_WORKSPACE_WRAPPER")
                 .env_remove("BUILD_GRAPH_COMPILER_OBSERVER");
         }
+    }
+
+    #[cfg(feature = "rustc-driver")]
+    pub fn has_explicit_tools(&self) -> bool {
+        self.explicit_sysroot.is_some()
+    }
+
+    /// Also used by the preexisting separate driver-reference check. This
+    /// configures its actual command without adding it to the operation schema.
+    pub fn configure_explicit_flags(&self, command: &mut Command) -> Result<()> {
+        if let Some(sysroot) = &self.explicit_sysroot {
+            let flags = self
+                .explicit_flags
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("explicit compiler flag baseline unavailable"))?;
+            compose_explicit_flag_baseline(command, flags)?;
+            apply_sysroot(command, sysroot)?;
+        }
+        Ok(())
     }
 
     pub fn set_roots(&mut self, roots: &[RootBinding]) {
@@ -167,6 +215,65 @@ impl CargoLaunchSession {
         kind: CargoOperationKind,
     ) -> Result<CargoChild<'_>> {
         let operation = self.begin(&mut command, kind)?;
+        self.launch_started(command, operation)
+    }
+
+    /// Distinct preexisting reference pass, using the same observer and Child
+    /// owner without relabelling it as a metadata/build/docs observation.
+    #[cfg(feature = "rustc-driver")]
+    pub fn launch_reference_check(&mut self, mut command: Command) -> Result<CargoChild<'_>> {
+        if !self.has_explicit_tools() || command.get_program() != self.cargo.as_os_str() {
+            bail!("reference check requires the exact explicit Cargo selection");
+        }
+        self.configure_explicit_flags(&mut command)?;
+        if self.ordinal >= MAX_CARGO_OPERATIONS as u64 {
+            bail!("launch intent operation bound exhausted");
+        }
+        self.ordinal = self
+            .ordinal
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("Cargo operation ordinal exhausted"))?;
+        let request = format!("{}-{}", self.label, self.ordinal);
+        command.env(REQUEST_ENV, &request);
+        #[cfg(target_os = "linux")]
+        if let Some(observer) = &mut self.observer {
+            let flags = [
+                command_value(&command, "CARGO_ENCODED_RUSTFLAGS"),
+                command_value(&command, "CARGO_ENCODED_RUSTDOCFLAGS"),
+            ];
+            self.routed = Some(observer.route(
+                &mut command,
+                Binding {
+                    session: self.label.clone(),
+                    operation: self.ordinal,
+                    request,
+                    root: observer.root().into(),
+                    kind: "driver_check".into(),
+                },
+                true,
+            )?);
+            let sysroot = self
+                .explicit_sysroot
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("explicit sysroot unavailable"))?;
+            require_final_explicit_selection(&command, sysroot, &self.rustc, &self.rustdoc)?;
+            if flags
+                != [
+                    command_value(&command, "CARGO_ENCODED_RUSTFLAGS"),
+                    command_value(&command, "CARGO_ENCODED_RUSTDOCFLAGS"),
+                ]
+            {
+                bail!("launch overlay changes the explicit compiler flag baseline");
+            }
+        }
+        self.launch_started(command, None)
+    }
+
+    fn launch_started(
+        &mut self,
+        mut command: Command,
+        operation: Option<usize>,
+    ) -> Result<CargoChild<'_>> {
         #[cfg(target_os = "linux")]
         if let Some(observer) = &mut self.observer {
             let routed = self
@@ -231,6 +338,7 @@ impl CargoLaunchSession {
         if command.get_program() != self.cargo.as_os_str() {
             bail!("selected Cargo command differs from launch session");
         }
+        self.configure_explicit_flags(command)?;
         self.ordinal = self
             .ordinal
             .checked_add(1)
@@ -242,6 +350,12 @@ impl CargoLaunchSession {
             if self.operations.len() >= MAX_CARGO_OPERATIONS {
                 bail!("launch intent operation bound exhausted");
             }
+            let explicit_flags = self.explicit_sysroot.as_ref().map(|_| {
+                [
+                    command_value(command, "CARGO_ENCODED_RUSTFLAGS"),
+                    command_value(command, "CARGO_ENCODED_RUSTDOCFLAGS"),
+                ]
+            });
             self.routed = Some(
                 observer.route(
                     command,
@@ -260,6 +374,19 @@ impl CargoLaunchSession {
                     true,
                 )?,
             );
+            if let Some(sysroot) = &self.explicit_sysroot {
+                // A routed overlay may add environment, but cannot change these
+                // selections after the request and before the final carrier.
+                require_final_explicit_selection(command, sysroot, &self.rustc, &self.rustdoc)?;
+                if explicit_flags
+                    != Some([
+                        command_value(command, "CARGO_ENCODED_RUSTFLAGS"),
+                        command_value(command, "CARGO_ENCODED_RUSTDOCFLAGS"),
+                    ])
+                {
+                    bail!("launch overlay changes the explicit compiler flag baseline");
+                }
+            }
         }
         if self.operations.len() >= MAX_CARGO_OPERATIONS {
             self.lost = self.lost.saturating_add(1);
@@ -820,6 +947,180 @@ fn capture_environment(
         .collect()
 }
 
+#[cfg(feature = "rustc-driver")]
+fn require_explicit_flag_baseline(command: &Command) -> Result<()> {
+    for (encoded, plain) in [
+        ("CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS"),
+        ("CARGO_ENCODED_RUSTDOCFLAGS", "RUSTDOCFLAGS"),
+    ] {
+        if command_value(command, encoded).is_none() && command_value(command, plain).is_none() {
+            bail!(
+                "explicit tools require a complete compiler and doc flag baseline, including empty values"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn compose_explicit_flag_baseline(command: &mut Command, baseline: &[OsString; 2]) -> Result<()> {
+    for ((encoded, plain), baseline) in [
+        ("CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS"),
+        ("CARGO_ENCODED_RUSTDOCFLAGS", "RUSTDOCFLAGS"),
+    ]
+    .into_iter()
+    .zip(baseline)
+    {
+        if let Some((_, value)) = command.get_envs().find(|(key, _)| *key == encoded) {
+            if value != Some(baseline.as_os_str()) {
+                bail!("selected command changes the explicit compiler flag baseline");
+            }
+            continue;
+        }
+        let mut flags = baseline
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("explicit compiler flags must be UTF-8"))?
+            .to_owned();
+        // The existing docs command supplies its JSON flags as a per-command
+        // plain value. Append those to the captured complete baseline.
+        if let Some((_, Some(value))) = command.get_envs().find(|(key, _)| *key == plain) {
+            let value = value
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("explicit compiler flags must be UTF-8"))?;
+            if value.len() > MAX_TEXT_BYTES {
+                bail!("explicit compiler flags exceed observation bound");
+            }
+            if value.contains('\x1f') {
+                bail!("plain compiler flags cannot contain the encoded argument separator");
+            }
+            for argument in value.split_whitespace() {
+                if flags
+                    .len()
+                    .checked_add(argument.len())
+                    .and_then(|length| length.checked_add(1))
+                    .is_none_or(|length| length > MAX_TEXT_BYTES)
+                {
+                    bail!("explicit compiler flags exceed observation bound");
+                }
+                if !flags.is_empty() {
+                    flags.push('\x1f');
+                }
+                flags.push_str(argument);
+                if flags.len() > MAX_TEXT_BYTES {
+                    bail!("explicit compiler flags exceed observation bound");
+                }
+            }
+        }
+        command.env(encoded, flags);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn require_final_explicit_selection(
+    command: &Command,
+    sysroot: &Path,
+    rustc: &Path,
+    rustdoc: &Path,
+) -> Result<()> {
+    if command_value(command, "RUSTC").as_deref() != Some(rustc.as_os_str())
+        || command_value(command, "RUSTDOC").as_deref() != Some(rustdoc.as_os_str())
+    {
+        bail!("launch overlay changes explicit compiler selections");
+    }
+    // Validate in a detached Command: the routed command must remain byte exact
+    // for Observer::prepare's final intent check.
+    let mut check = Command::new(command.get_program());
+    for name in ["CARGO_ENCODED_RUSTFLAGS", "CARGO_ENCODED_RUSTDOCFLAGS"] {
+        let value = command_value(command, name)
+            .ok_or_else(|| anyhow::anyhow!("launch overlay removes explicit compiler flags"))?;
+        check.env(name, &value);
+    }
+    apply_sysroot(&mut check, sysroot)?;
+    for name in ["CARGO_ENCODED_RUSTFLAGS", "CARGO_ENCODED_RUSTDOCFLAGS"] {
+        if command_value(&check, name) != command_value(command, name) {
+            bail!("launch overlay removes the explicit sysroot");
+        }
+    }
+    Ok(())
+}
+
+// Encode the selected sysroot as one Cargo flag, preserving the actual existing
+// flag precedence. This runs before the same command is observed or frozen.
+fn apply_sysroot(command: &mut Command, sysroot: &Path) -> Result<()> {
+    let sysroot = sysroot
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("explicit sysroot must be UTF-8"))?;
+    for (encoded_name, plain_name) in [
+        ("CARGO_ENCODED_RUSTFLAGS", "RUSTFLAGS"),
+        ("CARGO_ENCODED_RUSTDOCFLAGS", "RUSTDOCFLAGS"),
+    ] {
+        let encoded = command_value(command, encoded_name);
+        let plain = command_value(command, plain_name);
+        let value = encoded.as_ref().or(plain.as_ref());
+        let text = value
+            .map(|v| {
+                v.to_str()
+                    .ok_or_else(|| anyhow::anyhow!("explicit compiler flags must be UTF-8"))
+            })
+            .transpose()?
+            .unwrap_or("");
+        if text.len() > MAX_TEXT_BYTES {
+            bail!("explicit compiler flags exceed observation bound");
+        }
+        if encoded.is_none() && text.contains('\x1f') {
+            bail!("plain compiler flags cannot contain the encoded argument separator");
+        }
+        let mut flags: Vec<&str> = if text.is_empty() {
+            Vec::new()
+        } else if encoded.is_some() {
+            text.split('\x1f').take(MAX_ARGUMENTS + 1).collect()
+        } else {
+            text.split_whitespace().take(MAX_ARGUMENTS + 1).collect()
+        };
+        if flags.len() > MAX_ARGUMENTS {
+            bail!("explicit compiler flag count exceeds observation bound");
+        }
+        let mut selected = false;
+        for (index, flag) in flags.iter().enumerate() {
+            let value = if *flag == "--sysroot" {
+                flags.get(index + 1).copied()
+            } else {
+                flag.strip_prefix("--sysroot=")
+            };
+            if *flag == "--sysroot" && value.is_none() {
+                bail!("explicit compiler flags contain an incomplete sysroot");
+            }
+            if let Some(value) = value {
+                if selected || value != sysroot {
+                    bail!("explicit compiler flags contradict the selected sysroot");
+                }
+                selected = true;
+            }
+        }
+        let supplied = format!("--sysroot={sysroot}");
+        if !selected {
+            if text
+                .len()
+                .checked_add(supplied.len())
+                .and_then(|length| length.checked_add(1))
+                .is_none_or(|length| length > MAX_TEXT_BYTES)
+            {
+                bail!("explicit compiler flags exceed observation bound");
+            }
+            flags.push(&supplied);
+        }
+        if flags.len() > MAX_ARGUMENTS {
+            bail!("explicit compiler flag count exceeds observation bound");
+        }
+        let final_flags = flags.join("\x1f");
+        if final_flags.len() > MAX_TEXT_BYTES {
+            bail!("explicit compiler flags exceed observation bound");
+        }
+        command.env(encoded_name, final_flags);
+    }
+    Ok(())
+}
+
 fn command_value(command: &Command, name: &str) -> Option<OsString> {
     command
         .get_envs()
@@ -1074,3 +1375,11 @@ mod tests {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "cargo_launch_tests.rs"]
 mod launch_guard_tests;
+
+#[cfg(all(test, feature = "rustc-driver"))]
+#[path = "explicit_sysroot_tests.rs"]
+mod explicit_sysroot_tests;
+
+#[cfg(all(test, feature = "rustc-driver"))]
+#[path = "explicit_driver_tests.rs"]
+mod explicit_driver_tests;

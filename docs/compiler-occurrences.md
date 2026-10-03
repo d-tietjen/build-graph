@@ -43,6 +43,10 @@ same operation; a stable Cargo/configuration receipt cannot be relabelled as a
 nightly execution receipt. Existing workspace wrappers are rejected for this
 explicit route. Ordinary stable capture continues to use its original Cargo.
 
+For a supplied compiler, rustdoc and sysroot with no ambient discovery, see
+[explicit tool inputs](explicit-toolchain-inputs.md). Omission keeps the current
+discovery behavior.
+
 ### Actual Cargo operations
 
 The optional `CompilerInvocationsV1.cargo_operations` schema-1 attachment records
