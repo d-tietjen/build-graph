@@ -22,11 +22,23 @@ pub const MAX_CARGO_OPERATIONS: usize = 16;
 pub const MAX_CARGO_OPERATION_BYTES: usize = 32 * 1024;
 pub const MAX_CARGO_SESSION_BYTES: usize = 256 * 1024;
 
+/// A bounded serialization failure that never contains observation payloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObservationSizeError {
     BudgetExceeded,
     SerializationFailed,
 }
+
+impl std::fmt::Display for ObservationSizeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::BudgetExceeded => "observation budget exceeded",
+            Self::SerializationFailed => "observation serialization failed",
+        })
+    }
+}
+
+impl std::error::Error for ObservationSizeError {}
 
 /// Count JSON bytes without allocating a serialized copy, stopping at the cap.
 pub fn bounded_json_size(
@@ -780,6 +792,25 @@ fn validate_portable_values(value: &serde_json::Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_size_errors_preserve_their_standard_error_kind() {
+        for (kind, message) in [
+            (
+                ObservationSizeError::BudgetExceeded,
+                "observation budget exceeded",
+            ),
+            (
+                ObservationSizeError::SerializationFailed,
+                "observation serialization failed",
+            ),
+        ] {
+            let error = anyhow::Error::from(kind);
+            assert_eq!(error.to_string(), message);
+            assert_eq!(error.downcast_ref::<ObservationSizeError>(), Some(&kind));
+            assert!(error.source().is_none());
+        }
+    }
 
     #[test]
     fn serialized_size_counts_exact_bytes_without_retaining_overflow() {
