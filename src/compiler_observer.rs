@@ -2994,6 +2994,47 @@ mod tests {
         }
     }
 
+    // Binary tests link the ordinary library without its cfg(test) fixtures.
+    fn occurrence_fixture() -> CompilerOccurrencesV1 {
+        let d = compiler_occurrence::DefinitionOccurrence {
+            package: "demo".into(),
+            def_path: "source".into(),
+            kind: "function".into(),
+            definition_key: compiler_occurrence::definition_key(
+                "demo", "source", "function",
+            ),
+            legacy_id: compiler_occurrence::legacy_id(
+                "demo", "source", "function",
+            ),
+            range: compiler_occurrence::OccurrenceRange {
+                begin_line: 1,
+                begin_column: 0,
+                end_line: 1,
+                end_column: 18,
+            },
+            input: compiler_occurrence::OccurrenceInput {
+                root: OccurrenceRoot::Source,
+                relative: "src/lib.rs".into(),
+                bytes: 18,
+                content_fingerprint: compiler_occurrence::fingerprint(
+                    b"pub fn source() {}",
+                ),
+            },
+        };
+        CompilerOccurrencesV1 {
+            schema_version: 1,
+            nonce: "fresh-1".into(),
+            command_fingerprint: compiler_occurrence::fingerprint(b"command"),
+            crate_name: "demo".into(),
+            metadata: Some("abc".into()),
+            definitions: vec![d],
+            references: Vec::new(),
+            gaps: vec![
+                compiler_occurrence::OccurrenceGap::AnalysisCoveragePartial,
+            ],
+        }
+    }
+
     fn callback_fixture() -> (
         Workspace,
         Session,
@@ -3024,7 +3065,7 @@ mod tests {
             0,
         )
         .expect("fresh callback request");
-        let mut value = compiler_occurrence::tests::fixture();
+        let mut value = occurrence_fixture();
         value.nonce = request.nonce.clone();
         value.command_fingerprint = request.command_fingerprint.clone();
         value.crate_name = request.crate_name.clone();
