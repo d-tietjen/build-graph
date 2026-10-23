@@ -127,6 +127,15 @@ Each build has a new private run directory; cached artifacts never acquire old
 invocations, and the directory is removed after collection. A subsequent build
 without the flag removes the attachment.
 
+Cargo's stdin `___` target-information probe is delegated unchanged but does
+not allocate a compilation-unit slot. Recognition consumes the known probe's
+options and their values: its five supported information print requests
+(including `file-names`), crate types, optional target and `-Wwarnings`.
+A print-looking value of another option is never a print request. Source,
+response-file, emission/output, unfamiliar options and late print forms retain
+the ordinary observation path. Fresh private wrapper routes and actual feature
+invalidation remain unchanged.
+
 The attachment also records actual normalized Cargo argv/cwd, allowlisted Cargo
 environment and wrapper launch-executable observation. Each invocation records
 ordered allowlisted arguments, cwd, source/unit and

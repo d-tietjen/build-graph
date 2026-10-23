@@ -39,9 +39,11 @@ impl signatures, a foreign declaration, nested bodies and a closure before
 continued outer-body calls. The callback cases coherently rewrite every semantic
 nonce and page fingerprint while retaining the original callback, cover actual
 legacy size-cap omission, and use the genuine assembly/export readers and
-writers. Both control reads share the existing cap; no optional stream adds an
-aggregate or source-work allowance. All prior selectors and bodies remain
-required and unchanged.
+writers. The size-padding fixture uses allowlisted feature observations with
+value `1`, grows only their names within the existing text limit, and validates
+the invocation before adding the oversized legacy record. Both control reads
+share the existing cap; no optional stream adds an aggregate or source-work
+allowance. All prior selectors and assertions remain required.
 
 ## Actual driver occurrences
 
@@ -187,6 +189,8 @@ inherited_observer_environment_preserves_direct_and_cargo_cli_dispatch
 watch_no_build_observation_conflict_rejects_before_metadata_or_watch
 real_and_nested_wrapper_dispatch_preserves_original_os_arguments
 compiler_observer::tests::private_wrapper_entry_is_not_an_observed_root_grant_and_cleanup_unlinks_it
+compiler_observer::tests::cargo_information_probes_do_not_allocate_compilation_slots
+compiler_observer::tests::compilation_and_ambiguous_print_commands_are_not_information_probes
 inherited_observer_configuration_does_not_execute_non_utf8_cli_arguments
 actual_cargo_direct_custom_rustc_keeps_queries_build_and_inherited_cli
 actual_cargo_nested_custom_rustc_keeps_queries_build_and_inherited_cli

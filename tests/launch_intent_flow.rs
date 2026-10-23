@@ -2,6 +2,7 @@
 //! Fixtures test observations and failure ordering, never original-owner authority.
 #![cfg(target_os = "linux")]
 
+use build_graph::compiler_invocation::ObservationSizeError;
 use build_graph::launch_intent::*;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -352,7 +353,11 @@ fn stream_split_and_coalesced_frames_keep_the_fixed_ancillary_boundary() {
 
 #[test]
 fn event_environment_overlay_and_aggregate_caps_are_independent() {
-    assert!(encoded(&vec![b'x'; MAX_EVENT_BYTES]).is_err());
+    let error = encoded(&vec![b'x'; MAX_EVENT_BYTES]).expect_err("event byte cap");
+    assert_eq!(
+        error.downcast_ref::<ObservationSizeError>(),
+        Some(&ObservationSizeError::BudgetExceeded)
+    );
     assert!(
         digest_environment(&BTreeMap::from([(
             b"K".to_vec(),
@@ -376,6 +381,28 @@ fn event_environment_overlay_and_aggregate_caps_are_independent() {
     }
     assert!(channel.send(&vec![b'x'; MAX_EVENT_BYTES], None).is_err());
     server.join().expect("reader");
+}
+
+#[test]
+fn event_encoding_preserves_serialization_error_without_payload_details() {
+    struct Unserializable;
+
+    impl serde::Serialize for Unserializable {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("private observation payload"))
+        }
+    }
+
+    let error = encoded(&Unserializable).expect_err("serialization failure");
+    assert_eq!(
+        error.downcast_ref::<ObservationSizeError>(),
+        Some(&ObservationSizeError::SerializationFailed)
+    );
+    assert_eq!(error.to_string(), "observation serialization failed");
+    assert!(!format!("{error:#}").contains("private observation payload"));
 }
 
 #[test]
