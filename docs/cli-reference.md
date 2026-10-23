@@ -88,9 +88,12 @@ time and cargo caches it after that. Pass `--driver-bin <path>` or set
 
 The driver replaces the SCIP pass: it runs `cargo check --all-targets` with the
 driver as `RUSTC_WORKSPACE_WRAPPER`, persists per-crate edge files under
-`<out>/driver-refs`, and maps them onto Layer 2 nodes. It indexes the semantic
-def-reference graph, not rust-analyzer's syntactic occurrence graph, so treat it
-as a faster compiler-grounded reference source rather than a byte-identical
+`<out>/driver-refs-v2`, and maps them onto Layer 2 nodes. It indexes the
+semantic def-reference graph, including macro-expanded HIR, not
+rust-analyzer's syntactic occurrence graph. Edge files include both source
+coordinates and resolved def paths, so macro-generated items can still map when
+their spans point at a macro definition or share an invocation line. Treat it as
+a faster compiler-grounded reference source rather than a byte-identical
 rust-analyzer clone.
 
 ## Nightly + rustdoc-types Pin
@@ -169,10 +172,13 @@ edges into a re-extracted crate survive because IDs are deterministic.
 
 `cargo build-graph watch` does one refresh up front, then watches workspace
 `.rs` and `Cargo.toml` files while skipping `target/`, the output dir, and
-`.git`. A burst of saves coalesces into one rebuild. Pass `--no-build` to
-re-extract from the current `target/`, `--debounce <ms>` to tune the settle
-window, and normal build flags such as `--rich`, `-p`, and `--release` to control
-each cycle.
+`.git`. A burst of saves coalesces into one rebuild. On save, watch runs one
+flattened extraction pass across every enabled graph layer, so Layer 1/2/3 stay
+in lockstep even though they remain separate concepts in the output graph.
+Cargo, rustdoc, and the rustc-driver backend still reuse their own caches under
+that pass. Pass `--no-build` to re-extract from the current `target/`,
+`--debounce <ms>` to tune the settle window, and normal build flags such as
+`--rich`, `-p`, and `--release` to control each cycle.
 
 Under `watch`, `--rich --references` still uses rust-analyzer's cold
 whole-workspace SCIP index. For incremental Layer 3 refreshes, use

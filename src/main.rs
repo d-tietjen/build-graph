@@ -381,9 +381,14 @@ fn run_build(a: BuildArgs) -> Result<()> {
     build_and_extract(&a.common, &a.cargo_args, true)
 }
 
-/// One refresh pass: optionally run `cargo build`, then (re)extract the graph
-/// from target/. Shared by `build` and the `watch` loop. Both the build and the
-/// extract are already incremental — only changed crates recompile/re-document.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExtractScope {
+    Incremental,
+    AllCrates,
+}
+
+/// One refresh pass: optionally build, then extract the enabled graph layers.
+/// Normal commands reuse graph caches; watched saves refresh all crates.
 fn build_and_extract(common: &CommonArgs, cargo_args: &[String], do_build: bool) -> Result<()> {
     build_and_extract_with_launch(common, cargo_args, do_build, None)
 }
@@ -393,6 +398,22 @@ fn build_and_extract_with_launch(
     cargo_args: &[String],
     do_build: bool,
     launch: Option<(i32, String)>,
+) -> Result<()> {
+    build_and_extract_scoped(
+        common,
+        cargo_args,
+        do_build,
+        launch,
+        ExtractScope::Incremental,
+    )
+}
+
+fn build_and_extract_scoped(
+    common: &CommonArgs,
+    cargo_args: &[String],
+    do_build: bool,
+    launch: Option<(i32, String)>,
+    scope: ExtractScope,
 ) -> Result<()> {
     #[cfg(feature = "rustc-driver")]
     let occurrence_common = (common.observe_definition_occurrences && common.nightly.is_none())
@@ -523,7 +544,7 @@ fn build_and_extract_with_launch(
     };
     let manifest = common.manifest_path.as_ref().map(Utf8PathBuf::from);
     let meta = metadata::load_routed(manifest.as_deref(), selected_cargo.as_mut())?;
-    run_extract_observed(
+    run_extract_observed_with_scope(
         common,
         compiled.as_deref(),
         meta,
@@ -531,6 +552,7 @@ fn build_and_extract_with_launch(
         observations,
         selected_observation,
         selected_cargo,
+        scope,
     )
 }
 
@@ -571,9 +593,8 @@ fn selected_occurrence_cargo(
 }
 
 /// Watch the workspace and re-run the incremental refresh whenever a `.rs` or
-/// `Cargo.toml` file changes. Layers 1–2 already reuse the prior graph for
-/// unchanged crates, so a save only re-does the crate(s) you touched. The graph
-/// (and anything serving it) updates in place.
+/// `Cargo.toml` file changes. Each save refreshes every enabled graph layer;
+/// the compiler backends retain their own caches. The graph updates in place.
 fn run_watch(a: WatchArgs) -> Result<()> {
     if a.no_build && a.common.observe_compiler_inputs {
         bail!("compiler observation requires an actual build");
@@ -626,7 +647,13 @@ fn run_watch(a: WatchArgs) -> Result<()> {
             fp = next;
         }
         eprintln!("[build-graph] watch: change detected — refreshing…");
-        if let Err(e) = build_and_extract(&a.common, &a.cargo_args, do_build) {
+        if let Err(e) = build_and_extract_scoped(
+            &a.common,
+            &a.cargo_args,
+            do_build,
+            None,
+            ExtractScope::AllCrates,
+        ) {
             eprintln!("[build-graph] watch: refresh failed — {e:#}");
         }
         // Rescan after the refresh so sources the build itself touched (e.g.
@@ -678,6 +705,17 @@ fn workspace_fingerprint(root: &Utf8Path, excludes: &[std::path::PathBuf]) -> u6
     hasher.finish()
 }
 
+fn should_extract_crate(
+    scope: ExtractScope,
+    compatible_cache: bool,
+    prior_fingerprint: Option<&str>,
+    current_fingerprint: &str,
+) -> bool {
+    scope == ExtractScope::AllCrates
+        || !compatible_cache
+        || prior_fingerprint != Some(current_fingerprint)
+}
+
 fn run_extract(c: &CommonArgs, compiled: Option<&[cargo_build::CompiledTarget]>) -> Result<()> {
     let manifest = c.manifest_path.as_ref().map(Utf8PathBuf::from);
     let meta = metadata::load(manifest.as_deref())?;
@@ -710,7 +748,29 @@ fn run_extract_observed(
     extract_items: ItemLayerExtractor,
     compiler_invocations: Option<build_graph::compiler_invocation::CompilerInvocationsV1>,
     compiler_observation: Option<compiler_observer::Session>,
+    selected_cargo: Option<cargo_launch::CargoLaunchSession>,
+) -> Result<()> {
+    run_extract_observed_with_scope(
+        c,
+        compiled,
+        meta,
+        extract_items,
+        compiler_invocations,
+        compiler_observation,
+        selected_cargo,
+        ExtractScope::Incremental,
+    )
+}
+
+fn run_extract_observed_with_scope(
+    c: &CommonArgs,
+    compiled: Option<&[cargo_build::CompiledTarget]>,
+    meta: cargo_metadata::Metadata,
+    extract_items: ItemLayerExtractor,
+    compiler_invocations: Option<build_graph::compiler_invocation::CompilerInvocationsV1>,
+    compiler_observation: Option<compiler_observer::Session>,
     mut selected_cargo: Option<cargo_launch::CargoLaunchSession>,
+    scope: ExtractScope,
 ) -> Result<()> {
     let target_dir = c
         .target_dir
@@ -736,10 +796,11 @@ fn run_extract_observed(
     let cache_path = out.join(cache::CACHE_FILE);
     let existing = build_graph::output::find_graph(out.as_std_path());
     let prior = cache::Cache::load(cache_path.as_std_path());
-    let compatible = prior
-        .as_ref()
-        .map(|p| p.rich == rich && p.no_derives == c.no_derives && p.references == references)
-        .unwrap_or(false)
+    let compatible = scope == ExtractScope::Incremental
+        && prior
+            .as_ref()
+            .map(|p| p.rich == rich && p.no_derives == c.no_derives && p.references == references)
+            .unwrap_or(false)
         && existing.is_some();
     let mut prior_export = None;
     let mut graph = match (compatible, &existing) {
@@ -809,9 +870,12 @@ fn run_extract_observed(
                     })
                     .is_some_and(|report| report.status == ExtractionStatus::Complete)
             });
-        if !compatible
-            || prior_crates.get(&pkg.name) != Some(&fp)
-            || !export_reusable
+        if should_extract_crate(
+            scope,
+            compatible,
+            prior_crates.get(&pkg.name).map(String::as_str),
+            &fp,
+        ) || !export_reusable
             || !items_reusable
         {
             dirty.insert(pkg.name.clone());
@@ -1651,5 +1715,79 @@ mod tests {
             &PathBuf::from("/ws/.git/index.lock"),
             &excludes
         ));
+    }
+
+    #[test]
+    fn watch_save_scope_forces_every_crate_through_extraction() {
+        assert!(!should_extract_crate(
+            ExtractScope::Incremental,
+            true,
+            Some("same"),
+            "same"
+        ));
+        assert!(should_extract_crate(
+            ExtractScope::Incremental,
+            true,
+            Some("old"),
+            "new"
+        ));
+        assert!(should_extract_crate(
+            ExtractScope::AllCrates,
+            true,
+            Some("same"),
+            "same"
+        ));
+    }
+
+    fn detect_forced_item_refresh(
+        _graph: &mut Graph,
+        _meta: &cargo_metadata::Metadata,
+        _target_dir: &Utf8Path,
+        _nightly: Option<&str>,
+        packages: &[String],
+        _release: bool,
+        _no_derives: bool,
+    ) -> Result<rustdoc::ItemLayerResult> {
+        assert_eq!(packages, &["pkg-a", "pkg_a"]);
+        bail!("forced item refresh reached both unchanged packages")
+    }
+
+    #[test]
+    fn watched_save_refreshes_unchanged_cached_items_without_losing_provenance() {
+        let workspace = collision_workspace();
+        let args = fixture_args(&workspace);
+        refresh_fixture(&workspace, &args);
+
+        // The completed cached item reports allow a normal refresh to reuse
+        // both packages without invoking the replacement item extractor.
+        run_extract_observed_with_scope(
+            &args,
+            Some(&[]),
+            workspace.meta.clone(),
+            detect_forced_item_refresh,
+            None,
+            None,
+            None,
+            ExtractScope::Incremental,
+        )
+        .expect("ordinary refresh reuses both complete cached packages");
+
+        // The watch scope must reach the real item-layer dispatch even when
+        // fingerprints and supported provenance remain unchanged.
+        let error = run_extract_observed_with_scope(
+            &args,
+            Some(&[]),
+            workspace.meta.clone(),
+            detect_forced_item_refresh,
+            None,
+            None,
+            None,
+            ExtractScope::AllCrates,
+        )
+        .expect_err("watched save invokes the item extractor");
+        assert_eq!(
+            error.to_string(),
+            "forced item refresh reached both unchanged packages"
+        );
     }
 }
