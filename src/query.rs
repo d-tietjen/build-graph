@@ -487,23 +487,23 @@ fn gather<'a>(
         .map(|e| ("outgoing", *e, e.target.as_str()))
         .chain(ins.iter().map(|e| ("incoming", *e, e.source.as_str())))
     {
-        if let Some(rel) = &opts.relation
-            && e.relation != *rel
-        {
-            continue;
+        if let Some(rel) = &opts.relation {
+            if e.relation != *rel {
+                continue;
+            }
         }
         let Some(other) = by_id.get(other_id) else {
             continue;
         };
-        if let Some(k) = want_kind
-            && node_kind(other) != k
-        {
-            continue;
+        if let Some(k) = want_kind {
+            if node_kind(other) != k {
+                continue;
+            }
         }
-        if let Some(c) = &opts.krate
-            && node_crate(other) != c.as_str()
-        {
-            continue;
+        if let Some(c) = &opts.krate {
+            if node_crate(other) != c.as_str() {
+                continue;
+            }
         }
         if let Some(m) = &name_match {
             let hit = other.label.to_lowercase().contains(m)
