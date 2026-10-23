@@ -2358,6 +2358,64 @@ fn read_callback(
     Ok(value)
 }
 
+fn is_cargo_information_query(args: &[Option<&str>]) -> bool {
+    let Some(text) = args.iter().copied().collect::<Option<Vec<_>>>() else {
+        return false;
+    };
+    // Recognize only Cargo's known stdin/___ information probe. Consume each
+    // option's value: a print-looking value of another option is not a print
+    // request. Unknown rustflags and compilation forms retain normal capture.
+    if !text.starts_with(&["-", "--crate-name", "___"]) {
+        return false;
+    }
+    let mut index = 3;
+    let mut file_names = false;
+    while let Some(arg) = text.get(index).copied() {
+        index += 1;
+        let (kind, value) = match arg {
+            "--print" | "--crate-type" | "--target" => {
+                let Some(value) = text.get(index).copied() else {
+                    return false;
+                };
+                index += 1;
+                (arg, value)
+            }
+            "-Wwarnings" => continue,
+            _ => {
+                if let Some(value) = arg.strip_prefix("--print=") {
+                    ("--print", value)
+                } else if let Some(value) = arg.strip_prefix("--crate-type=") {
+                    ("--crate-type", value)
+                } else if let Some(value) = arg.strip_prefix("--target=") {
+                    ("--target", value)
+                } else {
+                    return false;
+                }
+            }
+        };
+        match kind {
+            "--print" => {
+                if !matches!(value, "file-names" | "sysroot" | "split-debuginfo" | "crate-name" | "cfg") {
+                    return false;
+                }
+                file_names |= value == "file-names";
+            }
+            "--crate-type" => {
+                if !matches!(value, "bin" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro") {
+                    return false;
+                }
+            }
+            "--target" => {
+                if value.is_empty() || value.starts_with('-') || value.starts_with('@') {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    file_names
+}
+
 fn prepare(
     config: &Config,
     command: &[OsString],
@@ -2377,6 +2435,9 @@ fn prepare(
         return None;
     }
     let text: Vec<_> = args.iter().map(|arg| arg.to_str()).collect();
+    if is_cargo_information_query(&text) {
+        return None;
+    }
     let Some(crate_name) = option(&text, "--crate-name") else {
         if text.iter().flatten().any(|arg| arg.starts_with('@')) {
             let _ = exclusive_write(
@@ -2994,6 +3055,149 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cargo_information_probes_do_not_allocate_compilation_slots() {
+        let workspace = Workspace::new(&[("demo", "demo_lib")]);
+        let session = session(&workspace);
+        let command: Vec<OsString> = [
+            "/unexecuted/rustc",
+            "-",
+            "--crate-name",
+            "___",
+            "--print=file-names",
+            "--crate-type",
+            "bin",
+            "--crate-type",
+            "rlib",
+            "--crate-type",
+            "dylib",
+            "--crate-type",
+            "cdylib",
+            "--crate-type",
+            "staticlib",
+            "--crate-type",
+            "proc-macro",
+            "--print=sysroot",
+            "--print=split-debuginfo",
+            "--print=crate-name",
+            "--print=cfg",
+            "-Wwarnings",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        for _ in 0..=MAX_INVOCATIONS {
+            assert!(prepare(&session.config, &command, 0, &command[1..]).is_none());
+        }
+        assert_eq!(
+            fs::read_dir(&session.config.directory).expect("unchanged observation directory").count(),
+            0,
+            "queries cannot allocate slots, unit files or budget witnesses"
+        );
+    }
+
+    #[test]
+    fn compilation_and_ambiguous_print_commands_are_not_information_probes() {
+        let probe = [Some("-"), Some("--crate-name"), Some("___"), Some("--print=file-names")];
+        assert!(is_cargo_information_query(&probe));
+        let split = [Some("-"), Some("--crate-name"), Some("___"), Some("--print"), Some("file-names")];
+        assert!(is_cargo_information_query(&split));
+        for target in [
+            vec![Some("--target"), Some("aarch64-unknown-linux-gnu")],
+            vec![Some("--target=x86_64-unknown-linux-gnu")],
+            vec![Some("--crate-type=rlib")],
+        ] {
+            let mut command = probe.to_vec();
+            command.extend(target);
+            assert!(is_cargo_information_query(&command));
+        }
+        // These full commands have no actual print request. In particular,
+        // rustc consumes the print-looking token as the required remap value.
+        for tail in [
+            vec![Some("--remap-path-prefix"), Some("--print=file-names")],
+            vec![Some("--target"), Some("--print=file-names")],
+            vec![Some("--crate-type"), Some("--print=file-names")],
+            vec![Some("--print"), Some("--print=file-names")],
+            vec![Some("-W"), Some("--print=file-names")],
+        ] {
+            let mut command = vec![Some("-"), Some("--crate-name"), Some("___")];
+            command.extend(tail);
+            assert!(!is_cargo_information_query(&command), "{command:?}");
+        }
+        for tail in [
+            vec![Some("src/lib.rs")],
+            vec![Some("@compiler.rsp")],
+            vec![Some("--emit=metadata")],
+            vec![Some("--emit"), Some("metadata")],
+            vec![Some("--out-dir"), Some("out")],
+            vec![Some("-ooutput")],
+            vec![Some("--test")],
+            vec![Some("--print=native-static-libs")],
+            vec![Some("--print=link-args")],
+            vec![Some("--print=unknown")],
+            vec![Some("--print")],
+            vec![Some("--crate-type")],
+            vec![Some("--target")],
+            vec![Some("--target=")],
+            vec![Some("--target"), Some("--print=cfg")],
+            vec![Some("--crate-type"), Some("--print=cfg")],
+            vec![Some("trailing-positional")],
+            vec![Some("--cfg"), Some("feature=selected")],
+            vec![None],
+        ] {
+            let mut command = probe.to_vec();
+            command.extend(tail);
+            assert!(!is_cargo_information_query(&command), "{command:?}");
+        }
+        assert!(!is_cargo_information_query(&[
+            Some("src/lib.rs"),
+            Some("--crate-name"),
+            Some("demo"),
+            Some("--emit=metadata")
+        ]));
+    }
+
+    // Binary tests link the ordinary library without its cfg(test) fixtures.
+    fn occurrence_fixture() -> CompilerOccurrencesV1 {
+        let d = compiler_occurrence::DefinitionOccurrence {
+            package: "demo".into(),
+            def_path: "source".into(),
+            kind: "function".into(),
+            definition_key: compiler_occurrence::definition_key(
+                "demo", "source", "function",
+            ),
+            legacy_id: compiler_occurrence::legacy_id(
+                "demo", "source", "function",
+            ),
+            range: compiler_occurrence::OccurrenceRange {
+                begin_line: 1,
+                begin_column: 0,
+                end_line: 1,
+                end_column: 18,
+            },
+            input: compiler_occurrence::OccurrenceInput {
+                root: OccurrenceRoot::Source,
+                relative: "src/lib.rs".into(),
+                bytes: 18,
+                content_fingerprint: compiler_occurrence::fingerprint(
+                    b"pub fn source() {}",
+                ),
+            },
+        };
+        CompilerOccurrencesV1 {
+            schema_version: 1,
+            nonce: "fresh-1".into(),
+            command_fingerprint: compiler_occurrence::fingerprint(b"command"),
+            crate_name: "demo".into(),
+            metadata: Some("abc".into()),
+            definitions: vec![d],
+            references: Vec::new(),
+            gaps: vec![
+                compiler_occurrence::OccurrenceGap::AnalysisCoveragePartial,
+            ],
+        }
+    }
+
     fn callback_fixture() -> (
         Workspace,
         Session,
@@ -3024,7 +3228,7 @@ mod tests {
             0,
         )
         .expect("fresh callback request");
-        let mut value = compiler_occurrence::tests::fixture();
+        let mut value = occurrence_fixture();
         value.nonce = request.nonce.clone();
         value.command_fingerprint = request.command_fingerprint.clone();
         value.crate_name = request.crate_name.clone();
@@ -4165,22 +4369,26 @@ mod tests {
         let legacy = read_callback(&callback, &invocation, &session.config.roots).unwrap();
         invocation.environment = (0..8)
             .map(|index| EnvironmentObservation {
-                name: format!("SEMANTIC_PADDING_{index}"),
+                name: format!("CARGO_FEATURE_SEMANTIC_PADDING_{index}"),
                 present: true,
-                value: Some(String::new()),
-                content_fingerprint: None,
+                value: Some("1".into()),
+                content_fingerprint: Some(content_fingerprint(b"1")),
                 path: None,
                 gap: None,
             })
             .collect();
         let base = bounded_json_size(&invocation, MAX_INVOCATION_BYTES).unwrap();
         let mut padding = MAX_INVOCATION_BYTES - 128 - base;
+        // Keep producer-valid feature values; only bounded names spend the padding.
         for value in &mut invocation.environment {
-            let bytes = padding.min(MAX_TEXT_BYTES);
-            value.value = Some("x".repeat(bytes));
+            let bytes = padding.min(MAX_TEXT_BYTES - value.name.len());
+            value.name.push_str(&"X".repeat(bytes));
             padding -= bytes;
+            assert!(env_allowed(&value.name));
+            assert!(safe_env_value(&value.name, value.value.as_deref().unwrap()));
         }
         assert_eq!(padding, 0);
+        invocation.validate().expect("valid padded original record before legacy overflow");
         invocation.occurrences = Some(legacy);
         assert_eq!(
             bounded_json_size(&invocation, MAX_INVOCATION_BYTES),
