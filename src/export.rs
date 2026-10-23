@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::compiler_invocation::{CompilerInvocation, CompilerInvocationsV1};
+
 /// Version of the `graph-export.json` schema.
 pub const EXPORT_SCHEMA_VERSION: u32 = 1;
 /// Uncompressed JSON sidecar written by the CLI, next to its graph.
@@ -201,6 +203,9 @@ pub struct ExportManifest {
     pub layers: Vec<LayerReport>,
     /// Ordered independently of legacy graph nodes; collisions are retained.
     pub definitions: Vec<DefinitionRecord>,
+    /// Optional actual compiler observations. Absence preserves legacy JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiler_invocations: Option<CompilerInvocationsV1>,
 }
 
 impl ExportManifest {
@@ -313,6 +318,7 @@ mod tests {
                 status: CompilerStatus::Unknown,
                 artifacts: Vec::new(),
             },
+            compiler_invocations: None,
             sources: BTreeMap::new(),
             layers: Vec::new(),
             definitions: ["Foo", "foo"]
@@ -328,6 +334,19 @@ mod tests {
                 })
                 .collect(),
         };
+        let raw = serde_json::to_vec(&manifest).expect("legacy sidecar JSON");
+        assert!(!String::from_utf8_lossy(&raw).contains("compiler_invocations"));
+        let mut legacy = serde_json::to_value(&manifest).expect("legacy value");
+        legacy
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("compiler_invocations");
+        let decoded: ExportManifest =
+            serde_json::from_value(legacy).expect("old schema remains readable");
+        assert_eq!(
+            raw,
+            serde_json::to_vec(&decoded).expect("legacy bytes unchanged")
+        );
         let roundtrip: ExportManifest =
             serde_json::from_slice(&serde_json::to_vec(&manifest).expect("sidecar JSON"))
                 .expect("sidecar roundtrip");

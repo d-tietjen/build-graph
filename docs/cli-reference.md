@@ -187,3 +187,34 @@ whole-workspace SCIP index. For incremental Layer 3 refreshes, use
   methods from the rich layer.
 - Without `--references` or `--driver`, body-level references (`calls`, `uses`,
   `member_calls`, `member_uses`) are not produced.
+
+## Observing compiler inputs
+
+With the `rustc-driver` feature, `--observe-definition-occurrences` additionally
+captures actual analysis-callback definitions/references in that original build.
+It requires `--observe-compiler-inputs`, matching nightly Cargo/rustc-dev and a
+matching `bg-driver`. `--occurrence-cargo PATH` can select the actual matching
+Cargo producer for actual metadata, build and rich docs launches. Matching rustc
+and rustdoc are delivered explicitly. Optional bounded `cargo_operations` records
+the actual per-pass launch requests and outcomes; paths/requests are observational
+and cannot authenticate nested process lineage. See
+[the occurrence contract](compiler-occurrences.md).
+
+`--observe-semantic-stream` additionally traverses the whole local HIR domain
+into bounded pages and an observational terminal. It requires both observation
+options above. Legacy occurrence records remain partial, and all optional streams
+share the original attachment allowance. See the
+[semantic stream contract](compiler-semantic-stream.md).
+
+```bash
+cargo build-graph build --observe-compiler-inputs
+cargo build-graph build --observe-compiler-inputs \
+  --compiler-input-root dependencies=/approved/dependencies -- --features selected
+```
+
+This stable opt-in observes the actual build's compiler invocations and attaches
+portable, bounded facts to `graph-export.json`. It does not need `rustc-driver`.
+Existing `RUSTC_WRAPPER` configurations must be removed or left unobserved;
+the CLI refuses to replace them. `update` and `watch --no-build` reject this flag.
+See [the observation contract](export.md#optional-compiler-observations) for root
+names, redaction, explicit gaps, budgets and compatibility.

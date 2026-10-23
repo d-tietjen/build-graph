@@ -128,12 +128,18 @@ pub fn read_export(out_dir: &Path) -> io::Result<ExportManifest> {
             "unsupported build-graph export schema version",
         ));
     }
+    if let Some(observation) = &manifest.compiler_invocations {
+        observation.validate().map_err(io::Error::other)?;
+    }
     Ok(manifest)
 }
 
 /// Atomically replace the export sidecar. The graph is a separate atomic
 /// write; consumers should call [`ExportManifest::matches_graph`] before reuse.
 pub fn write_export(out_dir: &Path, manifest: &ExportManifest) -> io::Result<()> {
+    if let Some(observation) = &manifest.compiler_invocations {
+        observation.validate().map_err(io::Error::other)?;
+    }
     let bytes = serde_json::to_vec(manifest).map_err(io::Error::other)?;
     write_atomic(&out_dir.join(EXPORT_FILE), &bytes)
 }

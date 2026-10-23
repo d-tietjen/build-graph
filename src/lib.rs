@@ -38,9 +38,17 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub mod compiler_context;
+pub mod compiler_invocation;
+pub mod compiler_occurrence;
+pub mod compiler_semantic;
+pub mod compiler_test_harness;
 pub mod export;
 pub mod fragment;
 pub mod graph;
+#[cfg(target_os = "linux")]
+pub mod held_callback_control;
+pub mod launch_intent;
 pub mod merge;
 pub mod output;
 pub mod report;
@@ -268,3 +276,6 @@ fn read_fragments(frag_dir: &Path) -> Vec<Fragment> {
     }
     out
 }
+
+#[cfg(test)]
+mod compiler_observation_tests;

@@ -32,3 +32,7 @@ camino = "1"
 scip = "0.6.1"
 protobuf = "3.7.2"
 flate2 = "1"
+sha2 = "=0.10.9"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "=0.2.186"
