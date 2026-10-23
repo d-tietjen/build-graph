@@ -1137,14 +1137,15 @@ fn run_extract_observed_with_scope(
             ),
         });
         if !stable {
-            if let Some(report) = item_reports.get_mut(&pkg.name)
-                && report.status != ExtractionStatus::Skipped
-            {
-                report.status = ExtractionStatus::Partial;
-                report.freshness = freshness;
-                report.reason = Some(
-                    "source set changed or could not be fully observed during extraction".into(),
-                );
+            if let Some(report) = item_reports.get_mut(&pkg.name) {
+                if report.status != ExtractionStatus::Skipped {
+                    report.status = ExtractionStatus::Partial;
+                    report.freshness = freshness;
+                    report.reason = Some(
+                        "source set changed or could not be fully observed during extraction"
+                            .into(),
+                    );
+                }
             }
             if references {
                 reference_report.status = ExtractionStatus::Partial;

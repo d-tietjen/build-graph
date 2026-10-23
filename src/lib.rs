@@ -177,11 +177,12 @@ fn find_workspace_root(manifest_dir: &Path) -> Option<PathBuf> {
     let mut found = None;
     for anc in manifest_dir.ancestors() {
         let manifest = anc.join("Cargo.toml");
-        if manifest.is_file()
-            && let Ok(text) = fs::read_to_string(&manifest)
-            && text.contains("[workspace]")
-        {
-            found = Some(anc.to_path_buf());
+        if manifest.is_file() {
+            if let Ok(text) = fs::read_to_string(&manifest) {
+                if text.contains("[workspace]") {
+                    found = Some(anc.to_path_buf());
+                }
+            }
         }
     }
     found
@@ -267,10 +268,10 @@ fn read_fragments(frag_dir: &Path) -> Vec<Fragment> {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            if let Ok(text) = fs::read_to_string(&path)
-                && let Ok(fragment) = serde_json::from_str::<Fragment>(&text)
-            {
-                out.push(fragment);
+            if let Ok(text) = fs::read_to_string(&path) {
+                if let Ok(fragment) = serde_json::from_str::<Fragment>(&text) {
+                    out.push(fragment);
+                }
             }
         }
     }

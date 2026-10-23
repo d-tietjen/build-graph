@@ -53,10 +53,10 @@ pub fn render(doc: &GraphJson) -> String {
     // Crates by source-file count.
     let mut files_per_crate: BTreeMap<&str, usize> = BTreeMap::new();
     for n in &doc.nodes {
-        if n.attributes.get("kind").map(String::as_str) == Some("file")
-            && let Some(krate) = n.attributes.get("crate")
-        {
-            *files_per_crate.entry(krate.as_str()).or_default() += 1;
+        if n.attributes.get("kind").map(String::as_str) == Some("file") {
+            if let Some(krate) = n.attributes.get("crate") {
+                *files_per_crate.entry(krate.as_str()).or_default() += 1;
+            }
         }
     }
     if !files_per_crate.is_empty() {

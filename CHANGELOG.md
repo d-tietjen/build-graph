@@ -26,6 +26,8 @@ semantic versioning.
 
 ### Fixed
 
+- **Rust 1.85 compatibility** is restored by expressing conditional bindings
+  without let-chains, preserving existing filtering and error handling.
 - **Live viewer refreshes** now keep the page mounted and patch in fresh graph
   data from VS Code / JetBrains live views, preserving layout and avoiding a
   full GPU/WebGL rebuild when the topology did not change.
