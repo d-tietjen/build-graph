@@ -10,6 +10,7 @@
 
 #![feature(rustc_private)]
 
+extern crate rustc_ast;
 extern crate rustc_driver;
 extern crate rustc_hir;
 extern crate rustc_interface;
@@ -27,6 +28,23 @@ use rustc_hir::{
 use rustc_interface::interface::Compiler;
 use rustc_middle::ty::{self, TyCtxt, TypeckResults};
 use rustc_span::def_id::{DefId, LOCAL_CRATE};
+#[path = "../../../src/compiler_occurrence.rs"]
+mod compiler_occurrence;
+#[path = "../../../src/compiler_semantic.rs"]
+mod compiler_semantic;
+// The shared transport also contains its sender API, used by the CLI.
+#[path = "../../../src/compiler_context.rs"]
+mod compiler_context;
+#[path = "../../../src/compiler_test_harness.rs"]
+mod compiler_test_harness;
+#[cfg(target_os = "linux")]
+#[allow(dead_code)]
+#[path = "../../../src/held_callback_control.rs"]
+mod held_callback_control;
+mod observed_context;
+mod occurrences;
+mod semantic;
+mod test_harness;
 
 struct DriverEdge {
     kind: &'static str,
@@ -36,11 +54,18 @@ struct DriverEdge {
     callee_path: String,
 }
 
-struct BgCallbacks;
+struct BgCallbacks {
+    #[cfg(target_os = "linux")]
+    controls: held_callback_control::InheritedControls,
+}
 
 impl Callbacks for BgCallbacks {
     fn after_analysis<'tcx>(&mut self, _compiler: &Compiler, tcx: TyCtxt<'tcx>) -> Compilation {
-        extract(tcx);
+        extract(
+            tcx,
+            #[cfg(target_os = "linux")]
+            &self.controls,
+        );
         Compilation::Continue
     }
 }
@@ -74,7 +99,10 @@ fn loc_of(tcx: TyCtxt<'_>, def_id: rustc_span::def_id::DefId) -> Option<(String,
     Some((file, lo.line))
 }
 
-fn extract(tcx: TyCtxt<'_>) {
+fn extract(
+    tcx: TyCtxt<'_>,
+    #[cfg(target_os = "linux")] controls: &held_callback_control::InheritedControls,
+) {
     let krate = tcx.crate_name(LOCAL_CRATE);
     let mut calls: usize = 0;
     let mut method_calls: usize = 0;
@@ -85,12 +113,21 @@ fn extract(tcx: TyCtxt<'_>) {
     // (kind, caller "file:line", callee "file:line"). Only collected when requested.
     let want_edges = std::env::var_os("BG_DRIVER_EDGES").is_some();
     let mut edges: Vec<DriverEdge> = Vec::new();
+    #[cfg(target_os = "linux")]
+    let mut occurrences = occurrences::Collector::new_with_controls(tcx, controls);
+    #[cfg(not(target_os = "linux"))]
+    let mut occurrences = occurrences::Collector::new(tcx);
+    if let Some(collector) = occurrences.as_mut() {
+        for did in tcx.hir_crate_items(()).definitions() {
+            collector.definition(tcx, did.to_def_id());
+        }
+    }
 
-    // Item-like HIR covers non-body references: imports, struct/enum fields,
-    // trait method signatures, extern signatures, associated type defaults, etc.
-    // Function bodies are deliberately handled below with typeck results.
+    // Item-like references include signatures, fields, imports and associated
+    // items. Edge output is optional; summaries do not require retaining rows.
     let mut item_v = ItemRefVisitor {
         tcx,
+        want_edges,
         owner_loc: None,
         owner_path: None,
         uses_count: &mut uses_count,
@@ -120,6 +157,36 @@ fn extract(tcx: TyCtxt<'_>) {
             edges: &mut edges,
         };
         v.visit_expr(body.value);
+
+        // Keep the original bounded occurrence traversal separate from the
+        // broader Layer 3 reference walk. Macro-generated reference edges do
+        // not change the collector's source/span admission or partial gaps.
+        if let Some(collector) = occurrences.as_mut() {
+            let mut occurrence_v = OccurrenceVisitor {
+                tcx,
+                typeck,
+                owner_did: owner.to_def_id(),
+                collector,
+            };
+            occurrence_v.visit_expr(body.value);
+            let node = tcx.hir_node_by_def_id(owner);
+            if let Some(decl) = node.fn_decl() {
+                intravisit::walk_fn_decl(&mut occurrence_v, decl);
+            }
+            if let Some(generics) = node.generics() {
+                intravisit::walk_generics(&mut occurrence_v, generics);
+            }
+        }
+    }
+
+    if let Some(mut collector) = occurrences {
+        semantic::observe(
+            tcx,
+            &mut collector,
+            #[cfg(target_os = "linux")]
+            controls,
+        );
+        collector.publish();
     }
 
     // Optional def catalog: `file:line -> DefKind` for every local def, so a
@@ -230,6 +297,7 @@ fn use_def_from_res(res: Res) -> Option<DefId> {
 
 struct ItemRefVisitor<'a, 'tcx> {
     tcx: TyCtxt<'tcx>,
+    want_edges: bool,
     owner_loc: Option<String>,
     owner_path: Option<String>,
     uses_count: &'a mut usize,
@@ -240,11 +308,15 @@ impl<'a, 'tcx> ItemRefVisitor<'a, 'tcx> {
     fn with_owner(&mut self, def_id: DefId, visit: impl FnOnce(&mut Self)) {
         let prev_loc = std::mem::replace(
             &mut self.owner_loc,
-            loc_of(self.tcx, def_id).map(|(f, l)| format!("{f}:{l}")),
+            self.want_edges
+                .then(|| loc_of(self.tcx, def_id))
+                .flatten()
+                .map(|(f, l)| format!("{f}:{l}")),
         );
-        let prev_path = self
-            .owner_path
-            .replace(self.tcx.def_path_str(def_id));
+        let prev_path = std::mem::replace(
+            &mut self.owner_path,
+            self.want_edges.then(|| self.tcx.def_path_str(def_id)),
+        );
         visit(self);
         self.owner_loc = prev_loc;
         self.owner_path = prev_path;
@@ -252,8 +324,7 @@ impl<'a, 'tcx> ItemRefVisitor<'a, 'tcx> {
 
     fn use_def(&mut self, callee: DefId) {
         *self.uses_count += 1;
-        if let (Some(caller), Some(caller_path)) =
-            (self.owner_loc.clone(), self.owner_path.clone())
+        if let (Some(caller), Some(caller_path)) = (self.owner_loc.clone(), self.owner_path.clone())
         {
             if let Some((f, l)) = loc_of(self.tcx, callee) {
                 if !f.starts_with('/') {
@@ -455,6 +526,139 @@ impl<'a, 'tcx> Visitor<'tcx> for CallVisitor<'a, 'tcx> {
     }
 }
 
+/// Preserve the existing occurrence stream independently of descriptive
+/// reference coverage. This borrows the one original bounded collector.
+struct OccurrenceVisitor<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    typeck: &'tcx TypeckResults<'tcx>,
+    owner_did: DefId,
+    collector: &'a mut occurrences::Collector,
+}
+
+impl<'a, 'tcx> OccurrenceVisitor<'a, 'tcx> {
+    fn record(&mut self, kind: &'static str, callee: DefId, span: rustc_span::Span) {
+        self.collector
+            .reference(self.tcx, self.owner_did, callee, kind, span);
+    }
+
+    fn record_use(&mut self, callee: DefId, span: rustc_span::Span) {
+        self.record("use", callee, span);
+    }
+
+    /// For a method call, resolve to the *concrete impl* method when the receiver
+    /// is monomorphizable (matching rust-analyzer, which records the impl). For a
+    /// generic/dyn receiver this can't be done, so fall back to the trait method.
+    fn method_target(&self, trait_method: DefId, hir_id: HirId) -> DefId {
+        let args = self.typeck.node_args(hir_id);
+        let env = ty::TypingEnv::post_analysis(self.tcx, self.owner_did);
+        match ty::Instance::try_resolve(self.tcx, env, trait_method, args) {
+            Ok(Some(inst)) => inst.def_id(),
+            _ => trait_method,
+        }
+    }
+
+    /// A `uses` target from a path resolution: types, consts, statics, fields,
+    /// variants, etc. — but NOT fns/ctors (those are `calls`, handled separately,
+    /// and re-counting their path expr would double-count).
+    fn use_from_res(&mut self, res: Res, span: rustc_span::Span) {
+        if let Res::Def(kind, def_id) = res {
+            let is_use = matches!(
+                kind,
+                DefKind::Struct
+                    | DefKind::Enum
+                    | DefKind::Union
+                    | DefKind::Trait
+                    | DefKind::TyAlias
+                    | DefKind::AssocTy
+                    | DefKind::TraitAlias
+                    | DefKind::ForeignTy
+                    | DefKind::Const
+                    | DefKind::AssocConst
+                    | DefKind::Static { .. }
+                    | DefKind::Field
+                    | DefKind::Variant
+            );
+            if is_use {
+                self.record("use", def_id, span);
+            }
+        }
+    }
+}
+
+impl<'a, 'tcx> Visitor<'tcx> for OccurrenceVisitor<'a, 'tcx> {
+    fn visit_expr(&mut self, ex: &'tcx Expr<'tcx>) {
+        // Skip references in macro-expanded code: rust-analyzer's SCIP works on
+        // source tokens, so it doesn't emit occurrences for derive/`?`-desugar
+        // generated calls. User code spliced into a macro arg keeps its own span.
+        if !ex.span.from_expansion() {
+            match ex.kind {
+                ExprKind::Call(callee, _args) => {
+                    if let ExprKind::Path(ref qpath) = callee.kind {
+                        if let Res::Def(dk, def_id) = self.typeck.qpath_res(qpath, callee.hir_id) {
+                            // tuple-struct/variant construction: rustc says "call",
+                            // SCIP says "use" — match SCIP.
+                            if matches!(dk, DefKind::Ctor(..)) {
+                                self.record_use(def_id, ex.span);
+                            } else {
+                                self.record("call", def_id, ex.span);
+                            }
+                        }
+                    }
+                }
+                ExprKind::MethodCall(..) => {
+                    if let Some(def_id) = self.typeck.type_dependent_def_id(ex.hir_id) {
+                        let target = self.method_target(def_id, ex.hir_id);
+                        self.record("call", target, ex.span);
+                    }
+                }
+                // value paths to consts/statics/variants used as values → use
+                ExprKind::Path(ref qpath) => {
+                    self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id), ex.span);
+                }
+                // struct/enum-variant literal → use of the type/variant
+                ExprKind::Struct(qpath, ..) => {
+                    self.use_from_res(self.typeck.qpath_res(qpath, ex.hir_id), ex.span);
+                }
+                // field access → use of the field def
+                ExprKind::Field(recv, _) => {
+                    let ty = self.typeck.expr_ty_adjusted(recv);
+                    if let ty::Adt(adt, _) = ty.kind() {
+                        if adt.is_struct() || adt.is_union() {
+                            let idx = self.typeck.field_index(ex.hir_id);
+                            if let Some(field) = adt.non_enum_variant().fields.get(idx) {
+                                self.record_use(field.did, ex.span);
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        intravisit::walk_expr(self, ex);
+    }
+
+    fn visit_ty(&mut self, t: &'tcx Ty<'tcx, AmbigArg>) {
+        if !t.span.from_expansion() {
+            if let TyKind::Path(QPath::Resolved(_, path)) = t.kind {
+                self.use_from_res(path.res, t.span);
+            }
+        }
+        intravisit::walk_ty(self, t);
+    }
+
+    fn visit_pat(&mut self, p: &'tcx Pat<'tcx>) {
+        if !p.span.from_expansion() {
+            match p.kind {
+                PatKind::TupleStruct(ref qpath, ..) | PatKind::Struct(ref qpath, ..) => {
+                    self.use_from_res(self.typeck.qpath_res(qpath, p.hir_id), p.span);
+                }
+                _ => {}
+            }
+        }
+        intravisit::walk_pat(self, p);
+    }
+}
+
 fn is_rustc(arg: &str) -> bool {
     std::path::Path::new(arg)
         .file_stem()
@@ -474,6 +678,18 @@ fn print_sysroot(rustc: &str) -> Option<String> {
 }
 
 fn main() -> std::process::ExitCode {
+    // Adopt only the explicit exec-time transfer, before any sysroot helper,
+    // compiler thread or child. Restoration of CLOEXEC prevents propagation.
+    let mut callbacks = BgCallbacks {
+        #[cfg(target_os = "linux")]
+        // SAFETY: process entry receives each declared non-stdio FD by unique
+        // ownership transfer from the wrapper's actual delegated Command.
+        controls: unsafe { held_callback_control::adopt_inherited_controls() },
+    };
+    #[cfg(target_os = "linux")]
+    if let held_callback_control::InheritedControls::Unavailable(_) = &callbacks.controls {
+        eprintln!("[bg-driver] sealed callback control unavailable");
+    }
     let mut args: Vec<String> = std::env::args().collect();
 
     // As RUSTC_WORKSPACE_WRAPPER, cargo calls us `bg-driver <rustc> <args…>`.
@@ -495,7 +711,7 @@ fn main() -> std::process::ExitCode {
     }
 
     rustc_driver::catch_with_exit_code(|| {
-        rustc_driver::run_compiler(&args, &mut BgCallbacks);
+        rustc_driver::run_compiler(&args, &mut callbacks);
         Ok::<(), rustc_span::ErrorGuaranteed>(())
     })
 }

@@ -228,7 +228,7 @@ fn dylib_env() -> &'static str {
     }
 }
 
-fn sysroot(nightly: &str) -> Result<String> {
+pub fn sysroot(nightly: &str) -> Result<String> {
     let out = Command::new("rustc")
         .arg(format!("+{nightly}"))
         .args(["--print", "sysroot"])
@@ -238,6 +238,19 @@ fn sysroot(nightly: &str) -> Result<String> {
         bail!("could not determine sysroot for toolchain `{nightly}`");
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+pub fn tool_program(nightly: &str, tool: &str) -> Result<std::path::PathBuf> {
+    let output = Command::new("rustup")
+        .args(["which", "--toolchain", nightly, tool])
+        .output()
+        .context("locating pinned driver toolchain executable")?;
+    if !output.status.success() {
+        bail!("pinned driver toolchain executable unavailable");
+    }
+    Ok(std::path::PathBuf::from(
+        std::str::from_utf8(&output.stdout)?.trim(),
+    ))
 }
 
 /// Run the driver over the workspace and (re)build the `calls`/`uses` edges from
@@ -282,6 +295,62 @@ pub fn add_references_layer(
         bail!("`cargo check` (driver) failed (exit {status})");
     }
 
+    read_reference_edges(graph, &edges_dir)
+}
+
+/// Supplied-tools variant of the existing separate driver pass. No discovery
+/// or driver build occurs; the original edge reader and partial outcomes apply.
+pub fn add_references_layer_selected(
+    graph: &mut Graph,
+    ws_root: &Utf8Path,
+    out: &Utf8Path,
+    driver_bin: &Utf8Path,
+    selected: &mut crate::cargo_launch::CargoLaunchSession,
+) -> Result<ReferenceCounts> {
+    let out = absolute_path(out)?;
+    let driver_bin = absolute_path(driver_bin)?;
+    if !selected.has_explicit_tools() || !driver_bin.as_std_path().is_file() {
+        bail!("explicit driver pass requires the supplied tools and prebuilt driver");
+    }
+    let edges_dir = out.join("driver-refs-v2");
+    let target_dir = out.join("driver-check");
+    std::fs::create_dir_all(edges_dir.as_std_path()).ok();
+    let command =
+        selected_reference_command(ws_root, &edges_dir, &target_dir, &driver_bin, selected)?;
+    eprintln!(
+        "[build-graph] references(driver): selected Cargo check --all-targets via the supplied driver…"
+    );
+    let mut child = selected.launch_reference_check(command)?;
+    let status = child
+        .wait()
+        .context("waiting for selected Cargo check with the rustc driver")?;
+    drop(child);
+    if !status.success() {
+        bail!("selected Cargo check (driver) failed (exit {status})");
+    }
+    read_reference_edges(graph, &edges_dir)
+}
+
+pub(crate) fn selected_reference_command(
+    ws_root: &Utf8Path,
+    edges_dir: &Utf8Path,
+    target_dir: &Utf8Path,
+    driver_bin: &Utf8Path,
+    selected: &crate::cargo_launch::CargoLaunchSession,
+) -> Result<Command> {
+    let mut command = Command::new(&selected.cargo);
+    command
+        .args(["check", "--all-targets", "--target-dir"])
+        .arg(target_dir.as_str())
+        .current_dir(ws_root.as_std_path())
+        .env("RUSTC_WORKSPACE_WRAPPER", driver_bin.as_str())
+        .env("BG_DRIVER_EDGES", edges_dir.as_str());
+    selected.configure(&mut command, true);
+    selected.configure_explicit_flags(&mut command)?;
+    Ok(command)
+}
+
+fn read_reference_edges(graph: &mut Graph, edges_dir: &Utf8Path) -> Result<ReferenceCounts> {
     // This layer is a full recompute from the persisted per-unit edge files.
     graph.remove_edges_with_relation("calls");
     graph.remove_edges_with_relation("uses");
@@ -410,5 +479,42 @@ mod tests {
                 .map(String::as_str),
             Some("selected")
         );
+    }
+
+    #[test]
+    fn edge_reader_maps_macro_paths_when_source_coordinates_are_shared() {
+        let workspace = crate::test_support::Workspace::new(&[]);
+        let edges = workspace.root.join("driver-refs-v2");
+        std::fs::create_dir(&edges).expect("edge directory");
+        std::fs::write(
+            edges.join("unit.tsv"),
+            "call\tmacro.rs:1\tmacro.rs:1\troute_fixture::generated::entrypoint\troute_fixture::generated::callee\n",
+        )
+        .expect("five-column edge file");
+        let mut graph = Graph::new();
+        graph.add_node(item(
+            "entrypoint",
+            "entrypoint",
+            "function",
+            "route-fixture",
+            "generated::entrypoint",
+        ));
+        graph.add_node(item(
+            "callee",
+            "callee",
+            "function",
+            "route-fixture",
+            "generated::callee",
+        ));
+        let counts =
+            super::read_reference_edges(&mut graph, &edges).expect("read macro-safe driver edges");
+        assert_eq!(counts.calls, 1);
+        assert_eq!(counts.uses, 0);
+        assert_eq!(graph.edge_count(), 1);
+        let document = graph.into_doc();
+        let edge = document.edges.first().expect("mapped call edge");
+        assert_eq!(edge.source, "entrypoint");
+        assert_eq!(edge.target, "callee");
+        assert_eq!(edge.relation, "calls");
     }
 }

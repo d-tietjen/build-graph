@@ -178,6 +178,8 @@ Artifacts are written to `target/build-graph/` by default:
 - `graph.json.gz` or `graph.json` - graphify-compatible data with deterministic
   IDs.
 - `graph.html` - the bundled offline viewer.
+- `graph-export.json` - versioned definition identities, full spans, and
+  extraction provenance from the CLI; see [export metadata](docs/export.md).
 - `GRAPH_REPORT.md` - counts, largest crates, and highly connected nodes.
 - `ARCHITECTURE.md` - optional generated architecture section, refreshed by the
   GitHub Action.
@@ -192,3 +194,9 @@ Artifacts are written to `target/build-graph/` by default:
 ## License
 
 MIT
+
+The feature-enabled Linux `build` route also supports an explicit inherited
+Cargo launch observer FD and opaque root correlation. See the
+[bounded generic protocol](docs/cargo-launch-intent.md) for invocation, sealed
+intent and ACK sequencing, privacy, failure ownership and remaining original
+parent qualification. It is disabled by default and does not change graph DTOs.
