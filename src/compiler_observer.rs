@@ -4369,22 +4369,26 @@ mod tests {
         let legacy = read_callback(&callback, &invocation, &session.config.roots).unwrap();
         invocation.environment = (0..8)
             .map(|index| EnvironmentObservation {
-                name: format!("SEMANTIC_PADDING_{index}"),
+                name: format!("CARGO_FEATURE_SEMANTIC_PADDING_{index}"),
                 present: true,
-                value: Some(String::new()),
-                content_fingerprint: None,
+                value: Some("1".into()),
+                content_fingerprint: Some(content_fingerprint(b"1")),
                 path: None,
                 gap: None,
             })
             .collect();
         let base = bounded_json_size(&invocation, MAX_INVOCATION_BYTES).unwrap();
         let mut padding = MAX_INVOCATION_BYTES - 128 - base;
+        // Keep producer-valid feature values; only bounded names spend the padding.
         for value in &mut invocation.environment {
-            let bytes = padding.min(MAX_TEXT_BYTES);
-            value.value = Some("x".repeat(bytes));
+            let bytes = padding.min(MAX_TEXT_BYTES - value.name.len());
+            value.name.push_str(&"X".repeat(bytes));
             padding -= bytes;
+            assert!(env_allowed(&value.name));
+            assert!(safe_env_value(&value.name, value.value.as_deref().unwrap()));
         }
         assert_eq!(padding, 0);
+        invocation.validate().expect("valid padded original record before legacy overflow");
         invocation.occurrences = Some(legacy);
         assert_eq!(
             bounded_json_size(&invocation, MAX_INVOCATION_BYTES),

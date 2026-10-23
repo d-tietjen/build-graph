@@ -39,9 +39,11 @@ impl signatures, a foreign declaration, nested bodies and a closure before
 continued outer-body calls. The callback cases coherently rewrite every semantic
 nonce and page fingerprint while retaining the original callback, cover actual
 legacy size-cap omission, and use the genuine assembly/export readers and
-writers. Both control reads share the existing cap; no optional stream adds an
-aggregate or source-work allowance. All prior selectors and bodies remain
-required and unchanged.
+writers. The size-padding fixture uses allowlisted feature observations with
+value `1`, grows only their names within the existing text limit, and validates
+the invocation before adding the oversized legacy record. Both control reads
+share the existing cap; no optional stream adds an aggregate or source-work
+allowance. All prior selectors and assertions remain required.
 
 ## Actual driver occurrences
 
