@@ -109,6 +109,11 @@ Each definition includes:
   of the compiler-owned source-map buffer. This differs from a post-run `.d`
   membership observation.
 
+Named paths are relative to the actual local crate. The driver asks the pinned
+compiler to include its crate-name prefix, then removes exactly that prefix.
+A real module named like the crate remains part of the definition path. External
+definitions and unsupported anonymous paths keep their existing explicit gaps.
+
 References include both full definition tuples, the actually visited reference
 range and source buffer, and the original relation/EXTRACTED confidence/score/
 weight. Local `calls` and `uses` are observed from the original HIR visitor.

@@ -466,9 +466,10 @@ impl Session {
                 .to_str()
                 .is_some_and(|n| n.starts_with("budget-"))
             {
-                if let Ok(bytes) = bounded_read(&entry.path(), 1024)
-                    && let Ok(witness) = serde_json::from_slice::<CollectionTruncation>(&bytes)
-                {
+                let witness = bounded_read(&entry.path(), 1024)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<CollectionTruncation>(&bytes).ok());
+                if let Some(witness) = witness {
                     result.truncations.push(witness);
                 } else {
                     result.gaps.push(ObservationGap::MalformedObservation);
@@ -1572,17 +1573,17 @@ fn tool_identity(program: &str, roots: &[RootBinding], budget: &mut u64) -> Tool
     ));
     if let Some(text) = query(Path::new(program), &["-vV"]) {
         for line in text.lines() {
-            if let Some((key, value)) = line.split_once(": ")
-                && matches!(
+            if let Some((key, value)) = line.split_once(": ") {
+                if matches!(
                     key,
                     "release" | "commit-hash" | "commit-date" | "host" | "LLVM version"
-                )
-                && value.len() <= 256
-                && value
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || " ._+-".contains(c))
-            {
-                result.verbose_identity.insert(key.into(), value.into());
+                ) && value.len() <= 256
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || " ._+-".contains(c))
+                {
+                    result.verbose_identity.insert(key.into(), value.into());
+                }
             }
         }
     }
@@ -1935,9 +1936,12 @@ pub fn wrapper(args: &[OsString]) -> i32 {
             invocation.gaps.sort();
             invocation.gaps.dedup();
         }
-        if bounded_json_size(&invocation, MAX_INVOCATION_BYTES).is_ok()
-            && let Ok(bytes) = serde_json::to_vec(&invocation)
-        {
+        let bytes = if bounded_json_size(&invocation, MAX_INVOCATION_BYTES).is_ok() {
+            serde_json::to_vec(&invocation).ok()
+        } else {
+            None
+        };
+        if let Some(bytes) = bytes {
             let path = config.directory.join(format!("unit-{slot}.json"));
             if exclusive_write(&path, &bytes).is_err() {
                 let _ = exclusive_write(

@@ -412,16 +412,16 @@ impl<'a> Ingest<'a> {
     }
 
     fn run(&mut self, crate_node_id: &str) {
-        if let Some(root) = self.krate.index.get(&self.krate.root)
-            && let ItemEnum::Module(m) = &root.inner
-        {
-            for child in &m.items {
-                if let Some(node) = self.walk(*child, "", None) {
-                    self.edges.push(EdgeSpec {
-                        src: crate_node_id.to_string(),
-                        tgt: node,
-                        rel: "contains",
-                    });
+        if let Some(root) = self.krate.index.get(&self.krate.root) {
+            if let ItemEnum::Module(m) = &root.inner {
+                for child in &m.items {
+                    if let Some(node) = self.walk(*child, "", None) {
+                        self.edges.push(EdgeSpec {
+                            src: crate_node_id.to_string(),
+                            tgt: node,
+                            rel: "contains",
+                        });
+                    }
                 }
             }
         }
@@ -579,19 +579,22 @@ impl<'a> Ingest<'a> {
 
         let impls = std::mem::take(&mut self.impls);
         for (owner, impl_id) in impls {
-            if let Some(item) = self.krate.index.get(&impl_id)
-                && let ItemEnum::Impl(im) = &item.inner
-                && let Some(tr) = &im.trait_
-            {
-                match self.resolve_id(tr.id) {
-                    Some(Resolved::Local(t)) => self.push_edge(&owner, &t, "implements"),
-                    Some(Resolved::External { item, krate }) => self.pending.push(Pending {
-                        from: owner.clone(),
-                        item,
-                        krate,
-                        rel: "implements",
-                    }),
-                    None => {}
+            if let Some(item) = self.krate.index.get(&impl_id) {
+                if let ItemEnum::Impl(im) = &item.inner {
+                    if let Some(tr) = &im.trait_ {
+                        match self.resolve_id(tr.id) {
+                            Some(Resolved::Local(t)) => self.push_edge(&owner, &t, "implements"),
+                            Some(Resolved::External { item, krate }) => {
+                                self.pending.push(Pending {
+                                    from: owner.clone(),
+                                    item,
+                                    krate,
+                                    rel: "implements",
+                                })
+                            }
+                            None => {}
+                        }
+                    }
                 }
             }
         }

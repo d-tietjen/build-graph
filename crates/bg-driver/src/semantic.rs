@@ -12,8 +12,8 @@ use rustc_middle::{
     ty::{self, TyCtxt, TypeckResults},
 };
 use rustc_span::{
-    def_id::{DefId, LOCAL_CRATE},
     Span,
+    def_id::{DefId, LOCAL_CRATE},
 };
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -1479,6 +1479,11 @@ impl<'a> ObservedRowBudget<'a> {
         did: DefId,
     ) -> Option<crate::compiler_test_harness::CompilerDefinitionObservation> {
         use crate::compiler_test_harness::CompilerDefinitionObservation;
+        // Executable-only sessions may omit the local HIR hash entirely.
+        // Returning no identity lets the harness publisher retain its typed gap.
+        if did.krate == LOCAL_CRATE && !tcx.needs_crate_hash() {
+            return None;
+        }
         // The existing path writer's fixed 64-key stack and 1024-byte ceiling
         // are admitted before it allocates a path. Actual capacity is bounded.
         self.charge(1024)?;

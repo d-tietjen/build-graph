@@ -205,6 +205,66 @@ fn actual_driver_exact_definitions_ranges_and_reference_edges_bind_invocation() 
 }
 
 #[test]
+fn actual_driver_local_paths_preserve_a_module_named_like_the_crate() {
+    let fixture = Fixture::new();
+    let source = "pub fn source()->u32{1}\npub mod occurrence_demo { pub fn nested()->u32{2} }\npub fn caller()->u32{source()+occurrence_demo::nested()}\n";
+    fs::write(fixture.0.join("src/lib.rs"), source).expect("actual Rust 2024 source");
+    let export = fixture.build(true, false, false);
+    let facts = export
+        .compiler_invocations
+        .expect("actual invocation attachment");
+    facts.validate().expect("original bounded reader");
+    let unit = facts
+        .invocations
+        .iter()
+        .find(|unit| unit.unit.crate_name == "occurrence_demo")
+        .expect("actual Rust 2024 unit");
+    let occurrences = unit
+        .occurrences
+        .as_ref()
+        .expect("actual callback, no skipped positive");
+    assert!(
+        occurrences
+            .definitions
+            .iter()
+            .any(|definition| definition.def_path == "source")
+    );
+    let nested = occurrences
+        .definitions
+        .iter()
+        .find(|definition| definition.def_path == "occurrence_demo::nested")
+        .expect("retain the real module name after removing only the crate prefix");
+    assert_eq!(
+        nested.definition_key,
+        build_graph::compiler_occurrence::definition_key(
+            "occurrence_demo",
+            "occurrence_demo::nested",
+            "function"
+        )
+    );
+    assert_eq!(
+        nested.input.content_fingerprint,
+        fingerprint(source.as_bytes())
+    );
+    assert!(
+        !occurrences
+            .definitions
+            .iter()
+            .any(|definition| definition.def_path == "nested")
+    );
+    assert!(
+        occurrences
+            .references
+            .iter()
+            .any(|reference| {
+                reference.source.def_path == "caller"
+                    && reference.target == *nested
+                    && reference.relation == "calls"
+            })
+    );
+}
+
+#[test]
 fn actual_driver_conditional_membership_is_not_shared_file_or_feature_inference() {
     let fixture = Fixture::new();
     let first = fixture.build(true, false, false);

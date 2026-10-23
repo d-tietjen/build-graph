@@ -44,7 +44,13 @@ crate hash, definition path hash, index and bounded compiler path. Stable crate
 identifiers and crate hashes use fixed-width numeric hexadecimal; definition
 path hashes encode all sixteen `Fingerprint::to_le_bytes()` bytes, including
 leading zeros. No compiler formatting helper allocates an uncharged hash string. These are
-compiler observations, not portable test keys or execution authority. Used crate
+compiler observations, not portable test keys or execution authority. Executable-only
+sessions can omit the local HIR hash when rustc does not need it. The producer
+checks `TyCtxt::needs_crate_hash()` before querying a local crate hash; if absent,
+it retains `test_harness_crate_source_unavailable` instead of fabricating an
+identity or aborting compilation. Genuine positive harness controls explicitly
+request a private incremental directory so rustc computes the required hash; a
+separate metadata-only control checks the unavailable path. Used crate
 paths do not prove descriptor consumption, source CAS, immutable installation,
 output provenance or test execution. Those checks belong to their actual owners.
 

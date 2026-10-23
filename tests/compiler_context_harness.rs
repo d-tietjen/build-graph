@@ -29,6 +29,15 @@ impl Fixture {
         Self(root)
     }
     fn run(&self, domain: SemanticDomain, test: bool, extra: &[&str]) -> SemanticStreamV1 {
+        self.run_with_local_hash(domain, test, extra, false)
+    }
+    fn run_with_local_hash(
+        &self,
+        domain: SemanticDomain,
+        test: bool,
+        extra: &[&str],
+        local_hash: bool,
+    ) -> SemanticStreamV1 {
         let driver =
             std::env::var_os("BUILD_GRAPH_DRIVER").expect("actual matching driver required");
         let rustc = std::env::var_os("BUILD_GRAPH_TEST_EXPLICIT_RUSTC")
@@ -124,6 +133,11 @@ impl Fixture {
         if domain == SemanticDomain::LocalHirWithTestHarness {
             command.env("BG_DRIVER_TEST_HARNESS_OBSERVATION", "1");
         }
+        if local_hash {
+            let mut incremental = std::ffi::OsString::from("incremental=");
+            incremental.push(self.0.join("incremental"));
+            command.arg("-C").arg(incremental);
+        }
         command.args(extra);
         let _retained = controls.configure_child(&mut command).unwrap();
         let result = command.output().unwrap();
@@ -157,6 +171,10 @@ impl Fixture {
             terminal: Some(index.terminal),
         };
         stream.validate().unwrap();
+        eprintln!(
+            "actual compiler observation terminal: {:?}",
+            stream.terminal
+        );
         stream
     }
 }
@@ -216,7 +234,12 @@ fn actual_target_feature_codegen_changes_same_session_inventory() {
 #[test]
 fn actual_test_harness_policies_order_constants_and_used_sysroot() {
     let source = "#[test] fn z(){}\n#[test] #[ignore=\"why\"] fn a(){}\n#[test] #[should_panic(expected=\"message\")] fn p(){panic!(\"message\")}\n#[test] #[should_panic] fn q(){panic!()}\n";
-    let value = Fixture::new(source).run(SemanticDomain::LocalHirWithTestHarness, true, &[]);
+    let value = Fixture::new(source).run_with_local_hash(
+        SemanticDomain::LocalHirWithTestHarness,
+        true,
+        &[],
+        true,
+    );
     let rows = descriptors(&value);
     assert_eq!(
         rows.iter().map(|row| row.name.as_str()).collect::<Vec<_>>(),
@@ -254,12 +277,33 @@ fn actual_test_harness_policies_order_constants_and_used_sysroot() {
 }
 #[test]
 fn actual_empty_harness_has_generated_entry_and_zero_table() {
-    let value =
-        Fixture::new("pub fn helper(){}\n").run(SemanticDomain::LocalHirWithTestHarness, true, &[]);
+    let value = Fixture::new("pub fn helper(){}\n").run_with_local_hash(
+        SemanticDomain::LocalHirWithTestHarness,
+        true,
+        &[],
+        true,
+    );
     assert!(targets(&value).any(
         |target| matches!(target,SemanticTarget::TestHarnessEntry {entry} if entry.table_entries==0)
     ));
     assert!(descriptors(&value).is_empty());
+}
+#[test]
+fn actual_metadata_only_harness_without_local_hash_retains_explicit_gap() {
+    let value =
+        Fixture::new("pub fn helper(){}\n").run(SemanticDomain::LocalHirWithTestHarness, true, &[]);
+    let terminal = value.terminal.as_ref().unwrap();
+    assert_eq!(terminal.stop, TraversalStop::EndOfDomain);
+    assert!(
+        terminal
+            .gaps
+            .contains(&SemanticGap::TestHarnessCrateSourceUnavailable)
+    );
+    assert!(!targets(&value).any(|target| matches!(
+        target,
+        SemanticTarget::TestHarnessEntry { .. } | SemanticTarget::TestHarnessDescriptor { .. }
+    )));
+    assert!(targets(&value).any(|target| matches!(target, SemanticTarget::CompilerContext { .. })));
 }
 #[test]
 fn actual_ordinary_unit_preserves_unavailable_harness_gap() {
@@ -298,7 +342,12 @@ fn actual_custom_runner_is_not_standard_libtest() {
 #[test]
 fn actual_bench_descriptor_resolves_real_assertion_closure() {
     let source = "#![feature(test)]\nextern crate test;\n#[bench] fn bench(b:&mut test::Bencher){b.iter(||1)}\n";
-    let value = Fixture::new(source).run(SemanticDomain::LocalHirWithTestHarness, true, &[]);
+    let value = Fixture::new(source).run_with_local_hash(
+        SemanticDomain::LocalHirWithTestHarness,
+        true,
+        &[],
+        true,
+    );
     let rows = descriptors(&value);
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].kind, TestDescriptorKind::Bench);
@@ -316,7 +365,12 @@ fn actual_large_generated_table_pages_under_shared_limits() {
     for index in 0..100 {
         source.push_str(&format!("#[test] fn test_{index:03}(){{}}\n"));
     }
-    let value = Fixture::new(&source).run(SemanticDomain::LocalHirWithTestHarness, true, &[]);
+    let value = Fixture::new(&source).run_with_local_hash(
+        SemanticDomain::LocalHirWithTestHarness,
+        true,
+        &[],
+        true,
+    );
     assert!(value.pages.len() > 1);
     let rows = descriptors(&value);
     assert_eq!(rows.len(), 100);
@@ -358,6 +412,7 @@ fn actual_selected_cargo_wrapper_exports_the_opted_harness_domain() {
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env("CARGO_ENCODED_RUSTFLAGS", "-C\x1fdebug-assertions=yes")
+        .env("CARGO_ENCODED_RUSTDOCFLAGS", "")
         .current_dir(&fixture.0);
     let result = command.output().unwrap();
     assert!(
