@@ -35,17 +35,17 @@ fn explicit_sysroot_preserves_plain_compiler_and_rustdoc_flags_as_encoded_argume
     apply_sysroot(&mut command, &sysroot).expect("composed flags");
     assert_eq!(
         command_value(&command, "CARGO_ENCODED_RUSTFLAGS").unwrap(),
-        format!(
+        OsString::from(format!(
             "--cfg\x1fselected\x1f-C\x1fopt-level=1\x1f--sysroot={}",
             sysroot.display()
-        )
+        ))
     );
     assert_eq!(
         command_value(&command, "CARGO_ENCODED_RUSTDOCFLAGS").unwrap(),
-        format!(
+        OsString::from(format!(
             "-Z\x1funstable-options\x1f--output-format\x1fjson\x1f--document-private-items\x1f--sysroot={}",
             sysroot.display()
-        )
+        ))
     );
 }
 
@@ -61,10 +61,10 @@ fn explicit_sysroot_preserves_encoded_precedence_spaces_and_empty_arguments() {
     apply_sysroot(&mut command, &sysroot).unwrap();
     assert_eq!(
         command_value(&command, "CARGO_ENCODED_RUSTFLAGS").unwrap(),
-        format!(
+        OsString::from(format!(
             "--cfg\x1fvalue with spaces\x1f\x1f-C\x1fopt-level=2\x1f--sysroot={}",
             sysroot.display()
-        )
+        ))
     );
 }
 
@@ -82,7 +82,7 @@ fn matching_explicit_sysroot_is_idempotent_in_both_flag_forms() {
         apply_sysroot(&mut command, &sysroot).unwrap();
         assert_eq!(
             command_value(&command, "CARGO_ENCODED_RUSTFLAGS").unwrap(),
-            flags
+            OsString::from(flags)
         );
     }
 }
@@ -177,7 +177,7 @@ fn selected_session_checks_final_flags_before_ordinal_or_route_and_keeps_exact_t
         for name in ["CARGO_ENCODED_RUSTFLAGS", "CARGO_ENCODED_RUSTDOCFLAGS"] {
             assert_eq!(
                 command_value(&command, name).unwrap(),
-                format!("--sysroot={}", sysroot.display())
+                OsString::from(format!("--sysroot={}", sysroot.display()))
             );
         }
     }
@@ -224,10 +224,10 @@ fn rich_doc_flags_append_to_the_complete_encoded_baseline_without_losing_it() {
     );
     assert_eq!(
         command_value(&command, "CARGO_ENCODED_RUSTDOCFLAGS").unwrap(),
-        format!(
+        OsString::from(format!(
             "{}\x1f-Z\x1funstable-options\x1f--output-format\x1fjson\x1f--document-private-items",
             baseline[1].to_str().unwrap()
-        )
+        ))
     );
 }
 

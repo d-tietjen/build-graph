@@ -80,7 +80,7 @@ fn separate_driver_check_uses_exact_supplied_cargo_compilers_and_prebuilt_driver
             .unwrap()
             .1
             .unwrap(),
-        format!("--sysroot={}", workspace.root)
+        OsString::from(format!("--sysroot={}", workspace.root)).as_os_str()
     );
 }
 
