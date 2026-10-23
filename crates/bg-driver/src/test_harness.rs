@@ -138,10 +138,10 @@ fn entry_call<'tcx>(expression: &'tcx Expr<'tcx>) -> Option<&'tcx Expr<'tcx>> {
     let ExprKind::Block(block, _) = expression.kind else {
         return Some(expression);
     };
-    if block.expr.is_some() || block.stmts.len() > 2 {
+    if block.stmts.len() > 2 {
         return None;
     }
-    let mut found = None;
+    let mut found = block.expr;
     for statement in block.stmts {
         match statement.kind {
             StmtKind::Item(_) => {}

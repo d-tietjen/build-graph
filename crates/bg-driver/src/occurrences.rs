@@ -396,7 +396,9 @@ impl Collector {
                 return None;
             }
         };
-        let full = tcx.def_path_str(did);
+        // Local Rust 2018+ paths normally omit the crate name. Request it
+        // explicitly before removing exactly that compiler-selected prefix.
+        let full = rustc_middle::ty::print::with_resolve_crate_name!(tcx.def_path_str(did));
         let Some(path) = full.strip_prefix(&format!("{}::", self.value.crate_name)) else {
             self.gap(OccurrenceGap::UnsupportedDefinition);
             return None;
@@ -414,7 +416,9 @@ impl Collector {
             self.gap(OccurrenceGap::UnsupportedDefinition);
             return None;
         };
-        let (input, range) = self.location(tcx, tcx.def_span(did))?;
+        let local = did.as_local()?;
+        let span = tcx.hir_span_with_body(tcx.local_def_id_to_hir_id(local));
+        let (input, range) = self.location(tcx, span)?;
         let value = DefinitionOccurrence {
             definition_key: definition_key(&package, path, kind),
             legacy_id: legacy_id(&package, path, kind),
