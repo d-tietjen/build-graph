@@ -2358,6 +2358,64 @@ fn read_callback(
     Ok(value)
 }
 
+fn is_cargo_information_query(args: &[Option<&str>]) -> bool {
+    let Some(text) = args.iter().copied().collect::<Option<Vec<_>>>() else {
+        return false;
+    };
+    // Recognize only Cargo's known stdin/___ information probe. Consume each
+    // option's value: a print-looking value of another option is not a print
+    // request. Unknown rustflags and compilation forms retain normal capture.
+    if !text.starts_with(&["-", "--crate-name", "___"]) {
+        return false;
+    }
+    let mut index = 3;
+    let mut file_names = false;
+    while let Some(arg) = text.get(index).copied() {
+        index += 1;
+        let (kind, value) = match arg {
+            "--print" | "--crate-type" | "--target" => {
+                let Some(value) = text.get(index).copied() else {
+                    return false;
+                };
+                index += 1;
+                (arg, value)
+            }
+            "-Wwarnings" => continue,
+            _ => {
+                if let Some(value) = arg.strip_prefix("--print=") {
+                    ("--print", value)
+                } else if let Some(value) = arg.strip_prefix("--crate-type=") {
+                    ("--crate-type", value)
+                } else if let Some(value) = arg.strip_prefix("--target=") {
+                    ("--target", value)
+                } else {
+                    return false;
+                }
+            }
+        };
+        match kind {
+            "--print" => {
+                if !matches!(value, "file-names" | "sysroot" | "split-debuginfo" | "crate-name" | "cfg") {
+                    return false;
+                }
+                file_names |= value == "file-names";
+            }
+            "--crate-type" => {
+                if !matches!(value, "bin" | "rlib" | "dylib" | "cdylib" | "staticlib" | "proc-macro") {
+                    return false;
+                }
+            }
+            "--target" => {
+                if value.is_empty() || value.starts_with('-') || value.starts_with('@') {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    file_names
+}
+
 fn prepare(
     config: &Config,
     command: &[OsString],
@@ -2377,6 +2435,9 @@ fn prepare(
         return None;
     }
     let text: Vec<_> = args.iter().map(|arg| arg.to_str()).collect();
+    if is_cargo_information_query(&text) {
+        return None;
+    }
     let Some(crate_name) = option(&text, "--crate-name") else {
         if text.iter().flatten().any(|arg| arg.starts_with('@')) {
             let _ = exclusive_write(
@@ -2992,6 +3053,108 @@ mod tests {
             cargo_truncations: vec![],
             driver: None,
         }
+    }
+
+    #[test]
+    fn cargo_information_probes_do_not_allocate_compilation_slots() {
+        let workspace = Workspace::new(&[("demo", "demo_lib")]);
+        let session = session(&workspace);
+        let command: Vec<OsString> = [
+            "/unexecuted/rustc",
+            "-",
+            "--crate-name",
+            "___",
+            "--print=file-names",
+            "--crate-type",
+            "bin",
+            "--crate-type",
+            "rlib",
+            "--crate-type",
+            "dylib",
+            "--crate-type",
+            "cdylib",
+            "--crate-type",
+            "staticlib",
+            "--crate-type",
+            "proc-macro",
+            "--print=sysroot",
+            "--print=split-debuginfo",
+            "--print=crate-name",
+            "--print=cfg",
+            "-Wwarnings",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        for _ in 0..=MAX_INVOCATIONS {
+            assert!(prepare(&session.config, &command, 0, &command[1..]).is_none());
+        }
+        assert_eq!(
+            fs::read_dir(&session.config.directory).expect("unchanged observation directory").count(),
+            0,
+            "queries cannot allocate slots, unit files or budget witnesses"
+        );
+    }
+
+    #[test]
+    fn compilation_and_ambiguous_print_commands_are_not_information_probes() {
+        let probe = [Some("-"), Some("--crate-name"), Some("___"), Some("--print=file-names")];
+        assert!(is_cargo_information_query(&probe));
+        let split = [Some("-"), Some("--crate-name"), Some("___"), Some("--print"), Some("file-names")];
+        assert!(is_cargo_information_query(&split));
+        for target in [
+            vec![Some("--target"), Some("aarch64-unknown-linux-gnu")],
+            vec![Some("--target=x86_64-unknown-linux-gnu")],
+            vec![Some("--crate-type=rlib")],
+        ] {
+            let mut command = probe.to_vec();
+            command.extend(target);
+            assert!(is_cargo_information_query(&command));
+        }
+        // These full commands have no actual print request. In particular,
+        // rustc consumes the print-looking token as the required remap value.
+        for tail in [
+            vec![Some("--remap-path-prefix"), Some("--print=file-names")],
+            vec![Some("--target"), Some("--print=file-names")],
+            vec![Some("--crate-type"), Some("--print=file-names")],
+            vec![Some("--print"), Some("--print=file-names")],
+            vec![Some("-W"), Some("--print=file-names")],
+        ] {
+            let mut command = vec![Some("-"), Some("--crate-name"), Some("___")];
+            command.extend(tail);
+            assert!(!is_cargo_information_query(&command), "{command:?}");
+        }
+        for tail in [
+            vec![Some("src/lib.rs")],
+            vec![Some("@compiler.rsp")],
+            vec![Some("--emit=metadata")],
+            vec![Some("--emit"), Some("metadata")],
+            vec![Some("--out-dir"), Some("out")],
+            vec![Some("-ooutput")],
+            vec![Some("--test")],
+            vec![Some("--print=native-static-libs")],
+            vec![Some("--print=link-args")],
+            vec![Some("--print=unknown")],
+            vec![Some("--print")],
+            vec![Some("--crate-type")],
+            vec![Some("--target")],
+            vec![Some("--target=")],
+            vec![Some("--target"), Some("--print=cfg")],
+            vec![Some("--crate-type"), Some("--print=cfg")],
+            vec![Some("trailing-positional")],
+            vec![Some("--cfg"), Some("feature=selected")],
+            vec![None],
+        ] {
+            let mut command = probe.to_vec();
+            command.extend(tail);
+            assert!(!is_cargo_information_query(&command), "{command:?}");
+        }
+        assert!(!is_cargo_information_query(&[
+            Some("src/lib.rs"),
+            Some("--crate-name"),
+            Some("demo"),
+            Some("--emit=metadata")
+        ]));
     }
 
     // Binary tests link the ordinary library without its cfg(test) fixtures.
