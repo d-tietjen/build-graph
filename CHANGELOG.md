@@ -4,6 +4,15 @@ All notable changes to this project are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); this project uses
 semantic versioning.
 
+## 0.2.2
+
+### Fixed
+
+- Registry installs with `rustc-driver` embed the driver sources and their
+  shared modules. `--driver` builds them on demand in a content-addressed user
+  cache even when the original Git checkout is unavailable. Explicit driver and
+  source overrides retain their precedence.
+
 ## 0.2.1
 
 ### Added
