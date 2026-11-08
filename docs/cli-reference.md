@@ -82,9 +82,19 @@ cargo build-graph build --driver
 cargo build-graph watch --driver
 ```
 
-`--driver` builds [`crates/bg-driver`](../crates/bg-driver) on demand the first
-time and cargo caches it after that. Pass `--driver-bin <path>` or set
-`BUILD_GRAPH_DRIVER` to use a prebuilt binary.
+`--driver` builds the driver on demand the first time and Cargo caches it after
+that. Source checkouts use [`crates/bg-driver`](../crates/bg-driver); registry
+installs unpack embedded sources under `$XDG_CACHE_HOME/build-graph/drivers`
+(or `$HOME/.cache/build-graph/drivers`), keyed by their content digest. No Git
+checkout is required. These sources and build outputs remain useful while that
+installed driver version is used. Pass `--driver-bin <path>` or set
+`BUILD_GRAPH_DRIVER` to use a prebuilt binary; `BUILD_GRAPH_DRIVER_SRC` retains
+its source-override precedence.
+
+For release verification, run `python3 scripts/verify_packaged_driver.py`
+(Python 3.11+). It installs the actual Cargo archive, removes the extracted
+source, and checks a real method-call edge without driver-path overrides.
+Pass `--target-dir <path>` to reuse CLI build outputs.
 
 The driver replaces the SCIP pass: it runs `cargo check --all-targets` with the
 driver as `RUSTC_WORKSPACE_WRAPPER`, persists per-crate edge files under

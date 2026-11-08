@@ -24,9 +24,12 @@ use build_graph::{Graph, norm};
 
 use crate::scip::{ReferenceCounts, add_member_reference_edges};
 
+#[path = "bundled_driver.rs"]
+mod bundled;
+
 /// Locate the `bg-driver` binary, building it on demand if needed. In order:
 /// `explicit` (`--driver-bin`), then `$BUILD_GRAPH_DRIVER`, then building the
-/// `crates/bg-driver` crate (its own nightly pin applies) and using the result.
+/// source checkout or embedded bundle (its own nightly pin applies).
 pub fn resolve_driver(explicit: Option<&str>) -> Result<Utf8PathBuf> {
     if let Some(p) = explicit {
         let p = absolute_path(&Utf8PathBuf::from(p))?;
@@ -42,10 +45,10 @@ pub fn resolve_driver(explicit: Option<&str>) -> Result<Utf8PathBuf> {
         }
         return Ok(p);
     }
-    let src = driver_src().context(
-        "rustc driver source not found — set BUILD_GRAPH_DRIVER to a prebuilt bg-driver binary, \
-         or BUILD_GRAPH_DRIVER_SRC to the crates/bg-driver directory, or pass --driver-bin",
-    )?;
+    let src = match driver_src() {
+        Some(source) => source,
+        None => bundled::materialize()?,
+    };
     build_driver(&src)
 }
 
