@@ -6,7 +6,7 @@ operational reference for `cargo build-graph`.
 ## CLI Commands
 
 ```bash
-cargo install build-graph
+cargo install build-graph --locked
 
 cargo build-graph build
 cargo build-graph watch
@@ -37,7 +37,7 @@ Useful flags: `--manifest-path`, `--target-dir`, `--out <dir>`, `-p <crate>`,
 `rustc-driver` Cargo feature:
 
 ```bash
-cargo install build-graph --features rustc-driver
+cargo install build-graph --locked --features rustc-driver
 ```
 
 ## Layers
@@ -72,14 +72,15 @@ large repositories pay the cold indexing cost on each reference refresh.
 
 ### rustc Driver (`--driver`)
 
-The driver backend is a clippy-style `RUSTC_WORKSPACE_WRAPPER` that reads the
-compiler's HIR during `cargo check`. It is incremental because cargo only re-runs
-the wrapper for crates it recompiles.
+The driver reads resolved HIR references and MIR control flow during
+`cargo check`. Cargo reuses compilation and capture artifacts for unchanged
+units. Install the pinned nightly with its driver components before using it.
 
 ```bash
-cargo install build-graph --features rustc-driver
-cargo build-graph build --driver
-cargo build-graph watch --driver
+rustup toolchain install nightly-2026-02-27 --component rustc-dev --component llvm-tools-preview
+cargo install build-graph --locked --features rustc-driver
+cargo build-graph build --driver --nightly nightly-2026-02-27
+cargo build-graph watch --driver --nightly nightly-2026-02-27
 ```
 
 `--driver` builds the driver on demand the first time and Cargo caches it after
@@ -92,48 +93,88 @@ installed driver version is used. Pass `--driver-bin <path>` or set
 its source-override precedence.
 
 For release verification, run `python3 scripts/verify_packaged_driver.py`
-(Python 3.11+). It installs the actual Cargo archive, removes the extracted
-source, and checks a real method-call edge without driver-path overrides.
-Pass `--target-dir <path>` to reuse CLI build outputs.
+with Python 3.11 or later. It installs the Cargo archive, removes the extracted
+source, and checks a resolved method call and captured MIR flow.
 
-The driver replaces the SCIP pass: it runs `cargo check --all-targets` with the
-driver as `RUSTC_WORKSPACE_WRAPPER`, persists per-crate edge files under
-`<out>/driver-refs-v3`, and maps them onto Layer 2 nodes. It indexes the
-semantic def-reference graph, including macro-expanded HIR, not
-rust-analyzer's syntactic occurrence graph. Edge files include both source
-coordinates and resolved def paths, so macro-generated items can still map when
-their spans point at a macro definition or share an invocation line. Treat it as
-a faster compiler-grounded reference source rather than a byte-identical
-rust-analyzer clone.
+The driver stores per-unit references and MIR alongside the graph output.
+Resolved definition paths let it map macro-expanded code even when several
+items share a source location. Dependency ownership uses exact Cargo package
+IDs. Native analysis follows FFI links and direct calls where compiled
+artifacts provide evidence.
 
-The bundled `graph.html` opens on **Architecture**, one graph combining structural
-relationships and captured calls. Sidebar **Field** and **Function graph**
-presets change visibility without replacing the graph. Node and connection
-controls refine what is shown; **Network**, **Radial**, and **Tree** arrange
-the same nodes. Folder eyes control Rust toolchain, workspace, and dependency
-visibility. Clicking a function isolates all directed
-upstream and downstream connections across captured call alternatives; possible
-dispatch and callback calls remain visibly uncertain. AND pins refine the
-selection and are shared with the full model. The **Execution flow** statechart
-is captured by rustc during `cargo check`, without running the program. It
-keeps all recorded MIR blocks and successors, including guards, loops,
-cleanup, and unwind transitions. Binary main functions anchor the application
-section; disconnected or unknown-entry procedures remain visible separately.
-Zoom into rounded procedure regions to inspect states and source locations.
-Click regions or states to AND-pin procedures; pin analysis ghosts routes outside
-the result while retaining the complete model. Unknown external bodies and
-dynamic targets remain explicit coverage boundaries. Static branch feasibility
-is not solved. Architecture also works with `--references` data without MIR bodies.
+## Explore the Viewer
 
-The companion **Request flow** opens from a function or statechart procedure.
-It offers **Flamegraph** and **UML sequence** views of bounded compiler path
-examples. The selector includes compiled binary entries and a focused local
-witness; AND pins remain shared with the complete statechart. Expand a frame
-to inspect its full captured CFG. Unknown bodies, possible trait dispatch,
-panic/unwind scope, and search caps stay visible.
+Run `cargo build-graph view` from the captured workspace. If you set
+`--out` during capture, pass it to `view` as well. Small graphs embed their
+data in `graph.html`. For larger captures, the viewer serves the HTML and
+graph data together over local HTTP.
 
-Build with `--driver` if the flow view reports no data; SCIP references alone
-do not include MIR blocks.
+### Browse Structure and Calls
+
+In **Graph controls**, choose **Field** to show architecture relationships or
+**Function graph** to focus on callable nodes and directed edges. Choose
+**Network**, **Radial**, or **Tree · left to right** to arrange the graph. Node
+and connection type filters refine the preset. The package tree groups Rust
+toolchain code, workspace code, and dependencies. Select a folder to focus it,
+or use its eye icon to change visibility. **Show all** and **Hide all** reset
+folder visibility. Use the minimap to navigate while keeping the main zoom.
+
+Select a function to inspect its source and the connected callers and callees.
+To connect two functions, use **Use as call-path start** and **Use as call-path
+destination** on graph nodes, then select **Find connecting calls** in **Call
+paths**. The result includes intermediate functions and source-linked
+callsites. Graph filters can hide intermediate nodes without changing the
+captured call-path query.
+
+From a source checkout, use
+`node scripts/audit-call-graph.cjs --graph path/to/graph.json --out path/to/audit`
+to list callables with no captured edges. Add `--source-root` to include
+identifier matches from the captured source. Review those matches and capture
+coverage before deciding whether an isolated callable is unused.
+
+### Explore Execution
+
+**Execution flow** opens the statechart for every recorded MIR block and
+successor in the selected build configuration. Zoom into a procedure to see
+branches, loops, calls, returns, and unwind paths. Pin multiple procedures to
+highlight recorded routes that include all pins. Binary entry points anchor
+application flow. External or dynamic calls remain marked where their target
+or body is uncertain.
+
+From a function's details, open **Flamegraph** or **UML sequence** for bounded
+request variants. Select a variant, then expand a frame to inspect the full
+captured execution flow. The call-order view uses compiled-event steps. The
+aggregate flamegraph groups matching stacks. Import benchmark or profiling
+data in **Performance measurements** to view measured performance.
+Compiler capture covers the selected targets and configuration. Structural
+routes may include branches whose runtime feasibility is unknown. Use
+`--driver` to collect MIR. SCIP captures support the architecture and
+reference views.
+
+### Choose an Analysis Tab
+
+| Tab | Start here |
+| --- | --- |
+| **Graph controls** | Choose what to show and how to lay out the graph. |
+| **Call paths** | Pick a start and destination to see the captured connecting calls. |
+| **Dependency advisories** | Load a local OSV snapshot and check whether captured routes reach affected dependencies. |
+| **Comments and documentation** | Search by keyword and select a match to open its symbol or source. Expand semantic options to configure a trusted embedding endpoint. |
+| **Performance measurements** | Load a measurement snapshot or import request, then choose a benchmark or profile. |
+| **Entry points and effects** | Select an entry to follow reachable effects, or select an effect to trace possible entries. |
+| **Compare builds** | Export the current build with its query selectors, then compare two snapshots. |
+| **Test candidates** | Provide a function signature, expected behavior, and sample inputs to generate a reviewable Rust test. |
+| **Resources and concurrency** | Specify operations and any known bounds to inspect allocation, loop, or lock-order candidates. |
+| **Failure and cleanup** | Declare resource transitions and permitted exit states to check captured cleanup paths. |
+| **Required guards** | Identify the operation, guard callsites, and the arguments that must match. |
+| **Value flow** | Specify source and destination value positions to inspect supported flow through recorded operations. |
+| **Ordered paths** | Start at a function or entry and list the captured events in order. Add exclusions when needed. |
+
+Model-based analyses use editable JSON templates with exact captured IDs.
+Select a procedure or callsite in **Execution flow** to inspect its ID.
+Expand the evidence below a result for coverage, source references, and a
+replay request. Explicit embedding actions send comment or query text to the
+configured endpoint. The [agent analysis reference](agent-analysis.md)
+describes the request schemas and what each result can establish.
 
 ## Nightly + rustdoc-types Pin
 
@@ -154,6 +195,8 @@ Written to `target/build-graph/` or `--out`:
 - `graph.json` - emitted instead when `--no-compress` is set.
 - `graph.html` - force-directed viewer. Small graphs inline their data; large
   graphs fetch the data file beside the HTML and should be served over HTTP.
+- `graph-export.json` - definition identities, complete source spans where
+  captured, and extraction provenance. See [export metadata](export.md).
 - `GRAPH_REPORT.md` - counts, largest crates, and the most-connected nodes.
 
 Every command reads either `graph.json.gz` or `graph.json` transparently. The
