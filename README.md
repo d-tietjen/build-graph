@@ -7,8 +7,8 @@ compiler's view of your workspace.
 
 - an AI-readable architecture snapshot that can be updated in CI,
 - a queryable symbol/type/call graph for agents and humans,
-- and an offline dashboard for exploring crates, files, folders, symbols, and
-  relationships.
+- and a local browser viewer for exploring crates, symbols, calls, and compiled
+  execution flow.
 
 The practical loop is simple: generate the graph, let agents read
 `ARCHITECTURE.md` first, then use bounded `find`/`refs` queries when they need
@@ -71,60 +71,33 @@ inputs, backend choices, and agent guidance.
 ### Use The CLI Locally
 
 ```bash
-cargo install build-graph --features rustc-driver
+rustup toolchain install nightly-2026-02-27 --component rustc-dev --component llvm-tools-preview
+cargo install build-graph --locked --features rustc-driver
 
-cargo build-graph build --rich --driver
-cargo build-graph watch --driver
+cargo build-graph build --driver --nightly nightly-2026-02-27
 cargo build-graph view
 ```
 
-`build` refreshes once, `watch` refreshes on every save, and `view` opens the
-bundled HTML dashboard. Use `--references` instead of `--driver` when you want
-the rust-analyzer SCIP backend. Watch keeps Layer 1/2/3 as graph concepts, but
-save refreshes run one flattened extraction pass across every enabled layer.
+Use `cargo build-graph watch --driver --nightly nightly-2026-02-27` to refresh
+on save. The driver collects MIR during `cargo check`, so the execution model
+describes the recorded branches, loops, calls, and unwind paths of that build.
 
-The driver collects MIR flow during `cargo check`; it does not run or instrument
-the application. `graph.html` opens on **Architecture**, a unified graph of
-structural relationships and captured calls. Sidebar **Field** and **Function
-graph** presets filter the same graph; node and connection controls refine
-visibility, while **Network**, **Radial**, and **Tree** change its arrangement.
-Folder eyes control Rust toolchain, workspace, and dependency visibility.
-Clicking a function isolates
-its complete directed caller and callee reachability across captured call
-alternatives; possible dispatch and callback calls stay marked as uncertain.
-AND pins refine the selection and are shared with the full execution model.
+- Open **Graph controls** to switch between **Field** and **Function graph**,
+  choose a layout, or adjust package visibility.
+- Select a function to see its callers and callees. Use **Call paths** to find
+  the captured routes between two functions.
+- Open **Execution flow** for the full captured statechart. Use **Flamegraph**
+  or **UML sequence** on a function to inspect a bounded request variant.
 
-To audit every callable with no edge in the Function graph, run
-`node scripts/audit-call-graph.cjs --graph path/to/graph.json --out path/to/audit`.
-Add `--source-root path/to/matching/source` for lexical Rust identifier evidence.
-The command writes `call-graph-audit.json` and `call-graph-audit.md`; isolation
-does not establish that a function is unused.
+The [viewer walkthrough](docs/cli-reference.md#explore-the-viewer) covers every
+sidebar tab and explains how to read the results.
 
-**Execution flow** keeps every recorded MIR block and successor, including branches,
-loops, cleanup, and unwind transitions. Binary entry functions anchor the
-application section; disconnected or unknown-entry procedures remain in a
-separate section. Rounded procedure regions share their bodies, and callsite
-continuations remain tied to their own callers. Zoom into a region to inspect
-operation states and source locations. Pin procedures to highlight routes that
-contain all pins without discarding the rest of the model. Unknown external
-bodies and dynamic dispatch remain explicit coverage boundaries. Static branch
-feasibility is not solved. A `--references` graph without MIR bodies still shows
-its symbols in Architecture.
-
-From a function in Architecture, open **Flamegraph** or **UML sequence** for
-compiler-derived request flow examples. The variants share AND pins with the
-full statechart. Expand a frame to inspect its complete captured execution
-flow. Path, step, visit, depth, and state limits apply only to request flow
-examples; the full statechart remains available.
-
-The SCIP `--references` backend does not provide MIR flows. Flow extraction covers
-the current non-test library and binary build configuration;
-library test harnesses are excluded because the rich symbol catalog has no
-`cfg(test)` symbols.
+For symbols and references using the rust-analyzer SCIP backend, run the
+following with the matching nightly and the rust-analyzer component installed.
 
 ```bash
-cargo install build-graph
-cargo build-graph build --rich --references
+cargo install build-graph --locked
+cargo build-graph build --references --nightly nightly-2026-02-27
 ```
 
 See [docs/cli-reference.md](docs/cli-reference.md) for all commands, outputs,
@@ -137,7 +110,7 @@ crate you want graphed:
 
 ```toml
 [build-dependencies]
-build-graph = "0.2.1"
+build-graph = "0.3"
 ```
 
 ```rust
@@ -216,7 +189,7 @@ Artifacts are written to `target/build-graph/` by default:
 
 - `graph.json.gz` or `graph.json` - graphify-compatible data with deterministic
   IDs.
-- `graph.html` - the bundled offline viewer.
+- `graph.html` - the local browser viewer.
 - `graph-export.json` - versioned definition identities, full spans, and
   extraction provenance from the CLI; see [export metadata](docs/export.md).
 - `GRAPH_REPORT.md` - counts, largest crates, and highly connected nodes.
@@ -227,30 +200,13 @@ Artifacts are written to `target/build-graph/` by default:
 
 - [GitHub Action](docs/github-action.md)
 - [CLI, layers, outputs, and query reference](docs/cli-reference.md)
+- [Agent analysis API and replay](docs/agent-analysis.md)
+- [Changelog](CHANGELOG.md)
 - [VS Code extension](integrations/vscode/README.md)
 - [JetBrains/RustRover plugin](integrations/jetbrains/README.md)
+
+- [Linux Cargo launch observation protocol](docs/cargo-launch-intent.md)
 
 ## License
 
 MIT
-
-The feature-enabled Linux `build` route also supports an explicit inherited
-Cargo launch observer FD and opaque root correlation. See the
-[bounded generic protocol](docs/cargo-launch-intent.md) for invocation, sealed
-intent and ACK sequencing, privacy, failure ownership and remaining original
-parent qualification. It is disabled by default and does not change graph DTOs.
-
-Rich captures can retain exact comments and effective documentation for local
-search in the existing viewer and agent API. The **Comments and documentation**
-panel builds a lexical index by default. Explicitly configure a pinned embedding
-endpoint and invoke embedding actions to enable natural-language semantic search;
-no model call occurs during capture, index/import/load or replay. Results retain
-original occurrence/source citations and describe author intent, not execution
-or security proof. Older captures report missing comment coverage. See the
-[comment capture/search contracts](docs/agent-analysis.md#comments-and-documentation)
-for source limitations, offline vectors, bounds and endpoint configuration.
-
-Agents can compose bounded read-only program facts, existing value/guard analyses,
-joins and source-linked evidence slices through `programQuery` version 1 in the
-shared API, CLI/JSONL and browser worker/fallback. See the typed contract and
-combined declared-input example in [agent analysis](docs/agent-analysis.md#composable-program-queries-and-compact-evidence-slices).

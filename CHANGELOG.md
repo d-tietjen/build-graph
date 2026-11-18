@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format loosely
 follows [Keep a Changelog](https://keepachangelog.com/); this project uses
 semantic versioning.
 
+## 0.3.0
+
+### Added
+
+- **Compiled execution flow** with recorded MIR branches, loops, calls,
+  callbacks, and unwind transitions. Explore the full statechart or inspect a
+  bounded request variant as a flamegraph or UML sequence.
+- **Unified architecture and function graph** with Network, Radial, and Tree
+  layouts, folder visibility controls, directed call edges, and minimaps.
+  Captures include exact Cargo dependency identities and native call evidence
+  where compiled artifacts support it.
+- **Source-linked analysis** for call paths, entries and effects, local dependency
+  advisories, comments, performance measurements, and build comparisons. Replayable
+  queries expose the same captured evidence to viewers and agents.
+
+### Changed
+
+- Sidebar tabs explain their purpose, label inputs, and surface the main action.
+  Advanced options and detailed evidence are expandable.
+- For large captures, graph data streams into the analysis worker and the full
+  execution model transfers to the viewer on demand.
+- The GitHub Action uses 0.3.0 by default when installing from crates.io.
+
+### Fixed
+
+- Registry installs bundle the MIR capture module with the compiler driver.
+- CLI reference queries resolve a mapped MIR body through its declaration when
+  both match the same symbol name.
+
 ## 0.2.2
 
 ### Fixed
