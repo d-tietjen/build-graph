@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "source": {"name": "Local synthetic OSV regression snapshot", "uri": "file:///fixtures/advisories.json"},
+  "retrievedAt": "2026-11-01T00:00:00Z",
+  "asOf": "2026-11-16T00:00:00Z",
+  "advisories": [
+    {
+      "schema_version": "1.9.2", "id": "x_TEST-001", "modified": "2026-11-01T00:00:00Z",
+      "summary": "Package advisory; this prose is never a function selector",
+      "affected": [{"package": {"ecosystem": "crates.io", "name": "parser"}, "ranges": [{"type": "SEMVER", "events": [{"introduced": "1.0.0"}, {"fixed": "2.0.0"}]}]}],
+      "references": [{"type": "ADVISORY", "url": "https://example.invalid/advisory/x_TEST-001"}]
+    },
+    {
+      "id": "x_TEST-NATIVE", "modified": "2026-11-01T00:00:00Z",
+      "affected": [{"package": {"ecosystem": "native", "name": "unversioned-library"}, "versions": ["1.0.0"]}]
+    }
+  ],
+  "coordinateMappings": [],
+  "functionMappings": []
+}

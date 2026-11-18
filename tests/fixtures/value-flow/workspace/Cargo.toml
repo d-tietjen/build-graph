@@ -1,0 +1,10 @@
+[package]
+name = "value-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+value-dependency = { path = "dependency" }
+
+[workspace]
+members = ["dependency"]

@@ -98,13 +98,42 @@ Pass `--target-dir <path>` to reuse CLI build outputs.
 
 The driver replaces the SCIP pass: it runs `cargo check --all-targets` with the
 driver as `RUSTC_WORKSPACE_WRAPPER`, persists per-crate edge files under
-`<out>/driver-refs-v2`, and maps them onto Layer 2 nodes. It indexes the
+`<out>/driver-refs-v3`, and maps them onto Layer 2 nodes. It indexes the
 semantic def-reference graph, including macro-expanded HIR, not
 rust-analyzer's syntactic occurrence graph. Edge files include both source
 coordinates and resolved def paths, so macro-generated items can still map when
 their spans point at a macro definition or share an invocation line. Treat it as
 a faster compiler-grounded reference source rather than a byte-identical
 rust-analyzer clone.
+
+The bundled `graph.html` opens on **Architecture**, one graph combining structural
+relationships and captured calls. Sidebar **Field** and **Function graph**
+presets change visibility without replacing the graph. Node and connection
+controls refine what is shown; **Network**, **Radial**, and **Tree** arrange
+the same nodes. Folder eyes control Rust toolchain, workspace, and dependency
+visibility. Clicking a function isolates all directed
+upstream and downstream connections across captured call alternatives; possible
+dispatch and callback calls remain visibly uncertain. AND pins refine the
+selection and are shared with the full model. The **Execution flow** statechart
+is captured by rustc during `cargo check`, without running the program. It
+keeps all recorded MIR blocks and successors, including guards, loops,
+cleanup, and unwind transitions. Binary main functions anchor the application
+section; disconnected or unknown-entry procedures remain visible separately.
+Zoom into rounded procedure regions to inspect states and source locations.
+Click regions or states to AND-pin procedures; pin analysis ghosts routes outside
+the result while retaining the complete model. Unknown external bodies and
+dynamic targets remain explicit coverage boundaries. Static branch feasibility
+is not solved. Architecture also works with `--references` data without MIR bodies.
+
+The companion **Request flow** opens from a function or statechart procedure.
+It offers **Flamegraph** and **UML sequence** views of bounded compiler path
+examples. The selector includes compiled binary entries and a focused local
+witness; AND pins remain shared with the complete statechart. Expand a frame
+to inspect its full captured CFG. Unknown bodies, possible trait dispatch,
+panic/unwind scope, and search caps stay visible.
+
+Build with `--driver` if the flow view reports no data; SCIP references alone
+do not include MIR blocks.
 
 ## Nightly + rustdoc-types Pin
 

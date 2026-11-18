@@ -3,8 +3,10 @@
 //! `cargo build-graph <build|update|view>`.
 
 mod cache;
+mod capture_provenance;
 mod cargo_build;
 mod cargo_launch;
+mod comments;
 mod compiler_observer;
 mod depinfo;
 #[cfg(feature = "rustc-driver")]
@@ -13,6 +15,8 @@ mod driver_refs;
 mod explicit_toolchain;
 mod export_sources;
 mod metadata;
+#[cfg(feature = "rustc-driver")]
+mod native;
 mod qserve;
 mod query;
 mod render;
@@ -454,15 +458,24 @@ fn build_and_extract_scoped(
             .context("launch observer requires selected Cargo")?
             .set_launch_observer(observer)?;
     }
+    let manifest = common.manifest_path.as_ref().map(Utf8PathBuf::from);
+    let starting_meta = metadata::load_routed(manifest.as_deref(), selected_cargo.as_mut())?;
+    let capture_start = capture_provenance::Start::capture(
+        common.manifest_path.as_deref(),
+        &starting_meta,
+        common.release,
+        &common.packages,
+        cargo_args,
+        common.nightly.as_deref(),
+        do_build,
+    );
     let mut observations = None;
     let mut selected_observation = None;
     let compiled = if do_build {
-        let manifest = common.manifest_path.as_ref().map(Utf8PathBuf::from);
         let mut session = if common.observe_compiler_inputs {
-            let meta = metadata::load_routed(manifest.as_deref(), selected_cargo.as_mut())?;
-            let target = meta.target_directory.as_std_path().to_path_buf();
+            let target = starting_meta.target_directory.as_std_path().to_path_buf();
             Some(compiler_observer::Session::new(
-                meta,
+                starting_meta,
                 &target,
                 &common.compiler_input_root,
             )?)
@@ -542,7 +555,6 @@ fn build_and_extract_scoped(
     } else {
         None
     };
-    let manifest = common.manifest_path.as_ref().map(Utf8PathBuf::from);
     let meta = metadata::load_routed(manifest.as_deref(), selected_cargo.as_mut())?;
     run_extract_observed_with_scope(
         common,
@@ -553,6 +565,7 @@ fn build_and_extract_scoped(
         selected_observation,
         selected_cargo,
         scope,
+        Some((capture_start, cargo_args)),
     )
 }
 
@@ -705,6 +718,173 @@ fn workspace_fingerprint(root: &Utf8Path, excludes: &[std::path::PathBuf]) -> u6
     hasher.finish()
 }
 
+#[cfg(feature = "rustc-driver")]
+fn driver_input_fingerprint(
+    meta: &cargo_metadata::Metadata,
+    out: &Utf8Path,
+    target_dir: &Utf8Path,
+    options: &CommonArgs,
+) -> Result<String> {
+    fn feed(hash: &mut u64, bytes: &[u8]) {
+        for byte in bytes {
+            *hash = (*hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3);
+        }
+        *hash = (*hash ^ 0xff).wrapping_mul(0x100000001b3);
+    }
+    let mut hash = 0xcbf29ce484222325_u64;
+    feed(&mut hash, &serde_json::to_vec(&meta.resolve)?);
+    let mut packages: Vec<_> = meta.packages.iter().collect();
+    packages.sort_by(|left, right| left.id.repr.cmp(&right.id.repr));
+    for package in packages {
+        feed(&mut hash, package.id.repr.as_bytes());
+        feed(&mut hash, package.manifest_path.as_str().as_bytes());
+        feed(
+            &mut hash,
+            &std::fs::read(package.manifest_path.as_std_path()).unwrap_or_default(),
+        );
+    }
+    feed(
+        &mut hash,
+        &std::fs::read(meta.workspace_root.join("Cargo.lock")).unwrap_or_default(),
+    );
+    feed(
+        &mut hash,
+        options
+            .nightly
+            .as_deref()
+            .unwrap_or(DEFAULT_DRIVER_NIGHTLY)
+            .as_bytes(),
+    );
+    let configured_driver = options
+        .driver_bin
+        .as_ref()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("BUILD_GRAPH_DRIVER").map(std::path::PathBuf::from));
+    if let Some(binary) = configured_driver {
+        feed(&mut hash, binary.to_string_lossy().as_bytes());
+        feed(&mut hash, &std::fs::read(binary).unwrap_or_default());
+    } else {
+        let source = std::env::var_os("BUILD_GRAPH_DRIVER_SRC")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/bg-driver")
+            });
+        for path in ["Cargo.toml", "src/main.rs", "src/flow.rs"] {
+            let path = source.join(path);
+            feed(&mut hash, path.to_string_lossy().as_bytes());
+            feed(&mut hash, &std::fs::read(path).unwrap_or_default());
+        }
+    }
+    // Cargo build scripts may read C, C++, headers, or other local inputs
+    // without changing any Rust dep-info. Hash local path packages' source
+    // trees, excluding build/cache outputs, so these inputs retrigger capture.
+    let excluded: Vec<_> = [target_dir, out, &meta.target_directory]
+        .iter()
+        .filter_map(|path| std::fs::canonicalize(path.as_std_path()).ok())
+        .collect();
+    let mut local_files = HashSet::new();
+    for package in &meta.packages {
+        if package.source.is_some() {
+            continue;
+        }
+        let Some(root) = package.manifest_path.parent() else {
+            continue;
+        };
+        for entry in walkdir::WalkDir::new(root.as_std_path())
+            .into_iter()
+            .filter_entry(|entry| {
+                let path = entry.path();
+                !is_excluded(path, &excluded)
+                    && !path
+                        .components()
+                        .any(|component| component.as_os_str() == "target")
+            })
+            .flatten()
+        {
+            if entry.file_type().is_file() {
+                local_files.insert(entry.path().to_path_buf());
+            }
+        }
+    }
+    let mut local_files: Vec<_> = local_files.into_iter().collect();
+    local_files.sort();
+    for path in local_files {
+        feed(&mut hash, path.to_string_lossy().as_bytes());
+        feed(&mut hash, &std::fs::read(path).unwrap_or_default());
+    }
+    // Native build-script outputs can change independently of Rust source.
+    let artifact_bytes = std::fs::read(out.join("driver-artifacts-v1.json")).unwrap_or_default();
+    feed(&mut hash, &artifact_bytes);
+    if !artifact_bytes.is_empty() {
+        if let Ok(index) = serde_json::from_slice::<serde_json::Value>(&artifact_bytes) {
+            let mut native_files = HashSet::new();
+            if let Some(links) = index["native_links"].as_array() {
+                for link in links {
+                    let Some(dir) = link["out_dir"].as_str() else {
+                        continue;
+                    };
+                    for entry in walkdir::WalkDir::new(dir).into_iter().flatten() {
+                        if entry.file_type().is_file() {
+                            native_files.insert(entry.path().to_path_buf());
+                        }
+                    }
+                }
+            }
+            let mut native_files: Vec<_> = native_files.into_iter().collect();
+            native_files.sort();
+            for path in native_files {
+                feed(&mut hash, path.to_string_lossy().as_bytes());
+                feed(&mut hash, &std::fs::read(path).unwrap_or_default());
+            }
+        }
+    }
+    let mut sources = HashSet::new();
+    if let Ok(entries) = std::fs::read_dir(out.join("driver-flows-v11")) {
+        for entry in entries.flatten() {
+            if entry.path().extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            let Ok(unit) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+                continue;
+            };
+            let manifest_dir = unit["manifest_dir"].as_str().unwrap_or("");
+            let Some(flows) = unit["flows"].as_array() else {
+                continue;
+            };
+            for flow in flows {
+                let Some(source) = flow["source_file"].as_str() else {
+                    continue;
+                };
+                let path = Utf8Path::new(source);
+                let path = if path.is_absolute() {
+                    path.to_path_buf()
+                } else {
+                    let workspace_path = meta.workspace_root.join(path);
+                    if workspace_path.as_std_path().exists() {
+                        workspace_path
+                    } else {
+                        Utf8Path::new(manifest_dir).join(path)
+                    }
+                };
+                sources.insert(path);
+            }
+        }
+    }
+    let mut sources: Vec<_> = sources.into_iter().collect();
+    sources.sort();
+    for path in sources {
+        feed(&mut hash, path.as_str().as_bytes());
+        feed(
+            &mut hash,
+            &std::fs::read(path.as_std_path()).unwrap_or_default(),
+        );
+    }
+    Ok(format!("{hash:016x}"))
+}
+
 fn should_extract_crate(
     scope: ExtractScope,
     compatible_cache: bool,
@@ -719,7 +899,26 @@ fn should_extract_crate(
 fn run_extract(c: &CommonArgs, compiled: Option<&[cargo_build::CompiledTarget]>) -> Result<()> {
     let manifest = c.manifest_path.as_ref().map(Utf8PathBuf::from);
     let meta = metadata::load(manifest.as_deref())?;
-    run_extract_with_item_layer(c, compiled, meta, rustdoc::add_item_layer)
+    let start = capture_provenance::Start::capture(
+        c.manifest_path.as_deref(),
+        &meta,
+        c.release,
+        &c.packages,
+        &[],
+        c.nightly.as_deref(),
+        compiled.is_some(),
+    );
+    run_extract_observed_with_scope(
+        c,
+        compiled,
+        meta,
+        rustdoc::add_item_layer,
+        None,
+        None,
+        None,
+        ExtractScope::Incremental,
+        Some((start, &[])),
+    )
 }
 
 type ItemLayerExtractor = fn(
@@ -730,35 +929,26 @@ type ItemLayerExtractor = fn(
     &[String],
     bool,
     bool,
+    &[String],
 ) -> Result<rustdoc::ItemLayerResult>;
 
+#[cfg(test)]
 fn run_extract_with_item_layer(
     c: &CommonArgs,
     compiled: Option<&[cargo_build::CompiledTarget]>,
     meta: cargo_metadata::Metadata,
     extract_items: ItemLayerExtractor,
 ) -> Result<()> {
-    run_extract_observed(c, compiled, meta, extract_items, None, None, None)
-}
-
-fn run_extract_observed(
-    c: &CommonArgs,
-    compiled: Option<&[cargo_build::CompiledTarget]>,
-    meta: cargo_metadata::Metadata,
-    extract_items: ItemLayerExtractor,
-    compiler_invocations: Option<build_graph::compiler_invocation::CompilerInvocationsV1>,
-    compiler_observation: Option<compiler_observer::Session>,
-    selected_cargo: Option<cargo_launch::CargoLaunchSession>,
-) -> Result<()> {
     run_extract_observed_with_scope(
         c,
         compiled,
         meta,
         extract_items,
-        compiler_invocations,
-        compiler_observation,
-        selected_cargo,
+        None,
+        None,
+        None,
         ExtractScope::Incremental,
+        None,
     )
 }
 
@@ -771,6 +961,7 @@ fn run_extract_observed_with_scope(
     compiler_observation: Option<compiler_observer::Session>,
     mut selected_cargo: Option<cargo_launch::CargoLaunchSession>,
     scope: ExtractScope,
+    capture: Option<(capture_provenance::Start, &[String])>,
 ) -> Result<()> {
     let target_dir = c
         .target_dir
@@ -796,10 +987,25 @@ fn run_extract_observed_with_scope(
     let cache_path = out.join(cache::CACHE_FILE);
     let existing = build_graph::output::find_graph(out.as_std_path());
     let prior = cache::Cache::load(cache_path.as_std_path());
+    #[cfg(feature = "rustc-driver")]
+    let driver_inputs = if c.driver_requested() {
+        Some(driver_input_fingerprint(&meta, &out, &target_dir, c)?)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "rustc-driver"))]
+    let driver_inputs: Option<String> = None;
+    let prior_driver_inputs = prior.as_ref().and_then(|cache| cache.driver_inputs.clone());
+    let driver_changed = c.driver_requested() && prior_driver_inputs != driver_inputs;
     let compatible = scope == ExtractScope::Incremental
         && prior
             .as_ref()
-            .map(|p| p.rich == rich && p.no_derives == c.no_derives && p.references == references)
+            .map(|p| {
+                p.rich == rich
+                    && p.no_derives == c.no_derives
+                    && p.references == references
+                    && p.driver == c.driver_requested()
+            })
             .unwrap_or(false)
         && existing.is_some();
     let mut prior_export = None;
@@ -839,17 +1045,59 @@ fn run_extract_observed_with_scope(
     let mut current: BTreeMap<String, String> = BTreeMap::new();
     let mut all_sources: HashMap<String, Vec<depinfo::SourceFile>> = HashMap::new();
     let mut dirty = HashSet::new();
+    let mut comment_cache_qualified = HashMap::<String, bool>::new();
+    let comment_context = (rich && capture.is_some()).then(|| {
+        comments::selected_context(
+            &meta,
+            target_dir.as_std_path(),
+            c.nightly.as_deref().unwrap_or("nightly"),
+            c.release,
+            &c.packages,
+        )
+    });
     for &pkg in &ws_pkgs {
         let manifest_dir = pkg
             .manifest_path
             .parent()
             .unwrap_or(meta.workspace_root.as_path());
-        let srcs = depidx.crate_sources(
-            &rustdoc::lib_crate_name(pkg),
-            manifest_dir,
-            &meta.workspace_root,
-        );
-        let fp = depinfo::fingerprint(&srcs);
+        let mut srcs: Vec<_> = pkg
+            .targets
+            .iter()
+            .filter(|target| rustdoc::is_documentable_target(target))
+            .flat_map(|target| {
+                depidx.crate_sources(
+                    &target.name.replace('-', "_"),
+                    &target.src_path,
+                    manifest_dir,
+                    &meta.workspace_root,
+                )
+            })
+            .collect();
+        srcs.sort_by(|a, b| a.rel.cmp(&b.rel));
+        srcs.dedup_by(|a, b| a.rel == b.rel);
+        let mut fp = depinfo::fingerprint(&srcs);
+        if comment_context.is_some() {
+            fp.push_str(&comments::fingerprint(manifest_dir.as_std_path()));
+        }
+        let comment_targets: Vec<_> = pkg
+            .targets
+            .iter()
+            .filter(|t| rustdoc::is_documentable_target(t))
+            .map(|t| serde_json::json!({"name":t.name,"kind":t.kind,"source":t.src_path}))
+            .collect();
+        let comments_current = comment_context.as_ref().is_some_and(|context| {
+            comments::cache_matches(
+                &graph,
+                meta.workspace_root.as_std_path(),
+                target_dir.as_std_path(),
+                &pkg.id.repr,
+                c.nightly.as_deref().unwrap_or("nightly"),
+                c.release,
+                &comment_targets,
+                context,
+            )
+        });
+        comment_cache_qualified.insert(pkg.id.repr.clone(), comments_current);
         let export_reusable = prior_export.as_ref().is_some_and(|manifest| {
             manifest.sources.get(&pkg.name) == sources.get(&pkg.name)
                 && sources
@@ -877,6 +1125,7 @@ fn run_extract_observed_with_scope(
             &fp,
         ) || !export_reusable
             || !items_reusable
+            || rich && comment_context.is_some() && !comments_current
         {
             dirty.insert(pkg.name.clone());
         }
@@ -889,6 +1138,7 @@ fn run_extract_observed_with_scope(
         .cloned()
         .collect();
     expand_dirty_namespaces(&mut dirty, &removed, &current);
+    let mut driver_layer_valid = compatible && !driver_changed && dirty.is_empty();
     let dirty_sources: HashMap<_, _> = all_sources
         .into_iter()
         .filter(|(name, _)| dirty.contains(name))
@@ -908,10 +1158,12 @@ fn run_extract_observed_with_scope(
                 Some("layer not requested")
             } else if !want.is_empty() && !want.contains(pkg.name.as_str()) {
                 Some("package outside requested item scope")
-            } else if !pkg.targets.iter().any(rustdoc::is_lib_target) {
-                Some("no library target")
-            } else if !pkg.targets.iter().any(rustdoc::is_documented_lib_target) {
-                Some("library documentation disabled")
+            } else if !pkg.targets.iter().any(rustdoc::is_documentable_target) {
+                Some(if pkg.targets.iter().any(rustdoc::is_lib_target) {
+                    "library documentation disabled"
+                } else {
+                    "no documented library or binary target"
+                })
             } else {
                 None
             };
@@ -975,13 +1227,90 @@ fn run_extract_observed_with_scope(
     if references {
         reference_report.status = ExtractionStatus::Partial;
     }
+
+    let qualified_comment_packages = comment_cache_qualified
+        .iter()
+        .filter(|(_, valid)| **valid)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let recaptured_comment_packages = ws_pkgs
+        .iter()
+        .filter(|pkg| dirty.contains(&pkg.name))
+        .map(|pkg| pkg.id.repr.clone())
+        .collect();
+    let affected_comment_crates = dirty
+        .iter()
+        .chain(removed.iter())
+        .map(|name| norm(name))
+        .collect();
+    let preserved_comment_carriers = comments::preserve_carriers(
+        &graph,
+        &qualified_comment_packages,
+        &recaptured_comment_packages,
+        &affected_comment_crates,
+    );
     // Drop changed/removed crates before re-extracting them.
     for name in dirty.iter().chain(removed.iter()) {
         graph.remove_crate(&norm(name));
     }
+    for carrier in preserved_comment_carriers {
+        graph.add_node(carrier);
+    }
 
     // Layer 1: crate + dependency edges (cheap, always fresh).
+    let retain_capture_summary = c.driver_requested()
+        && driver_layer_valid
+        && out.join("driver-import-report-v1.json").is_file()
+        && std::fs::read_dir(out.join("driver-flows-v11"))
+            .ok()
+            .is_some_and(|entries| {
+                entries.flatten().any(|entry| {
+                    entry.path().extension().and_then(|ext| ext.to_str()) == Some("json")
+                })
+            });
+    let prior_summaries: HashMap<String, Vec<(String, String)>> = if retain_capture_summary {
+        graph
+            .node_values()
+            .filter(|node| node.attributes.get("kind").map(String::as_str) == Some("crate"))
+            .filter_map(|node| {
+                let attributes: Vec<_> = ["capture_summary", "build_units", "cargo_build_evidence"]
+                    .into_iter()
+                    .filter_map(|key| {
+                        node.attributes
+                            .get(key)
+                            .map(|value| (key.to_string(), value.clone()))
+                    })
+                    .collect();
+                (!attributes.is_empty())
+                    .then(|| (node.attributes.get("package_id").cloned(), attributes))
+                    .and_then(|(package_id, attributes)| package_id.map(|id| (id, attributes)))
+            })
+            .collect()
+    } else {
+        HashMap::new()
+    };
     metadata::add_crate_layer(&mut graph, &meta);
+    if !prior_summaries.is_empty() {
+        let package_nodes: HashMap<String, String> = graph
+            .node_values()
+            .filter(|node| node.attributes.get("kind").map(String::as_str) == Some("crate"))
+            .filter_map(|node| {
+                node.attributes
+                    .get("package_id")
+                    .map(|id| (id.clone(), node.id.clone()))
+            })
+            .collect();
+        for (package_id, attributes) in prior_summaries {
+            if let Some(node) = package_nodes
+                .get(&package_id)
+                .and_then(|id| graph.node_mut(id))
+            {
+                // Retained reports describe the original valid capture. Reuse
+                // does not establish fresh script execution or a new writer.
+                node.attributes.extend(attributes);
+            }
+        }
+    }
 
     // Layer 1: source files for the dirty crates only.
     let mut files = 0usize;
@@ -1000,7 +1329,7 @@ fn run_extract_observed_with_scope(
             .iter()
             .filter(|p| dirty.contains(&p.name))
             .filter(|p| want.is_empty() || want.contains(p.name.as_str()))
-            .filter(|p| p.targets.iter().any(rustdoc::is_documented_lib_target))
+            .filter(|p| p.targets.iter().any(rustdoc::is_documentable_target))
             .map(|p| p.name.clone())
             .collect();
         if rich_dirty.is_empty() {
@@ -1012,9 +1341,11 @@ fn run_extract_observed_with_scope(
                     &mut graph,
                     &meta,
                     &target_dir,
+                    c.nightly.as_deref(),
                     &rich_dirty,
                     c.release,
                     c.no_derives,
+                    &c.packages,
                     selected,
                 )
             } else {
@@ -1026,6 +1357,7 @@ fn run_extract_observed_with_scope(
                     &rich_dirty,
                     c.release,
                     c.no_derives,
+                    &c.packages,
                 )
             }?;
             definitions.extend(result.definitions);
@@ -1043,7 +1375,7 @@ fn run_extract_observed_with_scope(
         // Layer 3 (semantic) — body-level calls/uses. Two backends: the rustc
         // driver (incremental; only changed crates re-run) or rust-analyzer SCIP
         // (cold whole-workspace index). Only (re)run when something changed.
-        if references && !dirty.is_empty() {
+        if references && (!dirty.is_empty() || driver_changed) {
             let t3 = std::time::Instant::now();
             let result;
             let backend;
@@ -1065,6 +1397,7 @@ fn run_extract_observed_with_scope(
                     }
                     driver_refs::add_references_layer(
                         &mut graph,
+                        &meta,
                         &meta.workspace_root,
                         &out,
                         &bin,
@@ -1087,6 +1420,9 @@ fn run_extract_observed_with_scope(
                     reference_report.reason = Some(format!(
                         "{backend} completed; per-target reference coverage is not measured"
                     ));
+                    if c.driver_requested() {
+                        driver_layer_valid = true;
+                    }
                     eprintln!(
                         "[build-graph] layer 3: +{} calls, +{} uses, +{} member_calls, +{} member_uses edge(s) ({backend}, {:.1}s)",
                         counts.calls,
@@ -1095,18 +1431,45 @@ fn run_extract_observed_with_scope(
                         counts.member_uses,
                         t3.elapsed().as_secs_f64()
                     );
+                    #[cfg(feature = "rustc-driver")]
+                    if c.driver_requested() {
+                        let report = native::add_native_layer(&mut graph, &meta, &out)?;
+                        eprintln!(
+                            "[build-graph] native layer: {} libraries, {} function boundaries, {} defined functions, {} direct calls, {} FFI targets, {} unresolved",
+                            report.libraries,
+                            report.boundaries,
+                            report.functions,
+                            report.direct_calls,
+                            report.ffi_targets,
+                            report.unresolved
+                        );
+                    }
                 }
                 Err(e) => {
                     reference_report.status = ExtractionStatus::Skipped;
                     reference_report.reason = Some(format!(
                         "references skipped: {e:#}; retained reference artifacts have unknown freshness"
                     ));
+                    #[cfg(feature = "rustc-driver")]
+                    if c.driver_requested() {
+                        return Err(e.context("rustc driver reference layer failed"));
+                    }
                     eprintln!("[build-graph] layer 3: references skipped — {e:#}");
                 }
             }
         }
     }
 
+    if let Some((start, cargo_args)) = capture {
+        start.attach(
+            &mut graph,
+            &meta,
+            c.release,
+            &c.packages,
+            cargo_args,
+            c.nightly.as_deref(),
+        );
+    }
     graph.prune_dangling_edges();
     let mut source_reports = Vec::new();
     for pkg in &ws_pkgs {
@@ -1208,9 +1571,27 @@ fn run_extract_observed_with_scope(
         .with_context(|| format!("writing graph to {out}"))?;
     build_graph::output::write_export(out.as_std_path(), &export)
         .with_context(|| format!("writing export metadata to {out}"))?;
-    cache::Cache::new(rich, c.no_derives, references, current)
-        .save(cache_path.as_std_path())
-        .with_context(|| format!("writing cache to {cache_path}"))?;
+    cache::Cache::new(
+        rich,
+        c.no_derives,
+        references,
+        c.driver_requested(),
+        if c.driver_requested() && driver_layer_valid {
+            #[cfg(feature = "rustc-driver")]
+            {
+                Some(driver_input_fingerprint(&meta, &out, &target_dir, c)?)
+            }
+            #[cfg(not(feature = "rustc-driver"))]
+            {
+                None
+            }
+        } else {
+            None
+        },
+        current,
+    )
+    .save(cache_path.as_std_path())
+    .with_context(|| format!("writing cache to {cache_path}"))?;
     eprintln!("[build-graph] wrote {out}/{wrote} ({nodes} nodes, {edges} edges)");
     eprintln!("[build-graph] view: cargo build-graph view --out {out}");
     Ok(())
@@ -1490,6 +1871,7 @@ mod tests {
         packages: &[String],
         _release: bool,
         _no_derives: bool,
+        _selected_packages: &[String],
     ) -> Result<rustdoc::ItemLayerResult> {
         let mut result = rustdoc::ItemLayerResult {
             items: 0,
@@ -1748,6 +2130,7 @@ mod tests {
         packages: &[String],
         _release: bool,
         _no_derives: bool,
+        _selected_packages: &[String],
     ) -> Result<rustdoc::ItemLayerResult> {
         assert_eq!(packages, &["pkg-a", "pkg_a"]);
         bail!("forced item refresh reached both unchanged packages")
@@ -1770,6 +2153,7 @@ mod tests {
             None,
             None,
             ExtractScope::Incremental,
+            None,
         )
         .expect("ordinary refresh reuses both complete cached packages");
 
@@ -1784,6 +2168,7 @@ mod tests {
             None,
             None,
             ExtractScope::AllCrates,
+            None,
         )
         .expect_err("watched save invokes the item extractor");
         assert_eq!(

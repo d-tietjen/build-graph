@@ -11,7 +11,8 @@ use std::path::Path;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
-pub const CACHE_VERSION: u32 = 2;
+// Rebuild captures with artifact evidence for every loaded compiler crate format.
+pub const CACHE_VERSION: u32 = 20;
 pub const CACHE_FILE: &str = ".build-graph-cache.json";
 
 #[derive(Serialize, Deserialize, Default)]
@@ -26,6 +27,13 @@ pub struct Cache {
     /// reference edges (`--references`).
     #[serde(default)]
     pub references: bool,
+    /// The driver and SCIP produce different semantic layers; never reuse one
+    /// backend's graph for the other.
+    #[serde(default)]
+    pub driver: bool,
+    /// Cargo resolution, manifests, lockfile, and captured dependency sources.
+    #[serde(default)]
+    pub driver_inputs: Option<String>,
     /// crate name -> dep-info fingerprint (mtime nanos, as a string).
     pub crates: BTreeMap<String, String>,
 }
@@ -35,6 +43,8 @@ impl Cache {
         rich: bool,
         no_derives: bool,
         references: bool,
+        driver: bool,
+        driver_inputs: Option<String>,
         crates: BTreeMap<String, String>,
     ) -> Self {
         Cache {
@@ -42,6 +52,8 @@ impl Cache {
             rich,
             no_derives,
             references,
+            driver,
+            driver_inputs,
             crates,
         }
     }

@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "origin": "real upstream perf script profile, not a synthetic benchmark",
+  "repository": "https://github.com/brendangregg/FlameGraph",
+  "commit": "41fee1f99f9276008b7cd112fca19dc3ea84ac32",
+  "url": "https://raw.githubusercontent.com/brendangregg/FlameGraph/41fee1f99f9276008b7cd112fca19dc3ea84ac32/example-perf-stacks.txt.gz",
+  "upstreamGzipSha256": "ad0d2cb09dba33c492893e6010adcc4806431b8a351b31798b7a4a2deddab7e5",
+  "upstreamDecodedSha256": "8e218c540a32c45bf3bcd206f9866fec28e97f76f3f1e3ce4222e6b729435617",
+  "excerptSha256": "11f1e40b67174db9210fb0eda9fc5086ccf20b47e0b784332d64f6c86a826994",
+  "foldedSha256": "00347f0ed8ade6a2117b8fe6f7082e2ad8e4c42b3271b71768b3338151d9c6dd",
+  "sampleRecords": 16,
+  "derivation": "First 16 complete records after perf header; drop instruction addresses and DSO parentheticals, preserve each symbol as one label, reverse leaf-first frames, prepend process name, then encode each label by replacing percent with %25 and semicolon with %3B before semicolon joining; decode %3B then %25 exactly once. Aggregate identical encoded stacks with one count per record; no inline reconstruction or new profiling run. This is a deliberately small excerpt, not the complete source profile. Encoding is a fixture derivation, not a change to the folded import format.",
+  "collection": {
+    "timeAsReported": "Thu Jul  9 17:14:37 2015",
+    "event": "cycles",
+    "commandAsReported": "/usr/lib/linux-tools-3.13.0-44/perf record -F 99 -a -g -- sleep 10",
+    "hostAsReported": "lgud-bgregg",
+    "architecture": "x86_64"
+  },
+  "license": "Upstream provided example profile data; attribution retained. No upstream program code copied."
+}

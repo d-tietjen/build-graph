@@ -18,6 +18,8 @@ extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 
+mod flow;
+
 use rustc_driver::{Callbacks, Compilation};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::intravisit::{self, Visitor};
@@ -104,6 +106,9 @@ fn extract(
     #[cfg(target_os = "linux")] controls: &held_callback_control::InheritedControls,
 ) {
     let krate = tcx.crate_name(LOCAL_CRATE);
+    if let Ok(dir) = std::env::var("BG_DRIVER_FLOWS") {
+        flow::write_unit(tcx, &dir, &unit_key(tcx, &krate.to_string()));
+    }
     let mut calls: usize = 0;
     let mut method_calls: usize = 0;
     let mut cross_crate: usize = 0;

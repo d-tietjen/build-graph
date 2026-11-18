@@ -25,14 +25,58 @@ use crate::export::{EXPORT_FILE, EXPORT_SCHEMA_VERSION, ExportManifest};
 use crate::graph::GraphJson;
 
 const VIEWER_TEMPLATE: &str = include_str!("viewer.html");
+const EXECUTION_FLOW_JS: &str = include_str!("execution-flow.js");
+const FLOW_MAP_JS: &str = include_str!("flow-map.js");
+const CALL_GRAPH_JS: &str = include_str!("call-graph.js");
+const ARCHITECTURE_ORGANIZATION_JS: &str = include_str!("architecture-organization.js");
+const SUPPLY_CHAIN_JS: &str = include_str!("supply-chain.js");
+const EXECUTION_MODEL_JS: &str = include_str!("execution-model.js");
+const VALUE_FLOW_JS: &str = include_str!("value-flow.js");
+const FAILURE_OBLIGATIONS_JS: &str = include_str!("failure-obligations.js");
+const RESOURCE_RISKS_JS: &str = include_str!("resource-risks.js");
+const GUARD_OBLIGATIONS_JS: &str = include_str!("guard-obligations.js");
+const ANALYSIS_SNAPSHOT_JS: &str = include_str!("analysis-snapshot.js");
+const REVISION_COMPARISON_JS: &str = include_str!("revision-comparison.js");
+const TEST_CANDIDATES_JS: &str = include_str!("test-candidates.js");
+const COMMENT_SEARCH_JS: &str = include_str!("comment-search.js");
+const PERFORMANCE_MEASUREMENTS_JS: &str = include_str!("performance-measurements.js");
+const ANALYSIS_EVIDENCE_JS: &str = include_str!("analysis-evidence.js");
+const PROGRAM_QUERIES_JS: &str = include_str!("program-queries.js");
+const CALL_PATHS_JS: &str = include_str!("call-paths.js");
+const ADVISORY_EXPOSURE_JS: &str = include_str!("advisory-exposure.js");
+const ENTRY_EFFECTS_JS: &str = include_str!("entry-effects.js");
+const EXECUTION_MODEL_VIEW_JS: &str = include_str!("execution-model-view.js");
+const TRACE_WATERFALL_JS: &str = include_str!("trace-waterfall.js");
 /// Replaced with the JSON payload; lives inside a `<script type="application/json">`.
 const PLACEHOLDER: &str = "/*__GRAPH_DATA__*/";
 /// Replaced with the filename the viewer fetches when the data isn't inlined —
 /// `graph.json.gz` (compressed) or `graph.json` (plain). The viewer sniffs the
 /// fetched bytes for gzip magic and inflates if needed, so this is just a hint.
 const SRC_PLACEHOLDER: &str = "__GRAPH_SRC__";
-/// Replaced with the dashboard title shown in the sidebar.
+/// Replaced with the capture name in the browser tab title.
 const TITLE_PLACEHOLDER: &str = "__GRAPH_TITLE__";
+const FLOW_JS_PLACEHOLDER: &str = "/*__EXECUTION_FLOW_JS__*/";
+const FLOW_MAP_JS_PLACEHOLDER: &str = "/*__FLOW_MAP_JS__*/";
+const CALL_GRAPH_JS_PLACEHOLDER: &str = "/*__CALL_GRAPH_JS__*/";
+const ARCHITECTURE_ORGANIZATION_JS_PLACEHOLDER: &str = "/*__ARCHITECTURE_ORGANIZATION_JS__*/";
+const SUPPLY_CHAIN_JS_PLACEHOLDER: &str = "/*__SUPPLY_CHAIN_JS__*/";
+const EXECUTION_MODEL_JS_PLACEHOLDER: &str = "/*__EXECUTION_MODEL_JS__*/";
+const VALUE_FLOW_JS_PLACEHOLDER: &str = "/*__VALUE_FLOW_JS__*/";
+const FAILURE_OBLIGATIONS_JS_PLACEHOLDER: &str = "/*__FAILURE_OBLIGATIONS_JS__*/";
+const RESOURCE_RISKS_JS_PLACEHOLDER: &str = "/*__RESOURCE_RISKS_JS__*/";
+const GUARD_OBLIGATIONS_JS_PLACEHOLDER: &str = "/*__GUARD_OBLIGATIONS_JS__*/";
+const ANALYSIS_SNAPSHOT_JS_PLACEHOLDER: &str = "/*__ANALYSIS_SNAPSHOT_JS__*/";
+const REVISION_COMPARISON_JS_PLACEHOLDER: &str = "/*__REVISION_COMPARISON_JS__*/";
+const TEST_CANDIDATES_JS_PLACEHOLDER: &str = "/*__TEST_CANDIDATES_JS__*/";
+const COMMENT_SEARCH_JS_PLACEHOLDER: &str = "/*__COMMENT_SEARCH_JS__*/";
+const PERFORMANCE_MEASUREMENTS_JS_PLACEHOLDER: &str = "/*__PERFORMANCE_MEASUREMENTS_JS__*/";
+const ANALYSIS_EVIDENCE_JS_PLACEHOLDER: &str = "/*__ANALYSIS_EVIDENCE_JS__*/";
+const PROGRAM_QUERIES_JS_PLACEHOLDER: &str = "/*__PROGRAM_QUERIES_JS__*/";
+const CALL_PATHS_JS_PLACEHOLDER: &str = "/*__CALL_PATHS_JS__*/";
+const ADVISORY_EXPOSURE_JS_PLACEHOLDER: &str = "/*__ADVISORY_EXPOSURE_JS__*/";
+const ENTRY_EFFECTS_JS_PLACEHOLDER: &str = "/*__ENTRY_EFFECTS_JS__*/";
+const EXECUTION_MODEL_VIEW_JS_PLACEHOLDER: &str = "/*__EXECUTION_MODEL_VIEW_JS__*/";
+const TRACE_WATERFALL_JS_PLACEHOLDER: &str = "/*__TRACE_WATERFALL_JS__*/";
 
 /// The plain (uncompressed) graph data filename.
 pub const GRAPH_JSON: &str = "graph.json";
@@ -151,7 +195,7 @@ pub fn write_graph(out_dir: &Path, doc: &GraphJson, compress: bool) -> io::Resul
     write_graph_with_title(out_dir, doc, compress, "build-graph")
 }
 
-/// Write a graph using a custom sidebar title in `graph.html`.
+/// Write a graph using a custom browser tab title in `graph.html`.
 pub fn write_graph_with_title(
     out_dir: &Path,
     doc: &GraphJson,
@@ -182,7 +226,32 @@ pub fn write_graph_with_title(
     // huge — data is embedded), so the substitution can't touch node labels.
     let template = VIEWER_TEMPLATE
         .replace(SRC_PLACEHOLDER, src_name)
-        .replace(TITLE_PLACEHOLDER, &escape_html(title));
+        .replace(TITLE_PLACEHOLDER, &escape_html(title))
+        .replace(FLOW_JS_PLACEHOLDER, EXECUTION_FLOW_JS)
+        .replace(FLOW_MAP_JS_PLACEHOLDER, FLOW_MAP_JS)
+        .replace(CALL_GRAPH_JS_PLACEHOLDER, CALL_GRAPH_JS)
+        .replace(ARCHITECTURE_ORGANIZATION_JS_PLACEHOLDER, ARCHITECTURE_ORGANIZATION_JS)
+        .replace(SUPPLY_CHAIN_JS_PLACEHOLDER, SUPPLY_CHAIN_JS)
+        .replace(EXECUTION_MODEL_JS_PLACEHOLDER, EXECUTION_MODEL_JS)
+        .replace(VALUE_FLOW_JS_PLACEHOLDER, VALUE_FLOW_JS)
+        .replace(GUARD_OBLIGATIONS_JS_PLACEHOLDER, GUARD_OBLIGATIONS_JS)
+        .replace(FAILURE_OBLIGATIONS_JS_PLACEHOLDER, FAILURE_OBLIGATIONS_JS)
+        .replace(RESOURCE_RISKS_JS_PLACEHOLDER, RESOURCE_RISKS_JS)
+        .replace(ANALYSIS_EVIDENCE_JS_PLACEHOLDER, ANALYSIS_EVIDENCE_JS)
+        .replace(PROGRAM_QUERIES_JS_PLACEHOLDER, PROGRAM_QUERIES_JS)
+        .replace(ANALYSIS_SNAPSHOT_JS_PLACEHOLDER, ANALYSIS_SNAPSHOT_JS)
+        .replace(REVISION_COMPARISON_JS_PLACEHOLDER, REVISION_COMPARISON_JS)
+        .replace(TEST_CANDIDATES_JS_PLACEHOLDER, TEST_CANDIDATES_JS)
+        .replace(COMMENT_SEARCH_JS_PLACEHOLDER, COMMENT_SEARCH_JS)
+        .replace(
+            PERFORMANCE_MEASUREMENTS_JS_PLACEHOLDER,
+            PERFORMANCE_MEASUREMENTS_JS,
+        )
+        .replace(CALL_PATHS_JS_PLACEHOLDER, CALL_PATHS_JS)
+        .replace(ADVISORY_EXPOSURE_JS_PLACEHOLDER, ADVISORY_EXPOSURE_JS)
+        .replace(ENTRY_EFFECTS_JS_PLACEHOLDER, ENTRY_EFFECTS_JS)
+        .replace(EXECUTION_MODEL_VIEW_JS_PLACEHOLDER, EXECUTION_MODEL_VIEW_JS)
+        .replace(TRACE_WATERFALL_JS_PLACEHOLDER, TRACE_WATERFALL_JS);
 
     // The inline decision is on the *uncompressed* size: a graph that's small
     // enough to embed stays a self-contained, file://-openable document.

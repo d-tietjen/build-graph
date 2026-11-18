@@ -1,0 +1,19 @@
+[workspace]
+
+[package]
+name = "execution-flow-fixture"
+version = "0.0.0"
+edition = "2021"
+publish = false
+autobins = false
+
+[lib]
+path = "src/main.rs"
+
+[[bin]]
+name = "execution-flow-runner"
+path = "src/bin/main.rs"
+
+[[bin]]
+name = "execution-flow-fixture"
+path = "src/bin/collision.rs"

@@ -1,0 +1,4 @@
+[workspace]
+resolver = "2"
+members = ["app", "shared", "macros"]
+exclude = ["duplicate-v1", "duplicate-v2"]

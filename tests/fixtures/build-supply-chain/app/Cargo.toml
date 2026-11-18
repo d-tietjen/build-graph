@@ -1,0 +1,19 @@
+[package]
+name = "build-supply-app"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+shared = { path = "../shared" }
+fixture-macros = { path = "../macros" }
+duplicate-one = { package = "duplicate", path = "../duplicate-v1" }
+
+[target.'cfg(unix)'.dependencies]
+duplicate-two = { package = "duplicate", path = "../duplicate-v2" }
+
+[build-dependencies]
+shared = { path = "../shared" }
+
+[target.'cfg(target_os = "none")'.build-dependencies]
+duplicate-one = { package = "duplicate", path = "../duplicate-v1" }
