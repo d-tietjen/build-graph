@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "adapters": [{
+    "id": "independent-host-integration",
+    "version": "1.0.0",
+    "entries": [{
+      "id": "host-activation",
+      "selector": { "id": "$host_callback" },
+      "kind": "host-callback",
+      "certainty": "modeled"
+    }],
+    "summaries": [{
+      "id": "transport-capability",
+      "selector": { "id": "$transport_emit" },
+      "effects": [{ "category": "network", "operation": "host-transport-send" }]
+    }]
+  }]
+}

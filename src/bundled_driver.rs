@@ -15,6 +15,7 @@ const FILES: &[(&str, &str)] = &[
     ("crates/bg-driver/Cargo.lock", include_str!("../driver-bundle/lock.toml")),
     ("crates/bg-driver/rust-toolchain.toml", include_str!("../driver-bundle/toolchain.toml")),
     ("crates/bg-driver/src/main.rs", include_str!("../driver-bundle/main.rs")),
+    ("crates/bg-driver/src/flow.rs", include_str!("../driver-bundle/flow.rs")),
     ("crates/bg-driver/src/observed_context.rs", include_str!("../driver-bundle/observed_context.rs")),
     ("crates/bg-driver/src/occurrences.rs", include_str!("../driver-bundle/occurrences.rs")),
     ("crates/bg-driver/src/semantic.rs", include_str!("../driver-bundle/semantic.rs")),

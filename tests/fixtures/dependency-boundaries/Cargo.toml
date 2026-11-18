@@ -1,0 +1,12 @@
+[package]
+name = "dependency-boundaries"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+exclude = ["common-v1", "common-v2", "native-sys"]
+
+[dependencies]
+common_v1 = { package = "common", path = "common-v1" }
+common_v2 = { package = "common", path = "common-v2" }
+native-sys = { path = "native-sys" }

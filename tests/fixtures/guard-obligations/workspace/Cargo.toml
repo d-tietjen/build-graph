@@ -1,0 +1,10 @@
+[package]
+name = "guard-fixture"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+policy-support = { path = "policy-support" }
+
+[workspace]
+members = ["policy-support"]

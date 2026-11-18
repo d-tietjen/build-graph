@@ -2,8 +2,8 @@
 //! dep-info (`.d`) files.
 //!
 //! Each compiled unit writes `target/<profile>/deps/<crate>-<hash>.d` listing
-//! the source files it was built from. We index those per crate (the newest
-//! one), read a crate's own `.rs` paths from it, and fingerprint the crate by
+//! the source files it was built from. We select the newest dep-info file for
+//! each target source root, then fingerprint that crate's `.rs` paths by
 //! those files' **mtimes** — which change only when you edit the crate's
 //! sources, not when the graph is rebuilt. That fingerprint is the signal for
 //! incremental caching.
@@ -29,16 +29,16 @@ pub struct SourceFile {
     pub mtime: u128,
 }
 
-/// Newest dep-info `.d` per crate, keyed by the rustc crate/lib name.
+/// Dep-info candidates keyed by rustc crate name. A lib and bin may share the
+/// name, so their source roots distinguish the records.
 pub struct DepIndex {
-    newest: HashMap<String, Utf8PathBuf>,
+    candidates: HashMap<String, Vec<(Utf8PathBuf, u128)>>,
 }
 
 impl DepIndex {
-    /// Scan the `deps/` directories once (filenames + mtimes only) and remember
-    /// the newest `.d` for each crate.
+    /// Scan the `deps/` directories once (filenames + mtimes only).
     pub fn build(target_dir: &Utf8Path, profiles: &[&str]) -> Self {
-        let mut newest: HashMap<String, (Utf8PathBuf, u128)> = HashMap::new();
+        let mut candidates: HashMap<String, Vec<(Utf8PathBuf, u128)>> = HashMap::new();
         for profile in profiles {
             let deps = target_dir.join(profile).join("deps");
             let Ok(entries) = std::fs::read_dir(deps.as_std_path()) else {
@@ -71,18 +71,18 @@ impl DepIndex {
                 // rlib or the rmeta unit resolves the crate.
                 let stripped = stem.strip_prefix("lib").unwrap_or(stem);
                 for key in [stem, stripped] {
-                    let slot = newest
+                    candidates
                         .entry(key.to_string())
-                        .or_insert_with(|| (upath.clone(), mtime));
-                    if mtime > slot.1 {
-                        *slot = (upath.clone(), mtime);
-                    }
+                        .or_default()
+                        .push((upath.clone(), mtime));
                 }
             }
         }
-        DepIndex {
-            newest: newest.into_iter().map(|(k, (p, _))| (k, p)).collect(),
+        for entries in candidates.values_mut() {
+            entries.sort_by(|(ap, at), (bp, bt)| bt.cmp(at).then_with(|| ap.cmp(bp)));
+            entries.dedup_by(|(ap, _), (bp, _)| ap == bp);
         }
+        DepIndex { candidates }
     }
 
     /// The crate's own `.rs` sources (paths under `manifest_dir`), each with its
@@ -90,13 +90,32 @@ impl DepIndex {
     pub fn crate_sources(
         &self,
         libname: &str,
+        target_source: &Utf8Path,
         manifest_dir: &Utf8Path,
         ws_root: &Utf8Path,
     ) -> Vec<SourceFile> {
-        let Some(dpath) = self.newest.get(libname) else {
+        let Some(candidates) = self.candidates.get(libname) else {
             return Vec::new();
         };
-        let Ok(content) = std::fs::read_to_string(dpath.as_std_path()) else {
+        // A package can have a lib and a same-named bin. Use the newest dep
+        // file that actually names this target's current root source, rather
+        // than letting one target hide the other's source membership.
+        let Some(content) = candidates.iter().find_map(|(dpath, _)| {
+            let content = std::fs::read_to_string(dpath.as_std_path()).ok()?;
+            content
+                .split_whitespace()
+                .filter(|token| token.trim_end_matches(':').ends_with(".rs"))
+                .any(|token| {
+                    let p = Utf8Path::new(token.trim_end_matches(':'));
+                    let p = if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        ws_root.join(p)
+                    };
+                    p == target_source
+                })
+                .then_some(content)
+        }) else {
             return Vec::new();
         };
         let mut seen = BTreeSet::new();

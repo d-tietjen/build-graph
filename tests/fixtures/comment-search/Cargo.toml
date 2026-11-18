@@ -1,0 +1,19 @@
+[package]
+name = "portable-comment-fixture"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[features]
+default = []
+blue = []
+
+[lib]
+name = "portable_comment_fixture"
+path = "source.rs"
+
+[[bin]]
+name = "portable_comment_fixture"
+path = "ownership.rs"

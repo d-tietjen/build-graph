@@ -169,6 +169,11 @@ impl Graph {
         self.nodes.get(id)
     }
 
+    /// Mutate metadata on a known node after a derived layer resolves targets.
+    pub fn node_mut(&mut self, id: &str) -> Option<&mut Node> {
+        self.nodes.get_mut(id)
+    }
+
     /// Iterate all edges (read-only) — used by derived layers that aggregate
     /// previously extracted relationships without losing the original edges.
     pub fn edge_values(&self) -> impl Iterator<Item = &Edge> {
@@ -238,6 +243,34 @@ impl Graph {
             .retain(|(source, _, _), _| crate_of_id(source) != Some(krate_norm));
     }
 
+    /// Replace a derived node catalog without disturbing edges that will have
+    /// their deterministic endpoints restored by the next extraction pass.
+    pub fn remove_nodes_with_kind(&mut self, kind: &str) {
+        self.nodes
+            .retain(|_, node| node.attributes.get("kind").map(String::as_str) != Some(kind));
+    }
+
+    /// Replace a derived catalog selected by one exact attribute value.
+    pub fn remove_nodes_with_attribute(&mut self, key: &str, value: &str) {
+        self.nodes
+            .retain(|_, node| node.attributes.get(key).map(String::as_str) != Some(value));
+    }
+
+    /// Drop a recomputed node catalog and only the edges touching its old IDs.
+    /// Other edges with the same relation remain intact.
+    pub fn remove_nodes_with_kind_and_incident_edges(&mut self, kind: &str) {
+        let removed: BTreeSet<String> = self
+            .nodes
+            .values()
+            .filter(|node| node.attributes.get("kind").map(String::as_str) == Some(kind))
+            .map(|node| node.id.clone())
+            .collect();
+        self.nodes.retain(|id, _| !removed.contains(id));
+        self.edges.retain(|(source, target, _), _| {
+            !removed.contains(source) && !removed.contains(target)
+        });
+    }
+
     /// Remove every edge with the given relation. Used by the semantic
     /// references layer, which recomputes reference relations wholesale.
     pub fn remove_edges_with_relation(&mut self, relation: &str) {
@@ -274,5 +307,29 @@ impl Graph {
             input_tokens: 0,
             output_tokens: 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Graph, Node};
+
+    #[test]
+    fn replacing_flow_catalog_keeps_unrelated_contains_edges() {
+        let mut graph = Graph::new();
+        graph.add_node(Node::new("crate".into(), "crate", "crate"));
+        graph.add_node(Node::new("file".into(), "file", "file"));
+        graph.add_node(Node::new("old_flow".into(), "old", "flow_function"));
+        graph.add_edge("crate", "file", "contains", None, None);
+        graph.add_edge("crate", "old_flow", "contains", None, None);
+        graph.add_edge("file", "old_flow", "has_flow", None, None);
+
+        graph.remove_nodes_with_kind_and_incident_edges("flow_function");
+
+        assert!(!graph.contains("old_flow"));
+        assert_eq!(graph.edge_count(), 1);
+        assert!(graph.edge_values().any(|edge| edge.source == "crate"
+            && edge.target == "file"
+            && edge.relation == "contains"));
     }
 }

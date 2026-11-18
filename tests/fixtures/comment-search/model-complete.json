@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "measured": true,
+  "sha256": {
+    "fixture.json": "38c07152430f0923b609baf07f04a0657a2b412ca47e44cb3e7fcf4a00cbb653",
+    "provenance.json": "262a84bcbce26469f42e628c7e0440c8b232c74fa631ac04ecbf8275c72b245b",
+    "run.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "input.json": "979aad4ca822831dcd18a686403ac728621ac7597b3844b75312d5a001af3f1d",
+    "source-input.bin": "520207a52663f43ebb47bafe4dc07a46b80f415e21839eb783d1d012dc1958b8",
+    "README.md": "9c9c5dcdcdceaa14c59cd3acabe6770fa33d3dd97713e4e961e7eeed229b15ea",
+    "artifact-manifest.json": "c314b40c80ae7d3086f5a7668ef0572d33328a4527d9ed3945829ecaa9c5cfb8",
+    "generate_fixture.py": "3ad90961c35144b0ce5007afa11143cc18e02e68ebc7332485f9e0e62c14e59a",
+    "requirements-macos-arm64-py313.txt": "e8402bcdf1d0c08731613a96265c143830c7574dff38bdfd1a487db21ea75ea1",
+    "configs/tokenizer_config.json": "acb92769e8195aabd29b7b2137a9e6d6e25c476a4f15aa4355c233426c61576b",
+    "configs/special_tokens_map.json": "303df45a03609e4ead04bc3dc1536d0ab19b5358db685b6f3da123d05ec200e3",
+    "configs/config.json": "953f9c0d463486b10a6871cc2fd59f223b2c70184f49815e7efbcab5d8908b41",
+    "configs/tokenizer.json": "be50c3628f2bf5bb5e3a7f17b1f74611b2561a3a27eeab05e5aa30f411572037",
+    "configs/README.md": "dcd602d2fd35c203a247304a06fec6654a12f7941b739f9221a064fe8dc3b7f0",
+    "configs/sentence_bert_config.json": "fc1993fde0a95c24ec6c022539d41cf6e2f7c9721e5415d6fb6897472a9cd4b7",
+    "configs/modules.json": "84e40c8e006c9b1d6c122e02cba9b02458120b5fb0c87b746c41e0207cf642cf",
+    "configs/1_Pooling/config.json": "4be450dde3b0273bb9787637cfbd28fe04a7ba6ab9d36ac48e92b11e350ffc23"
+  }
+}

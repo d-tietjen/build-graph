@@ -7,6 +7,7 @@ content-addressed user cache is also retained for subsequent invocations.
 """
 
 import argparse
+import gzip
 import json
 import os
 from pathlib import Path
@@ -69,7 +70,14 @@ def main():
             cwd=fixture, capture=True,
         ))
         assert any(edge["name"] == "forwardable" for edge in result["edges"]), result
-        print(f"Packaged {version}: forwardable calls allows; no checkout or driver overrides.")
+        with gzip.open(fixture / "target/build-graph/graph.json.gz", "rt") as graph_file:
+            graph = json.load(graph_file)
+        assert any(
+            node["attributes"].get("display_path", "").endswith("::forwardable")
+            and "flow" in node["attributes"]
+            for node in graph["nodes"]
+        ), "packaged driver did not capture execution flow"
+        print(f"Packaged {version}: resolved calls and execution flow; no checkout or driver overrides.")
 
 
 if __name__ == "__main__":

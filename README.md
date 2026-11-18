@@ -83,6 +83,45 @@ bundled HTML dashboard. Use `--references` instead of `--driver` when you want
 the rust-analyzer SCIP backend. Watch keeps Layer 1/2/3 as graph concepts, but
 save refreshes run one flattened extraction pass across every enabled layer.
 
+The driver collects MIR flow during `cargo check`; it does not run or instrument
+the application. `graph.html` opens on **Architecture**, a unified graph of
+structural relationships and captured calls. Sidebar **Field** and **Function
+graph** presets filter the same graph; node and connection controls refine
+visibility, while **Network**, **Radial**, and **Tree** change its arrangement.
+Folder eyes control Rust toolchain, workspace, and dependency visibility.
+Clicking a function isolates
+its complete directed caller and callee reachability across captured call
+alternatives; possible dispatch and callback calls stay marked as uncertain.
+AND pins refine the selection and are shared with the full execution model.
+
+To audit every callable with no edge in the Function graph, run
+`node scripts/audit-call-graph.cjs --graph path/to/graph.json --out path/to/audit`.
+Add `--source-root path/to/matching/source` for lexical Rust identifier evidence.
+The command writes `call-graph-audit.json` and `call-graph-audit.md`; isolation
+does not establish that a function is unused.
+
+**Execution flow** keeps every recorded MIR block and successor, including branches,
+loops, cleanup, and unwind transitions. Binary entry functions anchor the
+application section; disconnected or unknown-entry procedures remain in a
+separate section. Rounded procedure regions share their bodies, and callsite
+continuations remain tied to their own callers. Zoom into a region to inspect
+operation states and source locations. Pin procedures to highlight routes that
+contain all pins without discarding the rest of the model. Unknown external
+bodies and dynamic dispatch remain explicit coverage boundaries. Static branch
+feasibility is not solved. A `--references` graph without MIR bodies still shows
+its symbols in Architecture.
+
+From a function in Architecture, open **Flamegraph** or **UML sequence** for
+compiler-derived request flow examples. The variants share AND pins with the
+full statechart. Expand a frame to inspect its complete captured execution
+flow. Path, step, visit, depth, and state limits apply only to request flow
+examples; the full statechart remains available.
+
+The SCIP `--references` backend does not provide MIR flows. Flow extraction covers
+the current non-test library and binary build configuration;
+library test harnesses are excluded because the rich symbol catalog has no
+`cfg(test)` symbols.
+
 ```bash
 cargo install build-graph
 cargo build-graph build --rich --references
@@ -200,3 +239,18 @@ Cargo launch observer FD and opaque root correlation. See the
 [bounded generic protocol](docs/cargo-launch-intent.md) for invocation, sealed
 intent and ACK sequencing, privacy, failure ownership and remaining original
 parent qualification. It is disabled by default and does not change graph DTOs.
+
+Rich captures can retain exact comments and effective documentation for local
+search in the existing viewer and agent API. The **Comments and documentation**
+panel builds a lexical index by default. Explicitly configure a pinned embedding
+endpoint and invoke embedding actions to enable natural-language semantic search;
+no model call occurs during capture, index/import/load or replay. Results retain
+original occurrence/source citations and describe author intent, not execution
+or security proof. Older captures report missing comment coverage. See the
+[comment capture/search contracts](docs/agent-analysis.md#comments-and-documentation)
+for source limitations, offline vectors, bounds and endpoint configuration.
+
+Agents can compose bounded read-only program facts, existing value/guard analyses,
+joins and source-linked evidence slices through `programQuery` version 1 in the
+shared API, CLI/JSONL and browser worker/fallback. See the typed contract and
+combined declared-input example in [agent analysis](docs/agent-analysis.md#composable-program-queries-and-compact-evidence-slices).

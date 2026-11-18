@@ -1,0 +1,126 @@
+{
+  "schemaVersion": 1,
+  "status": "ground-truth-fixed-before-vector-generation; measured vectors pending",
+  "embeddingTextContract": "Exact UTF-8 record.text chunks; chunker=comment-text-utf16-1024-v1; no names, paths, prefixes or inferred summaries. These eight texts each fit one chunk. Do not trim, normalize whitespace or join sources.",
+  "source": "source.rs",
+  "documents": [
+    {
+      "id": "occ:portable:01",
+      "text": "Retries temporary failures with an exponentially increasing delay. Stops after\nthe configured attempt limit so a failing dependency cannot keep work alive forever.",
+      "symbol": "p01",
+      "kind": "effective-doc",
+      "sourceFile": "source.rs"
+    },
+    {
+      "id": "occ:portable:02",
+      "text": "Readers keep an immutable snapshot while a replacement is assembled separately.\nPublish the complete replacement atomically; an interrupted update never exposes half a revision.",
+      "symbol": "p02",
+      "kind": "effective-doc",
+      "sourceFile": "source.rs"
+    },
+    {
+      "id": "occ:portable:03",
+      "text": "Compares the stored content digest with a fresh digest before accepting saved data.\nReject a modified payload even when its file name and declared version are unchanged.",
+      "symbol": "p03",
+      "kind": "effective-doc",
+      "sourceFile": "source.rs"
+    },
+    {
+      "id": "occ:portable:04",
+      "text": "A cancelled task stops at cooperative checkpoints and releases its reservation.\nNo partial result is published after the caller has withdrawn the request.",
+      "symbol": "p04",
+      "kind": "effective-doc",
+      "sourceFile": "source.rs"
+    },
+    {
+      "id": "occ:portable:05",
+      "text": "// Comment delimiters inside quoted or raw string literals are data. Nested\n    // block comments end only after every opening delimiter has been closed.",
+      "symbol": "p05",
+      "kind": "line",
+      "sourceFile": "source.rs"
+    },
+    {
+      "id": "occ:portable:06",
+      "text": "// An expired credential must be renewed before access is granted. A cached\n    // identity alone does not establish that the current request is authorized.",
+      "symbol": "p06",
+      "kind": "line",
+      "sourceFile": "source.rs"
+    },
+    {
+      "id": "occ:portable:07",
+      "text": "// Reuse vectors for unchanged exact chunks. Editing documentation invalidates\n    // only its affected cache entries; removed records disappear from the next snapshot.",
+      "symbol": "p07",
+      "kind": "line",
+      "sourceFile": "source.rs"
+    },
+    {
+      "id": "occ:portable:08",
+      "text": "// Reserve bytes before retaining a result. Reject work that exceeds the\n    // memory quota, including escaped output, even if the record count is small.",
+      "symbol": "p08",
+      "kind": "line",
+      "sourceFile": "source.rs"
+    }
+  ],
+  "queries": [
+    {
+      "id": "q01",
+      "text": "Where do we slow down repeated transient errors instead of trying forever?",
+      "expectedDocIds": [
+        "occ:portable:01"
+      ],
+      "criterion": "relevant occurrence in top 3; no symbol-name text appears in query"
+    },
+    {
+      "id": "q02",
+      "text": "How can existing readers avoid seeing an incomplete update?",
+      "expectedDocIds": [
+        "occ:portable:02"
+      ],
+      "criterion": "relevant occurrence in top 3; no symbol-name text appears in query"
+    },
+    {
+      "id": "q03",
+      "text": "What detects tampering with previously saved information?",
+      "expectedDocIds": [
+        "occ:portable:03"
+      ],
+      "criterion": "relevant occurrence in top 3; no symbol-name text appears in query"
+    },
+    {
+      "id": "q04",
+      "text": "How do abandoned requests relinquish their allocated capacity?",
+      "expectedDocIds": [
+        "occ:portable:04"
+      ],
+      "criterion": "relevant occurrence in top 3; no symbol-name text appears in query"
+    },
+    {
+      "id": "q05",
+      "text": "Where is a stale login prevented from allowing access?",
+      "expectedDocIds": [
+        "occ:portable:06"
+      ],
+      "criterion": "relevant occurrence in top 3; no symbol-name text appears in query"
+    },
+    {
+      "id": "q06",
+      "text": "Can an oversized response be refused despite having few items?",
+      "expectedDocIds": [
+        "occ:portable:08"
+      ],
+      "criterion": "relevant occurrence in top 3; no symbol-name text appears in query"
+    },
+    {
+      "id": "n01",
+      "text": "How is the shortest geographic route between train stations computed?",
+      "expectedDocIds": [],
+      "criterion": "unrelated negative; report similarity/rank without inventing relevance; no universal rejection threshold claimed"
+    },
+    {
+      "id": "n02",
+      "text": "Which image filter removes red eyes from portraits?",
+      "expectedDocIds": [],
+      "criterion": "unrelated negative; report similarity/rank without inventing relevance; no universal rejection threshold claimed"
+    }
+  ]
+}

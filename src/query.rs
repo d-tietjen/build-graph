@@ -396,12 +396,22 @@ fn resolve_subject<'a>(ix: &Index<'a>, query: &str) -> Resolved<'a> {
         };
     }
     let needle = query.to_lowercase();
+    // A mapped compiler body is evidence for an existing symbol. Prefer the
+    // symbol when both match, while retaining exact IDs and compiler-only names.
+    let duplicates_matching_symbol = |node: &Node| {
+        node_kind(node) == "flow_function"
+            && attr(node, "mapping_status") == Some("mapped")
+            && attr(node, "symbol_id")
+                .and_then(|id| ix.by_id.get(id))
+                .is_some_and(|symbol| name_matches(symbol, &needle, query, false))
+    };
     let mut hits: Vec<&'a Node> = ix
         .doc
         .nodes
         .iter()
         .filter(|n| node_kind(n) != "file")
         .filter(|n| name_matches(n, &needle, query, false))
+        .filter(|n| !duplicates_matching_symbol(n))
         .collect();
     hits.sort_by(|a, b| {
         let ra = ix.in_deg(a.id.as_str());
@@ -426,6 +436,7 @@ fn resolve_subject<'a>(ix: &Index<'a>, query: &str) -> Resolved<'a> {
             .nodes
             .iter()
             .filter(|n| node_kind(n) != "file" && n.label.eq_ignore_ascii_case(&s.label))
+            .filter(|n| !duplicates_matching_symbol(n))
             .count(),
         None => 0,
     };
